@@ -72,7 +72,7 @@ _install_if_missing nibabel   nibabel
 CHALLENGE_BASELINE="$WORK/MRIX/challenge/Baseline"
 if [ -f "$CHALLENGE_BASELINE/setup.py" ]; then
     python3 -c "import mrixfields" 2>/dev/null || \
-        pip install --user --quiet "$CHALLENGE_BASELINE"
+        pip install --user --quiet --no-deps "$CHALLENGE_BASELINE"
 else
     echo "[ERREUR] $CHALLENGE_BASELINE/setup.py introuvable."
     echo "         Vérifiez que $WORK/MRIX/challenge/ contient bien le repo du challenge."

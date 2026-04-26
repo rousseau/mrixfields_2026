@@ -60,8 +60,10 @@ pip install --user --quiet torchcfm pot torchdiffeq nibabel
 
 # Package mrixfields
 if [ -f "$CHALLENGE_BASELINE/setup.py" ]; then
-    pip install --user --quiet "$CHALLENGE_BASELINE"
-    echo "  → mrixfields installé depuis $CHALLENGE_BASELINE"
+    # --no-deps : évite tensorflow<2.16 incompatible avec Python 3.12
+    # On n'utilise que mrixfields.data.transforms (aucune dépendance TF)
+    pip install --user --quiet --no-deps "$CHALLENGE_BASELINE"
+    echo "  → mrixfields installé (sans dépendances) depuis $CHALLENGE_BASELINE"
 elif [ -d "$CHALLENGE_DIR" ]; then
     echo "  [ATTENTION] setup.py introuvable dans $CHALLENGE_BASELINE"
     echo "  Vérifiez que le repo challenge est bien structuré avec un Baseline/."
