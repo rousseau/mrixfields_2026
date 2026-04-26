@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Environnement JEAN ZAY (IDRIS — H100 SXM5)
+#
+# $WORK = /lustre/fswork/projects/rech/crp/ulq73oz
+#
+# Structure attendue sous $WORK/MRIX/ :
+#   data/              ← données brutes MRIxFields (NIfTI, challenge structure)
+#   mrixfields_2026/   ← ce repo (git clone)
+#   challenge/         ← code officiel du challenge (git clone, pour pip install)
+#
+# Utilisation dans le job SLURM :
+#   python src/train_cfm2d.py --config configs/cfm_T1W.yaml --env jeanzay
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Données brutes MRIxFields 2026 (NIfTI)
+data_root: $WORK/MRIX/data
+
+# Racine des sorties (préprocessing, runs, prédictions)
+output_root: $WORK/MRIX/mrixfields_2026/outputs
+
+# Racine du projet
+project_root: $WORK/MRIX/mrixfields_2026
+
+# Exécutable Python (fourni par module pytorch-gpu/py3/2.5.0)
+python: python3

@@ -1,0 +1,34 @@
+method: cfm2d
+task_name: cfm2d_T1W
+
+model:
+  img_size: 512
+  model_channels: 128
+  num_res_blocks: 2
+  use_gradient_checkpointing: true
+
+data:
+  modality: T1W
+  split: retro_train
+  # Chemins résolus depuis configs/env/{local,jeanzay}.yaml + ces sous-chemins
+  preprocessed_subdir: stargan2d/preprocessed
+  output_subdir: cfm2d/runs/cfm2d_T1W
+  domains:
+    - 0.1T
+    - 1.5T
+    - 3T
+    - 5T
+    - 7T
+
+train:
+  batch_size: 8
+  num_workers: 4
+  total_iters: 100000
+  lr: 0.0001
+  sigma: 0.0          # OT-CFM déterministe (sigma=0)
+  save_every: 5000
+  print_every: 500
+
+inference:
+  n_steps: 50         # Euler integration steps
+  source_field: 0.1T

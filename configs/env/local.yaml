@@ -1,0 +1,18 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Environnement LOCAL (machine rousseau)
+#
+# Utilisation :
+#   python src/train_cfm2d.py --config configs/cfm_T1W.yaml --env local
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Données brutes MRIxFields 2026 (NIfTI)
+data_root: /home/rousseau/Data/MRIxFields_20260414
+
+# Racine des sorties (préprocessing, runs, prédictions)
+output_root: /home/rousseau/Exp/mrixfields_2026/outputs
+
+# Racine du projet (scripts, configs, results/)
+project_root: /home/rousseau/Exp/mrixfields_2026
+
+# Exécutable Python (avec CUDA)
+python: /home/rousseau/miniforge3/bin/python

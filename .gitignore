@@ -38,7 +38,13 @@ paper/*.synctex.gz
 paper/*.toc
 paper/*.pdf
 
+# ── Résultats lourds (figures de suivi, régénérables) ───────────────────────
+results/*.png
+results/*.pdf
+
 # ── OS / IDE ─────────────────────────────────────────────────────────────────
 .DS_Store
+._.DS_Store
+**/._.DS_Store
 .vscode/
 *.swp
