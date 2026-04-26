@@ -17,6 +17,8 @@ MRIX_ROOT="$WORK/MRIX"
 PROJECT_DIR="$MRIX_ROOT/mrixfields_2026"
 DATA_DIR="$MRIX_ROOT/data"
 CHALLENGE_DIR="$MRIX_ROOT/challenge"
+# Le package mrixfields est dans le sous-répertoire Baseline/
+CHALLENGE_BASELINE="$CHALLENGE_DIR/Baseline"
 
 echo "======================================================================="
 echo " Setup Jean Zay — MRIxFields 2026"
@@ -34,12 +36,13 @@ echo "[1/4] Répertoires créés"
 if [ ! -d "$CHALLENGE_DIR" ]; then
     echo ""
     echo "[2/4] Clonage du code officiel du challenge..."
-    echo "      → Modifiez l'URL ci-dessous si le repo est privé"
-    # git clone https://github.com/<org>/MRIxFields2026_Baseline.git "$CHALLENGE_DIR"
     echo "      [ACTION REQUISE] Lancez manuellement :"
     echo "      git clone <URL_DU_CHALLENGE> $CHALLENGE_DIR"
+elif [ ! -f "$CHALLENGE_BASELINE/setup.py" ]; then
+    echo "[2/4] Challenge repo présent mais Baseline/ introuvable : $CHALLENGE_BASELINE"
+    echo "      Vérifiez la structure du repo."
 else
-    echo "[2/4] Challenge repo déjà présent : $CHALLENGE_DIR"
+    echo "[2/4] Challenge repo OK : $CHALLENGE_BASELINE"
 fi
 
 # ─── 3. Installer les dépendances Python ─────────────────────────────────────
@@ -56,9 +59,12 @@ export PATH="$WORK/.local/bin:$PATH"
 pip install --user --quiet torchcfm pot torchdiffeq nibabel
 
 # Package mrixfields
-if [ -d "$CHALLENGE_DIR" ]; then
-    pip install --user --quiet "$CHALLENGE_DIR"
-    echo "  → mrixfields installé depuis $CHALLENGE_DIR"
+if [ -f "$CHALLENGE_BASELINE/setup.py" ]; then
+    pip install --user --quiet "$CHALLENGE_BASELINE"
+    echo "  → mrixfields installé depuis $CHALLENGE_BASELINE"
+elif [ -d "$CHALLENGE_DIR" ]; then
+    echo "  [ATTENTION] setup.py introuvable dans $CHALLENGE_BASELINE"
+    echo "  Vérifiez que le repo challenge est bien structuré avec un Baseline/."
 else
     echo "  [ATTENTION] mrixfields non installé (challenge repo manquant)"
     echo "  Relancez ce script après avoir cloné le challenge."

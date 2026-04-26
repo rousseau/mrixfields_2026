@@ -68,13 +68,14 @@ _install_if_missing ot        pot
 _install_if_missing torchdiffeq torchdiffeq
 _install_if_missing nibabel   nibabel
 
-# Package challenge (mrixfields) — installé depuis le clone local
-CHALLENGE_DIR="$WORK/MRIX/challenge"
-if [ -d "$CHALLENGE_DIR" ]; then
+# Package challenge (mrixfields) — installé depuis Baseline/ du clone local
+CHALLENGE_BASELINE="$WORK/MRIX/challenge/Baseline"
+if [ -f "$CHALLENGE_BASELINE/setup.py" ]; then
     python3 -c "import mrixfields" 2>/dev/null || \
-        pip install --user --quiet "$CHALLENGE_DIR"
+        pip install --user --quiet "$CHALLENGE_BASELINE"
 else
-    echo "[ERREUR] $CHALLENGE_DIR introuvable. Lancez setup_jeanzay.sh d'abord."
+    echo "[ERREUR] $CHALLENGE_BASELINE/setup.py introuvable."
+    echo "         Vérifiez que $WORK/MRIX/challenge/ contient bien le repo du challenge."
     exit 1
 fi
 
