@@ -30,7 +30,7 @@ CONFIGS_DIR=${CHALLENGE_DIR}/configs/task3/stargan
 
 # Surcharge OUTPUT_DIR : load_env() ne l'écrase pas si déjà défini
 export OUTPUT_DIR="${EXP_DIR}/runs"
-export DATA_DIR=/home/rousseau/Data/MRIxFields_20260414
+export DATA_DIR=${DATA_DIR:-/home/rousseau/Data/MRIxFields_20260414}
 # PREPROCESSED_DIR non défini → lecture NIfTI on-the-fly (pas de fichiers .npz)
 unset PREPROCESSED_DIR
 
