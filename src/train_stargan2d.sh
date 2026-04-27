@@ -30,7 +30,8 @@ PYTHON=/home/rousseau/miniforge3/bin/python
 # Surcharge OUTPUT_DIR : load_env() ne l'écrase pas si déjà défini
 export OUTPUT_DIR="${EXP_DIR}/runs"
 export DATA_DIR=/home/rousseau/Data/MRIxFields_20260414
-export PREPROCESSED_DIR="${EXP_DIR}/preprocessed"
+# PREPROCESSED_DIR non défini → lecture NIfTI on-the-fly (pas de fichiers .npz)
+unset PREPROCESSED_DIR
 
 mkdir -p "${OUTPUT_DIR}"
 
