@@ -276,11 +276,12 @@ def train(cfg_path: str, env_path: Optional[str] = None) -> None:
     domains_to_use = cfg["data"].get("domains", DOMAINS)
 
     # Sélection du mode de chargement :
-    # - CachedDomainDataset  si preprocessed_dir existe sur le disque (fichiers .npz)
+    # - CachedDomainDataset  si preprocessed_dir contient des fichiers .npz
     # - NIfTIDomainDataset   sinon, lecture directe depuis les NIfTI (data_root requis)
     use_cache = (
         preprocessed_dir_str is not None
         and Path(preprocessed_dir_str).is_dir()
+        and next(Path(preprocessed_dir_str).rglob("*.npz"), None) is not None
     )
     if not use_cache and data_root_str is None:
         raise RuntimeError(
