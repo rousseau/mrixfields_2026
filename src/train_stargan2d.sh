@@ -22,10 +22,11 @@ set -e
 MODALITY=${1:-all}
 MODE=${2:-retro_scratch}
 
-CHALLENGE_DIR=/home/rousseau/Code/MRIxFields2026/Baseline
+# Chemins overridables via variables d'environnement (pour Jean Zay, etc.)
+CHALLENGE_DIR=${CHALLENGE_DIR:-/home/rousseau/Code/MRIxFields2026/Baseline}
+EXP_DIR=${EXP_DIR:-/home/rousseau/Exp/mrixfields_2026/outputs/stargan2d}
+PYTHON=${PYTHON:-/home/rousseau/miniforge3/bin/python}
 CONFIGS_DIR=${CHALLENGE_DIR}/configs/task3/stargan
-EXP_DIR=/home/rousseau/Exp/mrixfields_2026/outputs/stargan2d
-PYTHON=/home/rousseau/miniforge3/bin/python
 
 # Surcharge OUTPUT_DIR : load_env() ne l'écrase pas si déjà défini
 export OUTPUT_DIR="${EXP_DIR}/runs"

@@ -90,6 +90,9 @@ def _resolve_paths(cfg: dict, env: Optional[dict]) -> dict:
         data["preprocessed_dir"] = str(output_root / data["preprocessed_subdir"])
     if "output_subdir" in data:
         data["output_dir"] = str(output_root / data["output_subdir"])
+    # Expose data_root pour le mode on-the-fly NIfTI
+    if "data_root" in env:
+        data.setdefault("data_root", env["data_root"])
     return cfg
 
 
@@ -131,6 +134,74 @@ class CachedDomainDataset(Dataset):
         npz = np.load(self.files[idx])
         image = npz["image"]  # (H, W) float32 in [0, 1]
         image = self.transform(image)  # → (1, img_size, img_size) in [-1, 1]
+        return image, self.domain_idx
+
+
+# Mapping abréviation → répertoire réel du challenge
+_SPLIT_ABBR_TO_DIR = {
+    "retro_train": "Training_retrospective",
+    "pro_train":   "Training_prospective",
+    "pro_val":     "Validating_prospective",
+    "pro_test":    "Testing_prospective",
+}
+
+
+class NIfTIDomainDataset(Dataset):
+    """Dataset on-the-fly : lit des volumes NIfTI et extrait des coupes 2D axiales.
+
+    Remplace CachedDomainDataset quand les fichiers .npz ne sont pas disponibles.
+    Structure attendue : {data_root}/{split_dir}/{modality}/{field}/*.nii.gz
+    """
+
+    def __init__(
+        self,
+        data_root: Path,
+        split: str,
+        modality: str,
+        field: str,
+        img_size: int = 512,
+        slice_axis: int = 2,
+        min_slice_std: float = 0.01,
+    ):
+        self.domain_idx = DOMAIN_TO_IDX[field]
+        self.transform = _make_transform(img_size)
+        self.slice_axis = slice_axis
+        self.min_slice_std = min_slice_std
+
+        split_dir = _SPLIT_ABBR_TO_DIR.get(split, split)
+        domain_dir = Path(data_root) / split_dir / modality / field
+        nifti_files = sorted(domain_dir.glob("*.nii.gz"))
+        if not nifti_files:
+            raise FileNotFoundError(f"Aucun fichier .nii.gz dans {domain_dir}")
+
+        self.samples: List[Tuple[Path, int]] = []
+        for nifti_path in nifti_files:
+            vol = nib.load(str(nifti_path)).get_fdata(dtype=np.float32)
+            vmin, vmax = vol.min(), vol.max()
+            if vmax > vmin:
+                vol = (vol - vmin) / (vmax - vmin)
+            n_slices = vol.shape[slice_axis]
+            for i in range(n_slices):
+                slc = self._get_slice(vol, i)
+                if slc.std() > min_slice_std:
+                    self.samples.append((nifti_path, i))
+
+    def _get_slice(self, volume: np.ndarray, idx: int) -> np.ndarray:
+        slicing = [slice(None)] * volume.ndim
+        slicing[self.slice_axis] = idx
+        return volume[tuple(slicing)]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        nifti_path, slice_idx = self.samples[idx]
+        vol = nib.load(str(nifti_path)).get_fdata(dtype=np.float32)
+        vmin, vmax = vol.min(), vol.max()
+        if vmax > vmin:
+            vol = (vol - vmin) / (vmax - vmin)
+        slc = self._get_slice(vol, slice_idx)
+        image = self.transform(slc)
         return image, self.domain_idx
 
 
@@ -197,11 +268,31 @@ def train(cfg_path: str, env_path: Optional[str] = None) -> None:
     cfg = _resolve_paths(cfg, _load_env(env_path))
 
     # --- Chemins ---
-    preprocessed_dir = Path(cfg["data"]["preprocessed_dir"])
+    preprocessed_dir_str = cfg["data"].get("preprocessed_dir")
+    data_root_str = cfg["data"].get("data_root")
     output_dir = Path(cfg["data"]["output_dir"])
     modality = cfg["data"]["modality"]
     split = cfg["data"].get("split", "retro_train")
     domains_to_use = cfg["data"].get("domains", DOMAINS)
+
+    # Sélection du mode de chargement :
+    # - CachedDomainDataset  si preprocessed_dir existe sur le disque (fichiers .npz)
+    # - NIfTIDomainDataset   sinon, lecture directe depuis les NIfTI (data_root requis)
+    use_cache = (
+        preprocessed_dir_str is not None
+        and Path(preprocessed_dir_str).is_dir()
+    )
+    if not use_cache and data_root_str is None:
+        raise RuntimeError(
+            "Aucune source de données disponible : définissez preprocessed_dir "
+            "(fichiers .npz) ou data_root (NIfTI on-the-fly) dans la config / env."
+        )
+    if use_cache:
+        preprocessed_dir = Path(preprocessed_dir_str)
+        print(f"Mode : cache .npz ({preprocessed_dir})")
+    else:
+        data_root = Path(data_root_str)
+        print(f"Mode : NIfTI on-the-fly ({data_root})")
 
     weights_dir = output_dir / "weights"
     weights_dir.mkdir(parents=True, exist_ok=True)
@@ -220,7 +311,10 @@ def train(cfg_path: str, env_path: Optional[str] = None) -> None:
     print(f"\nChargement datasets ({modality}, split={split}) :")
     loaders: Dict[str, any] = {}
     for field in domains_to_use:
-        ds = CachedDomainDataset(preprocessed_dir, split, modality, field, img_size)
+        if use_cache:
+            ds = CachedDomainDataset(preprocessed_dir, split, modality, field, img_size)
+        else:
+            ds = NIfTIDomainDataset(data_root, split, modality, field, img_size)
         print(f"  {field}: {len(ds)} slices")
         loader = DataLoader(
             ds,

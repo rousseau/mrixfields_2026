@@ -8,7 +8,7 @@
 # Ce script :
 #   1. Crée la structure de répertoires sous $WORK/MRIX/
 #   2. Installe les dépendances Python dans $WORK/.local
-#   3. Affiche les commandes rsync pour transférer les données et les .npz
+#   3. Affiche les commandes rsync pour transférer les données NIfTI
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
@@ -27,7 +27,7 @@ echo "======================================================================="
 
 # ─── 1. Répertoires ───────────────────────────────────────────────────────────
 mkdir -p "$DATA_DIR"
-mkdir -p "$PROJECT_DIR/outputs/stargan2d/preprocessed"
+mkdir -p "$PROJECT_DIR/outputs/stargan2d/runs"
 mkdir -p "$PROJECT_DIR/outputs/cfm2d"
 mkdir -p "$PROJECT_DIR/logs"
 echo "[1/4] Répertoires créés"
@@ -82,18 +82,23 @@ echo "  # Données brutes NIfTI (structure challenge) :"
 echo "  rsync -avP ~/Data/MRIxFields_20260414/ \\"
 echo "    <login>@jean-zay.idris.fr:$DATA_DIR/"
 echo ""
-echo "  # Données préprocessées .npz (StarGAN + CFM partagent ces fichiers) :"
-echo "  rsync -avP ~/Exp/mrixfields_2026/outputs/stargan2d/preprocessed/ \\"
-echo "    <login>@jean-zay.idris.fr:$PROJECT_DIR/outputs/stargan2d/preprocessed/"
-echo ""
-echo "  # Optionnel — transférer des checkpoints StarGAN existants :"
+echo "  # Optionnel — transférer des checkpoints existants :"
 echo "  rsync -avP ~/Exp/mrixfields_2026/outputs/stargan2d/runs/ \\"
 echo "    <login>@jean-zay.idris.fr:$PROJECT_DIR/outputs/stargan2d/runs/"
+echo "  rsync -avP ~/Exp/mrixfields_2026/outputs/cfm2d/runs/ \\"
+echo "    <login>@jean-zay.idris.fr:$PROJECT_DIR/outputs/cfm2d/runs/"
 echo ""
 echo "======================================================================="
 echo " Setup terminé."
 echo ""
-echo " Lancer un entraînement :"
-echo "   cd $PROJECT_DIR"
+echo " Lancer les entraînements (depuis $PROJECT_DIR) :"
+echo "   # StarGAN v2"
+echo "   sbatch src/slurm/stargan_jeanzay.slurm T1W retro_scratch"
+echo "   sbatch src/slurm/stargan_jeanzay.slurm T2W retro_scratch"
+echo "   sbatch src/slurm/stargan_jeanzay.slurm T2FLAIR retro_scratch"
+echo ""
+echo "   # OT-CFM 2D"
 echo "   sbatch src/slurm/cfm_jeanzay.slurm T1W"
+echo "   sbatch src/slurm/cfm_jeanzay.slurm T2W"
+echo "   sbatch src/slurm/cfm_jeanzay.slurm T2FLAIR"
 echo "======================================================================="
