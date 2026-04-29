@@ -262,10 +262,13 @@ def build_unet(cfg: dict, use_checkpoint: Optional[bool] = None) -> UNetModel:
 # Training
 # ==========================================================================
 
-def train(cfg_path: str, env_path: Optional[str] = None) -> None:
+def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] = None) -> None:
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
     cfg = _resolve_paths(cfg, _load_env(env_path))
+    # --resume CLI a priorité sur le champ "resume" de la config
+    if resume is not None:
+        cfg["resume"] = resume
 
     # --- Chemins ---
     preprocessed_dir_str = cfg["data"].get("preprocessed_dir")
@@ -618,10 +621,14 @@ def main() -> None:
     parser.add_argument("--source_field", default="0.1T")
     parser.add_argument("--target_field", default="7T")
 
+    # Reprise d'un entraînement interrompu
+    parser.add_argument("--resume", default=None,
+                        help="Chemin vers un checkpoint .pth pour reprendre l'entraînement")
+
     args = parser.parse_args()
 
     if args.mode == "train":
-        train(args.config, env_path=args.env)
+        train(args.config, env_path=args.env, resume=args.resume)
     else:
         if not args.checkpoint:
             parser.error("--checkpoint requis pour le mode infer")
