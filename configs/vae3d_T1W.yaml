@@ -1,0 +1,51 @@
+method: vae3d
+task_name: vae3d_T1W
+
+model:
+  spatial_dims: 3
+  in_channels: 1
+  out_channels: 1
+  latent_channels: 4           # Dimension de l'espace latent
+  channels: [64, 128, 256]     # Canaux par niveau de résolution
+  num_res_blocks: 2
+  norm_num_groups: 32
+  attention_levels: [false, false, false]   # Pas d'attention pour la vitesse
+  with_encoder_nonlocal_attn: false
+  with_decoder_nonlocal_attn: false
+  use_flash_attention: false
+  kl_weight: 1.0e-7            # Critique : trop haut → mauvaise reconstruction
+
+data:
+  modality: T1W
+  split: retro_train
+  # Chemins résolus depuis configs/env/{local,jeanzay}.yaml
+  output_subdir: vae3d/runs/vae3d_T1W
+  domains:
+    - 0.1T
+    - 1.5T
+    - 3T
+    - 5T
+    - 7T
+  # Taille de patch pour l'entraînement (multiple de 16)
+  patch_size: [112, 128, 80]
+  # Taille cible à l'inférence (volumes entiers 512×512×192)
+  target_volume_size: [512, 512, 192]
+  target_spacing: [1.0, 1.0, 1.0]   # mm isotrope, null pour garder spacing original
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+
+train:
+  batch_size: 1
+  num_workers: 4
+  total_epochs: 200
+  lr: 1.0e-4
+  kl_warmup_epochs: 10      # Ramper kl_weight linéairement pendant ces epochs
+  save_every_epochs: 10
+  print_every: 100           # En itérations
+  use_amp: true              # Automatic Mixed Precision (float16)
+  grad_clip: 1.0
+  perceptual_weight: 0.0     # Désactivé en v1 (simplification)
+  adv_weight: 0.0            # Désactivé en v1
+
+  # Multi-GPU (DDP via torchrun)
+  dist_backend: nccl
