@@ -1,0 +1,68 @@
+method: cfm3d
+task_name: cfm3d_latent_T1W
+
+model:
+  spatial_dims: 3
+  # Shape de l'espace latent = volume_size // 8 (3 niveaux de compression du VAE)
+  # 512×512×192 → latent 64×64×24  (en canaux latents=4)
+  in_channels: 5              # latent_channels(4) + source_latent(4) + modality_embedding = géré dans le code
+  latent_channels: 4          # Doit correspondre au VAE
+  model_channels: 128         # Canaux de base du UNet
+  num_res_blocks: 2
+  channel_mult: [1, 2, 4]
+  attention_levels: [false, true, true]   # Attention aux résolutions basses
+  num_head_channels: 64
+  use_gradient_checkpointing: true
+  use_flash_attention: false
+  norm_num_groups: 32
+
+# Chemin vers le VAE pré-entraîné (résolu depuis env ou absolu)
+vae:
+  # source options :
+  #   'local'  → checkpoint entraîné localement (voir vae.checkpoint)
+  #   'maisi'  → autoencoder MAISI depuis MONAI Model Zoo (~1.5GB download)
+  #   'random' → poids aléatoires (débug uniquement)
+  source: local
+  checkpoint: ""              # À remplir : path vers vae3d_T1W/weights/model_best.pth
+  vae_config: "configs/vae3d_T1W.yaml"
+  # maisi_cache_dir: ~/.cache/monai/bundles  # optionnel si source=maisi
+
+data:
+  modality: T1W
+  split: retro_train
+  output_subdir: cfm3d/runs/cfm3d_latent_T1W
+  domains:
+    - 0.1T
+    - 1.5T
+    - 3T
+    - 5T
+    - 7T
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  # Resampling isotrope avant encodage VAE
+  # 364×436×364 @ 0.5mm → 182×218×182 @ 1mm (8× moins de voxels)
+  target_spacing: [1.0, 1.0, 1.0]   # mm, null pour conserver le spacing original
+  # Taille de volume lors de l'encodage (doit correspondre au training du VAE)
+  volume_size: [512, 512, 192]   # Peut être null pour volumes variables
+  max_volumes_per_domain: null   # null = tous les volumes disponibles
+
+train:
+  batch_size: 2               # Par GPU (DDP)
+  num_workers: 4
+  total_iters: 150000
+  lr: 1.0e-4
+  sigma: 0.0                  # OT-CFM déterministe
+  ot_method: exact            # "exact" ou "sinkhorn" (plus rapide pour grands batches)
+  save_every: 5000
+  print_every: 200
+  use_amp: true
+  grad_clip: 1.0
+  ema_decay: 0.9999           # Moyenne mobile exponentielle du modèle
+
+inference:
+  n_steps: 50                 # Euler steps (50 = bon compromis qualité/vitesse)
+  ode_solver: euler           # "euler" ou "dopri5" (adaptatif, 30 NFE typique)
+  source_domain: 0.1T
+  # Sliding window VAE decode pour économiser la mémoire
+  vae_decode_patch_size: [64, 64, 64]
+  vae_decode_overlap: 0.25
