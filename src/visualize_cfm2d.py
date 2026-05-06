@@ -18,7 +18,6 @@ Prérequis :
 import argparse
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -41,6 +40,9 @@ SOURCE_FIELD = "0.1T"
 
 PYTHON = "/home/rousseau/miniforge3/bin/python"
 TRAIN_SCRIPT = Path("/home/rousseau/Exp/mrixfields_2026/src/train_cfm2d.py")
+
+# Symboles importés depuis train_cfm2d (chargement différé dans infer_middle_slices)
+_cfm_imports: dict = {}
 
 
 def _setup_paths(env_arg: str | None) -> None:
@@ -67,54 +69,99 @@ def _setup_paths(env_arg: str | None) -> None:
     RESULTS_DIR = project_root / "results"
     PYTHON = str(env.get("python", Path("python3")))
     TRAIN_SCRIPT = project_root / "src" / "train_cfm2d.py"
+    _cfm_imports.clear()  # force re-import si l'env change
 
 
 # ---------------------------------------------------------------------------
-# Inférence à la volée depuis un checkpoint
+# Inférence à la volée — coupe centrale uniquement (in-process)
 # ---------------------------------------------------------------------------
 
-def run_inference_for_checkpoint(
+def _load_cfm_symbols() -> dict:
+    """Importe les symboles nécessaires depuis train_cfm2d (chargement différé)."""
+    if _cfm_imports:
+        return _cfm_imports
+    src_dir = str(TRAIN_SCRIPT.parent)
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    import train_cfm2d as _cfm  # noqa: F401
+    _cfm_imports.update({
+        "build_unet":       _cfm.build_unet,
+        "_euler_integrate": _cfm._euler_integrate,
+        "DOMAIN_TO_IDX":    _cfm.DOMAIN_TO_IDX,
+        "_pad_slice":       _cfm._pad_slice,
+        "_unpad_slice":     _cfm._unpad_slice,
+        "_resolve_paths":   _cfm._resolve_paths,
+        "_load_env":        _cfm._load_env,
+    })
+    return _cfm_imports
+
+
+def infer_middle_slices(
     checkpoint: Path,
     config: Path,
     modality: str,
     subjects: list,
-    pred_dir: Path,
+    axis: int = 2,
     env_arg: str | None = None,
-) -> None:
-    """Lance train_cfm2d.py --mode infer pour chaque champ cible."""
+) -> dict:
+    """Charge le modèle une fois et infère la coupe centrale de chaque sujet × champ.
+
+    Retourne {subject_id: {target_field: np.ndarray}} — tableaux normalisés [0, 1].
+    """
+    import torch
+    import yaml
+    import nibabel as nib
+
+    sym = _load_cfm_symbols()
+
+    with open(config) as f:
+        cfg = yaml.safe_load(f)
+    cfg = sym["_resolve_paths"](cfg, sym["_load_env"](env_arg))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = sym["build_unet"](cfg, use_checkpoint=False).to(device)
+    state = torch.load(str(checkpoint), map_location=device, weights_only=False)
+    model.load_state_dict(state.get("model", state))
+    model.eval()
+    print(f"Modèle chargé : {checkpoint.name}  ({device})")
+
+    img_size = cfg["model"]["img_size"]
+    n_steps  = cfg.get("inference", {}).get("n_steps", 50)
     input_dir = DATA_DIR / "Training_prospective" / modality / SOURCE_FIELD
 
-    for tgt in TARGET_FIELDS:
-        out_dir = pred_dir / f"{SOURCE_FIELD}_to_{tgt}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # Skip si déjà calculé (tous les sujets présents)
-        already = all(
-            _find_subject_file(out_dir, sid) is not None for sid in subjects
-        )
-        if already:
-            print(f"  Inférence {SOURCE_FIELD}→{tgt} déjà présente, skip.")
+    result: dict = {}
+    total = len(subjects) * len(TARGET_FIELDS)
+    done  = 0
+    for sid in subjects:
+        src_file = _find_subject_file(input_dir, sid)
+        if src_file is None:
+            print(f"  [ATTENTION] Fichier source introuvable : {sid}")
+            result[sid] = {sid: {} for tgt in TARGET_FIELDS}
             continue
 
-        print(f"  Inférence {SOURCE_FIELD}→{tgt} …")
-        cmd = [
-            PYTHON,
-            str(TRAIN_SCRIPT),
-            "--mode", "infer",
-            "--config", str(config),
-            "--checkpoint", str(checkpoint),
-            "--input_dir", str(input_dir),
-            "--output_dir", str(out_dir),
-            "--source_field", SOURCE_FIELD,
-            "--target_field", tgt,
-        ]
-        if env_arg:
-            cmd += ["--env", env_arg]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  [ERREUR] inférence {tgt} :\n{result.stderr[-1000:]}")
-        else:
-            print(f"  OK → {out_dir}")
+        nii_img = nib.load(str(src_file))
+        vol     = nii_img.get_fdata(dtype=np.float32)
+        sl_idx  = vol.shape[axis] // 2
+        sl_src  = np.clip(np.take(vol, sl_idx, axis=axis), 0.0, 1.0)
+
+        result[sid] = {}
+        sl_padded, pad_params = sym["_pad_slice"](sl_src, img_size, img_size)
+        orig_h, orig_w, ph1, pw1 = pad_params
+        x_src = torch.from_numpy(sl_padded * 2.0 - 1.0).float()
+        x_src = x_src.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+
+        for tgt in TARGET_FIELDS:
+            done += 1
+            print(f"  [{done}/{total}] {SOURCE_FIELD}→{tgt}  sujet {sid} …", flush=True)
+            tgt_idx = sym["DOMAIN_TO_IDX"][tgt]
+            x_out   = sym["_euler_integrate"](model, x_src, tgt_idx, device, n_steps)
+            sl_out  = x_out.squeeze().cpu().numpy()
+            sl_out  = np.clip((sl_out + 1.0) / 2.0, 0.0, 1.0)
+            sl_out  = sym["_unpad_slice"](sl_out, orig_h, orig_w, ph1, pw1)
+            result[sid][tgt] = sl_out
+            print(f"      OK")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -171,13 +218,16 @@ def make_figure(
     axis: int,
     out_path: Path,
     pred_dir: Path | None = None,
+    pred_slices: dict | None = None,
 ) -> None:
     """Génère la grille de comparaison.
 
-    pred_dir : répertoire contenant les sous-dossiers <src>_to_<tgt>/.
-    Si None, utilise EXP_DIR/predictions/<modality>/.
+    pred_slices : dict {subject_id: {target_field: np.ndarray}} pré-calculé.
+    pred_dir    : répertoire contenant les sous-dossiers <src>_to_<tgt>/
+                  (utilisé si pred_slices est None).
+    Si les deux sont None, utilise EXP_DIR/predictions/<modality>/.
     """
-    if pred_dir is None:
+    if pred_slices is None and pred_dir is None:
         pred_dir = EXP_DIR / "predictions" / modality
 
     col_labels = [f"{SOURCE_FIELD}\n(input)"]
@@ -207,14 +257,20 @@ def make_figure(
             col_pred = 1 + 2 * tgt_idx
             col_gt = col_pred + 1
 
-            # Prédiction
-            tgt_pred_dir = pred_dir / f"{SOURCE_FIELD}_to_{tgt_field}"
-            pred_file = _find_subject_file(tgt_pred_dir, subject_id)
-            if pred_file is not None:
-                sl_pred = _normalize(_load_mid_slice(pred_file, axis))
+            # Prédiction — depuis dict pré-calculé ou depuis fichier
+            if pred_slices is not None:
+                arr = pred_slices.get(subject_id, {}).get(tgt_field)
+                sl_pred = _normalize(arr) if arr is not None else np.zeros((64, 64))
+                if arr is None:
+                    print(f"  [ATTENTION] Prédiction manquante dans pred_slices : {subject_id}/{tgt_field}")
             else:
-                sl_pred = np.zeros((64, 64))
-                print(f"  [ATTENTION] Prédiction manquante : {tgt_pred_dir} / {subject_id}")
+                tgt_pred_dir = pred_dir / f"{SOURCE_FIELD}_to_{tgt_field}"
+                pred_file = _find_subject_file(tgt_pred_dir, subject_id)
+                if pred_file is not None:
+                    sl_pred = _normalize(_load_mid_slice(pred_file, axis))
+                else:
+                    sl_pred = np.zeros((64, 64))
+                    print(f"  [ATTENTION] Prédiction manquante : {tgt_pred_dir} / {subject_id}")
 
             # Ground truth
             gt_dir = DATA_DIR / "Training_prospective" / modality / tgt_field
@@ -289,13 +345,15 @@ def main() -> None:
             print(f"[ERREUR] Config introuvable : {config}", file=sys.stderr)
             sys.exit(1)
 
-        pred_dir = EXP_DIR / "predictions_ckpt" / args.modality / step_tag
-        run_inference_for_checkpoint(
-            ckpt, config, args.modality, args.subjects, pred_dir, env_arg=args.env
-        )
-
         if args.out is None:
             args.out = str(RESULTS_DIR / f"cfm2d_{args.modality.lower()}_{step_tag}.png")
+
+        pred_slices = infer_middle_slices(
+            ckpt, config, args.modality, args.subjects,
+            axis=args.axis, env_arg=args.env,
+        )
+    else:
+        pred_slices = None
 
     out_path = Path(args.out) if args.out else (
         RESULTS_DIR / f"cfm2d_{args.modality.lower()}.png"
@@ -307,6 +365,7 @@ def main() -> None:
         axis=args.axis,
         out_path=out_path,
         pred_dir=pred_dir,
+        pred_slices=pred_slices,
     )
 
 

@@ -6,10 +6,11 @@
 # QOS : qos_gpu_h100-t4 (100h max)
 #
 # Durée estimée sur H100 (×10 vs GB10) :
-#   100k iters, batch=8, 512×512 : ~6-10h
+#   100k iters, batch=16, 512×512 : ~6-12h selon data loader / contention GPU
 #
 # Lancement :
 #   sbatch src/slurm/cfm_jeanzay.slurm T1W
+#   sbatch src/slurm/cfm_jeanzay.slurm T1W configs/cfm_T1W_h100_b16.yaml
 #   sbatch src/slurm/cfm_jeanzay.slurm T2W
 #   sbatch src/slurm/cfm_jeanzay.slurm T2FLAIR
 #
@@ -25,7 +26,7 @@
 
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=10
+#SBATCH --cpus-per-task=16
 #SBATCH --ntasks=1
 
 #SBATCH --partition=gpu_p6
@@ -41,6 +42,7 @@
 set -e
 
 MODALITY="${1:-T1W}"
+CONFIG_ARG="${2:-}"
 CODE_DIR="$WORK/MRIX/mrixfields_2026"
 mkdir -p "$CODE_DIR/logs"
 
@@ -105,14 +107,41 @@ echo "GPU            : $(nvidia-smi --query-gpu=name,memory.total --format=csv,n
 # ─── Lancement ───────────────────────────────────────────────────────────────
 cd "$CODE_DIR"
 
-CONFIG="configs/cfm_${MODALITY}.yaml"
+if [ -n "$CONFIG_ARG" ]; then
+    CONFIG="$CONFIG_ARG"
+elif [ -f "configs/cfm_${MODALITY}_h100_b16.yaml" ]; then
+    CONFIG="configs/cfm_${MODALITY}_h100_b16.yaml"
+else
+    CONFIG="configs/cfm_${MODALITY}.yaml"
+fi
+
 if [ ! -f "$CONFIG" ]; then
     echo "[ERREUR] Config introuvable : $CONFIG"
     exit 1
 fi
 
+echo "Config          : $CONFIG"
+
+OUTPUT_SUBDIR=$(python3 - "$CONFIG" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    cfg = yaml.safe_load(f)
+print(cfg["data"]["output_subdir"])
+PY
+)
+
+TASK_NAME=$(python3 - "$CONFIG" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    cfg = yaml.safe_load(f)
+print(cfg.get("task_name", "cfm2d"))
+PY
+)
+echo "Run name        : $TASK_NAME"
+echo "Output subdir   : $OUTPUT_SUBDIR"
+
 # Reprendre depuis le dernier checkpoint si disponible
-WEIGHTS_DIR="$WORK/MRIX/mrixfields_2026/outputs/cfm2d/runs/cfm2d_${MODALITY}/weights"
+WEIGHTS_DIR="$WORK/MRIX/mrixfields_2026/outputs/${OUTPUT_SUBDIR}/weights"
 RESUME_CKPT=""
 if [ -d "$WEIGHTS_DIR" ]; then
     LAST_CKPT=$(ls "$WEIGHTS_DIR"/checkpoint_*.pth 2>/dev/null | sort -V | tail -1)

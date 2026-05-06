@@ -1,0 +1,33 @@
+method: cfm2d
+task_name: cfm2d_T1W_H100_B16
+
+model:
+  img_size: 512
+  model_channels: 128
+  num_res_blocks: 2
+  use_gradient_checkpointing: true
+
+data:
+  modality: T1W
+  split: retro_train
+  preprocessed_subdir: stargan2d/preprocessed
+  output_subdir: cfm2d/runs/cfm2d_T1W_H100_B16
+  domains:
+    - 0.1T
+    - 1.5T
+    - 3T
+    - 5T
+    - 7T
+
+train:
+  batch_size: 16
+  num_workers: 8
+  total_iters: 100000
+  lr: 0.0001
+  sigma: 0.0
+  save_every: 5000
+  print_every: 100
+
+inference:
+  n_steps: 50
+  source_field: 0.1T

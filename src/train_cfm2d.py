@@ -26,6 +26,7 @@ import argparse
 import os
 import random
 import time
+from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -380,7 +381,11 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
 
     model.train()
     t0 = time.time()
+    last_log_t = t0
     loss_accum = 0.0
+    ema_loss: Optional[float] = None
+    recent_losses: deque[float] = deque(maxlen=print_every)
+    last_grad_norm = 0.0
 
     for step in range(start_iter, total_iters):
         # ---- Tirer deux domaines distincts ----
@@ -407,24 +412,46 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        last_grad_norm = float(grad_norm)
         optimizer.step()
         scheduler.step()
 
-        loss_accum += loss.item()
+        loss_value = float(loss.item())
+        loss_accum += loss_value
+        recent_losses.append(loss_value)
+        ema_loss = loss_value if ema_loss is None else (0.98 * ema_loss + 0.02 * loss_value)
 
         # ---- Logging ----
         if (step + 1) % print_every == 0:
             avg_loss = loss_accum / print_every
             lr_cur = scheduler.get_last_lr()[0]
             elapsed = time.time() - t0
+            window_dt = time.time() - last_log_t
+            steps_done = step + 1 - start_iter
+            iter_per_sec = steps_done / max(elapsed, 1e-9)
+            window_iter_per_sec = print_every / max(window_dt, 1e-9)
+            eta_sec = (total_iters - (step + 1)) / max(iter_per_sec, 1e-9)
+            recent_avg = sum(recent_losses) / max(len(recent_losses), 1)
+            mem_gb = 0.0
+            if device.type == "cuda":
+                mem_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
             print(
-                f"[{step+1:6d}/{total_iters}]  loss={avg_loss:.4f}"
+                f"[{step+1:6d}/{total_iters}]"
+                f"  loss={avg_loss:.4f}"
+                f"  recent={recent_avg:.4f}"
+                f"  ema={ema_loss:.4f}"
+                f"  last={loss_value:.4f}"
+                f"  grad={last_grad_norm:.2f}"
                 f"  lr={lr_cur:.2e}"
-                f"  {src_field}→{tgt_field}"
+                f"  pair={src_field}→{tgt_field}"
+                f"  speed={window_iter_per_sec:.2f} it/s"
+                f"  eta={eta_sec/3600:.2f}h"
                 f"  t={elapsed/60:.1f}min"
+                + (f"  max_mem={mem_gb:.1f}GB" if device.type == "cuda" else "")
             )
             loss_accum = 0.0
+            last_log_t = time.time()
 
         # ---- Checkpoint intermédiaire ----
         if (step + 1) % save_every == 0:
@@ -558,7 +585,11 @@ def infer(
     for nii_path in nifti_files:
         print(f"  {nii_path.name} …", end=" ", flush=True)
         nii_img = nib.load(str(nii_path))
-        vol = nii_img.get_fdata(dtype=np.float32)  # (H, W, D) in [0, 1]
+        vol = nii_img.get_fdata(dtype=np.float32)
+
+        # Normaliser min-max sur le volume entier (cohérent avec entraînement NIfTIDomainDataset)
+        vmin, vmax = float(vol.min()), float(vol.max())
+        vol = (vol - vmin) / (vmax - vmin) if vmax > vmin else np.zeros_like(vol)
 
         # Inférence coupe par coupe selon l'axe axial (axis=2)
         slice_axis = 2
@@ -567,8 +598,7 @@ def infer(
 
         for s_idx in range(n_slices):
             sl = np.take(vol, s_idx, axis=slice_axis)  # (H, W)
-
-            # Normaliser à [0,1] (au cas où les valeurs dépassent)
+            # Déjà normalisé en [0,1], clip par sécurité
             sl = np.clip(sl, 0.0, 1.0)
 
             # Pad/crop → img_size × img_size
