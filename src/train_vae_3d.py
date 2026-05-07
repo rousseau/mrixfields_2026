@@ -19,6 +19,7 @@ Usage :
 """
 
 import argparse
+import inspect
 import os
 import time
 from collections import deque
@@ -240,18 +241,27 @@ class NIfTIVolumeDataset(Dataset):
 def build_vae(cfg: dict) -> AutoencoderKL:
     """Construit un AutoencoderKL 3D via MONAI."""
     m = cfg["model"]
-    return AutoencoderKL(
-        spatial_dims=m["spatial_dims"],
-        in_channels=m["in_channels"],
-        out_channels=m["out_channels"],
-        latent_channels=m["latent_channels"],
-        channels=tuple(m["channels"]),
-        num_res_blocks=m["num_res_blocks"],
-        norm_num_groups=m["norm_num_groups"],
-        attention_levels=tuple(m["attention_levels"]),
-        with_encoder_nonlocal_attn=m["with_encoder_nonlocal_attn"],
-        with_decoder_nonlocal_attn=m["with_decoder_nonlocal_attn"],
-    )
+    sig = inspect.signature(AutoencoderKL.__init__).parameters
+    kwargs = {
+        "spatial_dims": m["spatial_dims"],
+        "in_channels": m["in_channels"],
+        "out_channels": m["out_channels"],
+        "latent_channels": m["latent_channels"],
+        "num_res_blocks": m["num_res_blocks"],
+        "norm_num_groups": m["norm_num_groups"],
+        "attention_levels": tuple(m["attention_levels"]),
+        "with_encoder_nonlocal_attn": m["with_encoder_nonlocal_attn"],
+        "with_decoder_nonlocal_attn": m["with_decoder_nonlocal_attn"],
+    }
+
+    channels = tuple(m["channels"])
+    if "channels" in sig:
+        kwargs["channels"] = channels
+    elif "num_channels" in sig:
+        kwargs["num_channels"] = channels
+
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig}
+    return AutoencoderKL(**filtered_kwargs)
 
 
 # ===========================================================================
