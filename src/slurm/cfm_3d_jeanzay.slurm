@@ -79,24 +79,21 @@ try:
     from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
 except Exception:
     try:
-        from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+        from monai.generative.networks.nets import AutoencoderKL, DiffusionModelUNet
     except Exception:
-        raise SystemExit(1)
+        try:
+            from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+        except Exception:
+            raise SystemExit(1)
 raise SystemExit(0)
 PY
     then
         echo "[INFO] AutoencoderKL/DiffusionModelUNet disponibles."
     else
-        echo "[INFO] Installation de monai-generative (AutoencoderKL/DiffusionModelUNet)..."
-        pip install --user --quiet monai-generative
-        # Re-vérification explicite après installation.
-        python3 - <<'PY'
-try:
-    from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
-except Exception:
-    from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
-print("[INFO] MONAI generative OK")
-PY
+        echo "[ERREUR] AutoencoderKL/DiffusionModelUNet introuvables dans l'environnement." >&2
+        echo "         Sur JeanZay (compute node sans internet), l'installation pip dynamique peut échouer." >&2
+        echo "         Pré-installez sur l'environnement partagé via login node, puis relancez." >&2
+        exit 1
     fi
 }
 _ensure_monai_generative_models

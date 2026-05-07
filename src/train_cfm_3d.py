@@ -53,13 +53,17 @@ try:
     from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
 except ImportError:
     try:
+        # MONAI avec sous-module generative
+        from monai.generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+    except ImportError:
+        try:
         # MONAI Generative package (namespace séparé)
-        from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
-    except ImportError as e:
-        raise ImportError(
-            "AutoencoderKL/DiffusionModelUNet introuvables. "
-            "Installez MONAI generative avec : pip install monai-generative"
-        ) from e
+            from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+        except ImportError as e:
+            raise ImportError(
+                "AutoencoderKL/DiffusionModelUNet introuvables. Essayez : "
+                "monai>=1.3, monai[generation], ou monai-generative"
+            ) from e
 
 from torchcfm.conditional_flow_matching import (
     ConditionalFlowMatcher,

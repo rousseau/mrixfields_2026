@@ -41,13 +41,17 @@ try:
     from monai.networks.nets import AutoencoderKL
 except ImportError:
     try:
+        # MONAI avec sous-module generative
+        from monai.generative.networks.nets import AutoencoderKL
+    except ImportError:
+        try:
         # MONAI Generative package (namespace séparé)
-        from generative.networks.nets import AutoencoderKL
-    except ImportError as e:
-        raise ImportError(
-            "AutoencoderKL introuvable. Installez MONAI generative avec : "
-            "pip install monai-generative"
-        ) from e
+            from generative.networks.nets import AutoencoderKL
+        except ImportError as e:
+            raise ImportError(
+                "AutoencoderKL introuvable. Essayez l'un des paquets : "
+                "monai>=1.3, monai[generation], ou monai-generative"
+            ) from e
 
 # ---------------------------------------------------------------------------
 # Constants
