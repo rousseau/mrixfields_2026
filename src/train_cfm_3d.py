@@ -49,9 +49,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 try:
+    # MONAI récent (intégration generative dans monai.networks)
     from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
 except ImportError:
-    raise ImportError("MONAI >= 1.3 requis. pip install 'monai[all]>=1.3.0'")
+    try:
+        # MONAI Generative package (namespace séparé)
+        from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+    except ImportError as e:
+        raise ImportError(
+            "AutoencoderKL/DiffusionModelUNet introuvables. "
+            "Installez MONAI generative avec : pip install monai-generative"
+        ) from e
 
 from torchcfm.conditional_flow_matching import (
     ConditionalFlowMatcher,

@@ -37,11 +37,17 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 # MONAI generative models
 try:
+    # MONAI récent (intégration generative dans monai.networks)
     from monai.networks.nets import AutoencoderKL
 except ImportError:
-    raise ImportError(
-        "MONAI >= 1.3 requis. Installez avec : pip install 'monai[all]>=1.3.0'"
-    )
+    try:
+        # MONAI Generative package (namespace séparé)
+        from generative.networks.nets import AutoencoderKL
+    except ImportError as e:
+        raise ImportError(
+            "AutoencoderKL introuvable. Installez MONAI generative avec : "
+            "pip install monai-generative"
+        ) from e
 
 # ---------------------------------------------------------------------------
 # Constants
