@@ -326,17 +326,41 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
         is_training=True,
         target_spacing=target_spacing,
     )
-    val_ds = NIfTIVolumeDataset(
-        data_root=Path(data_root),
-        split="pro_val",
-        modality=modality,
-        domains=domains,
-        patch_size=patch_size,
-        percentile_lower=p_lo,
-        percentile_upper=p_hi,
-        is_training=False,
-        target_spacing=target_spacing,
-    )
+    
+    # Essayer de charger un dataset de validation spécifique;
+    # si inexistant, faire un split simple du training set.
+    val_split_fraction = cfg["data"].get("val_split_fraction", 0.2)
+    try:
+        val_ds = NIfTIVolumeDataset(
+            data_root=Path(data_root),
+            split="pro_val",
+            modality=modality,
+            domains=domains,
+            patch_size=patch_size,
+            percentile_lower=p_lo,
+            percentile_upper=p_hi,
+            is_training=False,
+            target_spacing=target_spacing,
+        )
+        if is_main_process():
+            print(f"  → Validation dataset chargé depuis Validating_prospective")
+    except FileNotFoundError as e:
+        if is_main_process():
+            print(f"  [INFO] Validation dataset non trouvé")
+            print(f"  → Création d'un split train/val depuis {split} ({int((1-val_split_fraction)*100)}% train, {int(val_split_fraction*100)}% val)")
+        # Split simple du training set
+        from torch.utils.data import Subset
+        full_ds = train_ds
+        n_total = len(full_ds)
+        n_val = max(1, int(n_total * val_split_fraction))
+        indices = list(range(n_total))
+        # Utiliser un seed fixe pour reproductibilité sur tous les processus
+        rng = np.random.RandomState(42)
+        rng.shuffle(indices)
+        train_indices = indices[n_val:]
+        val_indices = indices[:n_val]
+        train_ds = Subset(full_ds, train_indices)
+        val_ds = Subset(full_ds, val_indices)
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if is_distributed else None
     train_loader = DataLoader(
