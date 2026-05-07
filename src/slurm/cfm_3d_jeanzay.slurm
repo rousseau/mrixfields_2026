@@ -74,7 +74,7 @@ _install_if_missing monai       "monai[all]>=1.3.0"
 
 # Vérifie explicitement la disponibilité des modèles generative
 _ensure_monai_generative_models() {
-    python3 - <<'PY' >/dev/null 2>&1
+    if python3 - <<'PY' >/dev/null 2>&1
 try:
     from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
 except Exception:
@@ -84,9 +84,19 @@ except Exception:
         raise SystemExit(1)
 raise SystemExit(0)
 PY
-    if [ $? -ne 0 ]; then
+    then
+        echo "[INFO] AutoencoderKL/DiffusionModelUNet disponibles."
+    else
         echo "[INFO] Installation de monai-generative (AutoencoderKL/DiffusionModelUNet)..."
         pip install --user --quiet monai-generative
+        # Re-vérification explicite après installation.
+        python3 - <<'PY'
+try:
+    from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
+except Exception:
+    from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+print("[INFO] MONAI generative OK")
+PY
     fi
 }
 _ensure_monai_generative_models
