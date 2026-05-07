@@ -170,10 +170,12 @@ class NIfTILatentDataset(Dataset):
         percentile_upper: float = 99.5,
         max_per_domain: Optional[int] = None,
         target_spacing: Optional[Tuple[float, float, float]] = None,
+        volume_size: Optional[Tuple[int, int, int]] = None,
     ):
         self.percentile_lower = percentile_lower
         self.percentile_upper = percentile_upper
         self.target_spacing = target_spacing
+        self.volume_size = volume_size
 
         split_dir = _SPLIT_ABBR_TO_DIR.get(split, split)
         self.samples: List[Tuple[Path, int]] = []
@@ -205,6 +207,30 @@ class NIfTILatentDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _center_crop_or_pad(self, vol: np.ndarray) -> np.ndarray:
+        if self.volume_size is None:
+            return vol
+
+        th, tw, td = self.volume_size
+        h, w, d = vol.shape
+
+        # Pad si le volume est trop petit sur un axe.
+        ph = max(0, th - h)
+        pw = max(0, tw - w)
+        pd = max(0, td - d)
+        if ph > 0 or pw > 0 or pd > 0:
+            vol = np.pad(
+                vol,
+                [(ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (pd // 2, pd - pd // 2)],
+                mode="reflect",
+            )
+            h, w, d = vol.shape
+
+        sh = max((h - th) // 2, 0)
+        sw = max((w - tw) // 2, 0)
+        sd = max((d - td) // 2, 0)
+        return vol[sh: sh + th, sw: sw + tw, sd: sd + td]
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         path, domain_idx = self.samples[idx]
         img_nib = nib.load(str(path))
@@ -215,6 +241,7 @@ class NIfTILatentDataset(Dataset):
         else:
             vol = img_nib.get_fdata(dtype=np.float32)
         vol = self._normalize(vol)
+        vol = self._center_crop_or_pad(vol)
         tensor = torch.from_numpy(vol).unsqueeze(0)  # (1, H, W, D)
         return tensor, domain_idx
 
@@ -454,6 +481,8 @@ def train(
     p_lo        = cfg["data"].get("percentile_lower", 0.5)
     p_hi        = cfg["data"].get("percentile_upper", 99.5)
     max_per_dom = cfg["data"].get("max_volumes_per_domain", None)
+    raw_vs      = cfg["data"].get("volume_size", None)
+    volume_size = tuple(int(v) for v in raw_vs) if raw_vs else None
     raw_ts      = cfg["data"].get("target_spacing", None)
     target_spacing = tuple(float(v) for v in raw_ts) if raw_ts else None
 
@@ -501,6 +530,7 @@ def train(
         percentile_upper=p_hi,
         max_per_domain=max_per_dom,
         target_spacing=target_spacing,
+        volume_size=volume_size,
     )
 
     # Pour chaque domaine, un loader infini séparé (comme en 2D)
