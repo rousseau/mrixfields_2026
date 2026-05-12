@@ -341,9 +341,24 @@ def create_medvae(
 ) -> Optional[nn.Module]:
     """Create MedVAE model (requires medvae package)."""
     try:
+        import os
         from medvae import MVAE
-        model = MVAE(model_name="medvae_4_1_3d", modality="mri")
-        return model.to(device)
+        # On Jean Zay compute nodes, use local_files_only to avoid network access.
+        # Weights must be pre-downloaded on login node or already cached.
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        try:
+            model = MVAE(model_name="medvae_4_1_3d", modality="mri")
+            return model.to(device)
+        except Exception as e:
+            if "Network is unreachable" in str(e) or "LocalEntryNotFoundError" in str(type(e).__name__):
+                print("\n⚠️ MEDVAE WEIGHTS NOT FOUND IN CACHE")
+                print("On Jean Zay, pre-download weights on login node:")
+                print("  module purge && module load pytorch-gpu/py3/2.5.0")
+                print("  export PYTHONUSERBASE=$WORK/.local")
+                print("  python3 -c 'from medvae import MVAE; MVAE(model_name=\"medvae_4_1_3d\", modality=\"mri\")'")
+                print("Then resubmit your job.\n")
+                raise
+            raise
     except ImportError:
         print("⚠ MedVAE not installed: pip install medvae")
         return None

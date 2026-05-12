@@ -67,6 +67,8 @@ module load pytorch-gpu/py3/2.5.0
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 export TORCH_HOME="$WORK/.cache/torch"
+# Avoid CUDA memory fragmentation on long-running training
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 _install_if_missing() {
   python3 -c "import $1" >/dev/null 2>&1 || pip install --user --quiet "$2"
