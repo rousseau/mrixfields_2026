@@ -23,7 +23,7 @@ vae:
   #   'maisi'  → autoencoder MAISI depuis MONAI Model Zoo (~1.5GB download)
   #   'random' → poids aléatoires (débug uniquement)
   source: local
-  checkpoint: ""              # À remplir : path vers vae3d_T1W/weights/model_best.pth
+  checkpoint: "outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth"
   vae_config: "configs/vae3d_T1W.yaml"
   # maisi_cache_dir: ~/.cache/monai/bundles  # optionnel si source=maisi
 
