@@ -525,6 +525,19 @@ def train(args: argparse.Namespace) -> None:
                     + args.lambda_cross * cross_loss
                 )
 
+            if not torch.isfinite(total):
+                print(
+                    f"[WARN] step={step} non-finite loss detected "
+                    f"(total={float(total.detach().cpu().item())}, "
+                    f"recon={float(recon_loss.detach().cpu().item())}, "
+                    f"vq={float(vq_loss.detach().cpu().item())}, "
+                    f"adv={float(adv_loss.detach().cpu().item())}, "
+                    f"cross={float(cross_loss.detach().cpu().item())}). "
+                    "Skipping optimizer step."
+                )
+                opt.zero_grad(set_to_none=True)
+                continue
+
             scaler.scale(total).backward()
             if args.grad_clip > 0:
                 scaler.unscale_(opt)
@@ -589,7 +602,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--steps", type=int, default=2000)
-    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
 

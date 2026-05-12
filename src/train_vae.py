@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import inspect
 import os
 import time
 from pathlib import Path
@@ -290,20 +291,30 @@ class HybridMRIDataset(Dataset):
 # ============================================================================
 
 def create_aekl_vae(device: str = "cuda") -> nn.Module:
-    """Create AEKL model using MONAI AutoencoderKL."""
-    # Build config similar to vae3d_T1W.yaml
-    model = AutoencoderKL(
-        spatial_dims=3,
-        in_channels=1,
-        out_channels=1,
-        channels=(64, 128, 256),  # Channels per resolution level
-        latent_channels=4,
-        num_res_blocks=2,
-        norm_num_groups=32,
-        attention_levels=(False, False, False),
-        with_encoder_nonlocal_attn=False,
-        with_decoder_nonlocal_attn=False,
-    )
+    """Create AEKL model with MONAI-version-compatible kwargs."""
+    sig = inspect.signature(AutoencoderKL.__init__).parameters
+
+    channels = (64, 128, 256)
+    kwargs = {
+        "spatial_dims": 3,
+        "in_channels": 1,
+        "out_channels": 1,
+        "latent_channels": 4,
+        "num_res_blocks": 2,
+        "norm_num_groups": 32,
+        "attention_levels": (False, False, False),
+        "with_encoder_nonlocal_attn": False,
+        "with_decoder_nonlocal_attn": False,
+    }
+
+    # MONAI API can expose either channels or num_channels.
+    if "channels" in sig:
+        kwargs["channels"] = channels
+    elif "num_channels" in sig:
+        kwargs["num_channels"] = channels
+
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig}
+    model = AutoencoderKL(**filtered_kwargs)
     return model.to(device)
 
 

@@ -72,12 +72,24 @@ _install_if_missing() {
   python3 -c "import $1" >/dev/null 2>&1 || pip install --user --quiet "$2"
 }
 
+_require_module() {
+  python3 -c "import $1" >/dev/null 2>&1 || {
+    echo "[ERREUR] Module Python manquant: $1"
+    echo "Installez-le sur login node puis relancez:"
+    echo "  module purge && module load arch/h100 && module load pytorch-gpu/py3/2.5.0"
+    echo "  export PYTHONUSERBASE=$WORK/.local && export PATH=$WORK/.local/bin:$PATH"
+    echo "  pip install --user $1"
+    exit 1
+  }
+}
+
 _install_if_missing nibabel nibabel
 _install_if_missing scipy scipy
 _install_if_missing einops einops
 
 if [[ "$VAE_TYPE" == "medvae" ]]; then
-  _install_if_missing medvae medvae
+  # Compute nodes may not have external network access; require preinstalled package.
+  _require_module medvae
 fi
 
 if [[ ! -d "$DATA_ROOT" ]]; then
