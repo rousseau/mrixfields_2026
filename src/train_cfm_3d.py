@@ -408,11 +408,14 @@ def build_unet_3d(cfg: dict, latent_channels: int) -> DiffusionModelUNet:
     base_channels = m.get("model_channels", 128)
     channels = tuple(base_channels * c for c in channel_mult)
 
+    _sig = inspect.signature(DiffusionModelUNet.__init__).parameters
+    _ch_kwarg = "num_channels" if "num_channels" in _sig else "channels"
+
     return DiffusionModelUNet(
         spatial_dims=3,
         in_channels=2 * latent_channels,         # cat(z_t, z_src)
         out_channels=latent_channels,
-        channels=channels,
+        **{_ch_kwarg: channels},
         attention_levels=tuple(m.get("attention_levels", [False, True, True])),
         num_res_blocks=m.get("num_res_blocks", 2),
         num_head_channels=m.get("num_head_channels", 64),
