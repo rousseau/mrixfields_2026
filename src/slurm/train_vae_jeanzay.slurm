@@ -54,8 +54,13 @@ DATA_ROOT="${DATA_ROOT:-$WORK/MRIX/data}"
 OUT_ROOT="${OUT_ROOT:-$WORK/MRIX/outputs}"
 
 STEPS="${STEPS:-20000}"
-BATCH_SIZE="${BATCH_SIZE:-2}"
 LR="${LR:-1e-4}"
+
+DEFAULT_BATCH_SIZE=2
+if [[ "$VAE_TYPE" == "vqvae" ]]; then
+  DEFAULT_BATCH_SIZE=1
+fi
+BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_BATCH_SIZE}"
 
 mkdir -p "$CODE_DIR/logs"
 mkdir -p "$OUT_ROOT"

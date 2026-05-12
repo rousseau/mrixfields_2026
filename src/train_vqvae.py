@@ -219,7 +219,9 @@ class EMAVectorQuantizer(nn.Module):
         self.eps = eps
         self.beta = beta
 
-        embed = torch.randn(num_embeddings, embedding_dim)
+        # Match NeuroQuant-style small codebook init to avoid early distance explosions.
+        embed = torch.empty(num_embeddings, embedding_dim)
+        embed.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
         self.register_buffer("embedding", embed)
         self.register_buffer("ema_count", torch.zeros(num_embeddings))
         self.register_buffer("ema_weight", embed.clone())
@@ -227,17 +229,20 @@ class EMAVectorQuantizer(nn.Module):
     def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # z_e: (B,C,H,W,D)
         b, c, h, w, d = z_e.shape
-        z_flat = z_e.permute(0, 2, 3, 4, 1).contiguous().view(-1, c)
+        # Compute VQ assignment in fp32 for numerical stability under AMP.
+        z_flat = z_e.float().permute(0, 2, 3, 4, 1).contiguous().view(-1, c)
+        embedding_fp32 = self.embedding.float()
 
         # distances L2
         dist = (
             z_flat.pow(2).sum(dim=1, keepdim=True)
-            - 2 * z_flat @ self.embedding.t()
-            + self.embedding.pow(2).sum(dim=1, keepdim=True).t()
+            - 2 * z_flat @ embedding_fp32.t()
+            + embedding_fp32.pow(2).sum(dim=1, keepdim=True).t()
         )
         indices = torch.argmin(dist, dim=1)
-        z_q = self.embedding.index_select(0, indices)
+        z_q = embedding_fp32.index_select(0, indices)
         z_q = z_q.view(b, h, w, d, c).permute(0, 4, 1, 2, 3).contiguous()
+        z_q = z_q.to(dtype=z_e.dtype)
 
         if self.training:
             onehot = F.one_hot(indices, self.num_embeddings).type_as(z_flat)
@@ -249,11 +254,12 @@ class EMAVectorQuantizer(nn.Module):
 
             n = self.ema_count.sum()
             smoothed = (self.ema_count + self.eps) / (n + self.num_embeddings * self.eps) * n
+            smoothed = smoothed.clamp_min(1e-6)
             self.embedding.copy_(self.ema_weight / smoothed.unsqueeze(1))
 
         # straight-through + commitment
         z_q_st = z_e + (z_q - z_e).detach()
-        commit_loss = self.beta * F.mse_loss(z_e, z_q.detach())
+        commit_loss = self.beta * F.mse_loss(z_e.float(), z_q.detach().float())
 
         probs = F.one_hot(indices, self.num_embeddings).float().mean(dim=0)
         perplexity = torch.exp(-(probs * torch.log(probs + 1e-10)).sum())
@@ -470,6 +476,21 @@ def train(args: argparse.Namespace) -> None:
 
     step = 0
     t0 = time.time()
+
+    def _linear_ramp(step_id: int, start: int, ramp_steps: int, max_val: float) -> float:
+        if step_id < start:
+            return 0.0
+        if ramp_steps <= 0:
+            return float(max_val)
+        p = min(1.0, (step_id - start) / max(1, ramp_steps))
+        return float(max_val * p)
+
+    def _grl_sigmoid(step_id: int, start: int, total_steps: int, max_alpha: float) -> float:
+        if step_id < start:
+            return 0.0
+        p = min(1.0, (step_id - start) / max(1, total_steps - start))
+        return float(max_alpha * (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0))
+
     while step < args.steps:
         for batch in loader:
             if step >= args.steps:
@@ -488,6 +509,10 @@ def train(args: argparse.Namespace) -> None:
             model.train()
             opt.zero_grad(set_to_none=True)
 
+            cross_w = _linear_ramp(step, args.cross_start_step, args.cross_ramp_steps, args.lambda_cross)
+            adv_w = _linear_ramp(step, args.adv_start_step, args.adv_ramp_steps, args.lambda_adv)
+            grl_lambda = _grl_sigmoid(step, args.adv_start_step, args.steps, args.adv_grl_lambda)
+
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 out_src = model.forward_src(x_src, src_mod, src_field)
                 x_rec = out_src["x_rec"]
@@ -495,7 +520,6 @@ def train(args: argparse.Namespace) -> None:
                 vq_loss = out_src["vq_loss"]
 
                 # Adversary modalité sur code anatomique (invariance)
-                grl_lambda = args.adv_grl_lambda
                 logits_adv = model.adversary(out_src["z_anat"], grl_lambda=grl_lambda)
                 adv_loss = F.cross_entropy(logits_adv, src_mod)
 
@@ -521,8 +545,8 @@ def train(args: argparse.Namespace) -> None:
                 total = (
                     args.lambda_recon * recon_loss
                     + args.lambda_vq * vq_loss
-                    + args.lambda_adv * adv_loss
-                    + args.lambda_cross * cross_loss
+                    + adv_w * adv_loss
+                    + cross_w * cross_loss
                 )
 
             if not torch.isfinite(total):
@@ -555,6 +579,9 @@ def train(args: argparse.Namespace) -> None:
                     f"vq={float(vq_loss.item()):.4f} "
                     f"adv={float(adv_loss.item()):.4f} "
                     f"cross={float(cross_loss.item()):.4f} "
+                    f"w_adv={adv_w:.4f} "
+                    f"w_cross={cross_w:.4f} "
+                    f"grl={grl_lambda:.3f} "
                     f"paired={paired_ratio:.2f} "
                     f"ppl={float(out_src['perplexity'].item()):.1f} "
                     f"t={elapsed/60:.1f}min"
@@ -599,7 +626,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vq-decay", type=float, default=0.99)
     p.add_argument("--vq-beta", type=float, default=0.25)
 
-    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -611,6 +638,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda-adv", type=float, default=1e-3)
     p.add_argument("--lambda-cross", type=float, default=0.5)
     p.add_argument("--adv-grl-lambda", type=float, default=0.5)
+    p.add_argument("--cross-start-step", type=int, default=500)
+    p.add_argument("--cross-ramp-steps", type=int, default=1000)
+    p.add_argument("--adv-start-step", type=int, default=1500)
+    p.add_argument("--adv-ramp-steps", type=int, default=1000)
 
     p.add_argument("--print-every", type=int, default=20)
     p.add_argument("--save-every", type=int, default=200)
