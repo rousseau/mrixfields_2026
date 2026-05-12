@@ -1,0 +1,4 @@
+modality,n_fields,n_subjects
+T1W,5,3
+T2W,5,3
+T2FLAIR,5,3
