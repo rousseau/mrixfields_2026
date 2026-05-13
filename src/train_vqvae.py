@@ -684,7 +684,7 @@ def train(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train VQ-VAE 3D hybride paired/unpaired (MRIxFields)")
     p.add_argument("--data-root", type=str, default="/home/rousseau/Data/MRIxFields_20260414")
-    p.add_argument("--output-dir", type=str, default="outputs/vqvae3d/runs/vqvae3d_hybrid")
+    p.add_argument("--output-dir", type=str, default="outputs/vqvae3d", help="Output directory for weights and checkpoints (relative to mrixfields_2026/)")
 
     p.add_argument("--splits", nargs="+", default=["retro_train"])
     p.add_argument("--modalities", nargs="+", default=MODALITIES)

@@ -49,7 +49,7 @@ FIELDS="${3:-0.1T 1.5T 3T 5T 7T}"
 
 CODE_DIR="$WORK/MRIX/mrixfields_2026"
 DATA_ROOT="$WORK/MRIX/data"
-OUTPUT_DIR="$WORK/MRIX/outputs/vqvae3d/runs/${RUN_NAME}"
+OUTPUT_DIR="$WORK/MRIX/outputs/vqvae3d/${RUN_NAME}"  # Simplified output path structure
 
 mkdir -p "$CODE_DIR/logs"
 
