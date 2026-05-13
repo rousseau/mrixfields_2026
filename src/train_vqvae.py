@@ -12,6 +12,7 @@ Ce script est volontairement autonome pour tester l'approche avant intégration 
 """
 
 import argparse
+import gc
 import random
 import re
 import time
@@ -569,6 +570,12 @@ def train(args: argparse.Namespace) -> None:
             scaler.step(opt)
             scaler.update()
 
+            # Periodic memory cleanup to prevent CUDA OOM during long training runs
+            if step % 50 == 0:
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
             if step % args.print_every == 0 or step == 1:
                 elapsed = time.time() - t0
                 paired_ratio = float(is_paired.mean().item())
@@ -597,6 +604,11 @@ def train(args: argparse.Namespace) -> None:
                 ckpt_path = weights_dir / f"vqvae_step_{step:06d}.pth"
                 torch.save(ckpt, ckpt_path)
                 print(f"  -> checkpoint: {ckpt_path}")
+                
+                # Clean up after checkpoint save
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
 
     final_path = weights_dir / "vqvae_final.pth"
     torch.save({"step": step, "model": model.state_dict(), "optimizer": opt.state_dict(), "args": vars(args)}, final_path)

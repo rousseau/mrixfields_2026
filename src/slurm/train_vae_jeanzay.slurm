@@ -57,10 +57,13 @@ STEPS="${STEPS:-20000}"
 LR="${LR:-1e-4}"
 
 DEFAULT_BATCH_SIZE=2
+DEFAULT_STEPS=20000
 if [[ "$VAE_TYPE" == "vqvae" ]]; then
   DEFAULT_BATCH_SIZE=1
+  DEFAULT_STEPS=10000  # Conservative default for VQ-VAE due to memory accumulation
 fi
 BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_BATCH_SIZE}"
+STEPS="${STEPS:-$DEFAULT_STEPS}"
 
 mkdir -p "$CODE_DIR/logs"
 mkdir -p "$OUT_ROOT"
