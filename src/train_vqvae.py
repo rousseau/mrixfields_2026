@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 
 MODALITIES = ["T1W", "T2W", "T2FLAIR"]
@@ -285,21 +286,48 @@ class ConvBlock3D(nn.Module):
 
 
 class DualStreamEncoder(nn.Module):
-    def __init__(self, in_channels: int = 1, base_channels: int = 32, anat_channels: int = 64, mod_channels: int = 32):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        base_channels: int = 32,
+        channel_multipliers: Tuple[int, ...] = (1, 2, 4, 4),
+        anat_channels: int = 64,
+        mod_channels: int = 32,
+    ):
         super().__init__()
-        self.stem = ConvBlock3D(in_channels, base_channels)
-        self.down1 = nn.Sequential(nn.Conv3d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1), nn.SiLU())
-        self.down2 = nn.Sequential(nn.Conv3d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1), nn.SiLU())
-        self.down3 = nn.Sequential(nn.Conv3d(base_channels * 4, base_channels * 4, kernel_size=4, stride=2, padding=1), nn.SiLU())
-        hidden = base_channels * 4
+        self.gradient_checkpointing = False
+        channels = [base_channels * m for m in channel_multipliers]
+        if len(channels) < 2:
+            raise ValueError("channel_multipliers must contain at least 2 values")
+
+        self.stem = ConvBlock3D(in_channels, channels[0])
+
+        self.down_blocks = nn.ModuleList()
+        in_ch = channels[0]
+        for out_ch in channels:
+            self.down_blocks.append(
+                nn.Sequential(
+                    nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1),
+                    nn.SiLU(inplace=True),
+                    nn.Conv3d(out_ch, out_ch, kernel_size=4, stride=2, padding=1),
+                    nn.SiLU(inplace=True),
+                )
+            )
+            in_ch = out_ch
+
+        hidden = channels[-1]
         self.anat_head = nn.Conv3d(hidden, anat_channels, kernel_size=1)
         self.mod_head = nn.Conv3d(hidden, mod_channels, kernel_size=1)
 
+    def _run_block(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        if self.training and self.gradient_checkpointing and x.requires_grad:
+            return torch_checkpoint(block, x, use_reentrant=False)
+        return block(x)
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.stem(x)
-        h = self.down1(h)
-        h = self.down2(h)
-        h = self.down3(h)
+        h = self._run_block(self.stem, x)
+        for block in self.down_blocks:
+            h = self._run_block(block, h)
         z_anat = self.anat_head(h)
         z_mod = self.mod_head(h)
         return z_anat, z_mod
@@ -313,42 +341,64 @@ class FiLMDecoder(nn.Module):
         n_modalities: int,
         n_fields: int,
         base_channels: int = 32,
+        channel_multipliers: Tuple[int, ...] = (1, 2, 4, 4),
         out_channels: int = 1,
     ):
         super().__init__()
+        self.gradient_checkpointing = False
         self.mod_emb = nn.Embedding(n_modalities, 16)
         self.field_emb = nn.Embedding(n_fields, 8)
 
+        channels = [base_channels * m for m in channel_multipliers]
+        if len(channels) < 2:
+            raise ValueError("channel_multipliers must contain at least 2 values")
+        rev_channels = list(reversed(channels))
+
         style_in = mod_channels + 16 + 8
+        film_total = 2 * sum(rev_channels)
         self.style_mlp = nn.Sequential(
             nn.Linear(style_in, 128),
             nn.SiLU(inplace=True),
-            nn.Linear(128, 2 * (base_channels * 4 + base_channels * 2 + base_channels)),
+            nn.Linear(128, film_total),
         )
 
-        self.up1 = nn.ConvTranspose3d(anat_channels, base_channels * 4, kernel_size=4, stride=2, padding=1)
-        self.up2 = nn.ConvTranspose3d(base_channels * 4, base_channels * 2, kernel_size=4, stride=2, padding=1)
-        self.up3 = nn.ConvTranspose3d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1)
-        self.out = nn.Conv3d(base_channels, out_channels, kernel_size=3, padding=1)
+        self.up_blocks = nn.ModuleList()
+        in_ch = anat_channels
+        for out_ch in rev_channels:
+            self.up_blocks.append(nn.ConvTranspose3d(in_ch, out_ch, kernel_size=4, stride=2, padding=1))
+            in_ch = out_ch
+        self.film_channels = rev_channels
+        self.out = nn.Conv3d(rev_channels[-1], out_channels, kernel_size=3, padding=1)
 
     def _film(self, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         # gamma/beta: (B,C)
         return x * (1.0 + gamma[:, :, None, None, None]) + beta[:, :, None, None, None]
+
+    def _run_block(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        if self.training and self.gradient_checkpointing and x.requires_grad:
+            return torch_checkpoint(block, x, use_reentrant=False)
+        return block(x)
 
     def forward(self, z_q: torch.Tensor, z_mod: torch.Tensor, mod_idx: torch.Tensor, field_idx: torch.Tensor) -> torch.Tensor:
         z_mod_pool = z_mod.mean(dim=(2, 3, 4))
         style = torch.cat([z_mod_pool, self.mod_emb(mod_idx), self.field_emb(field_idx)], dim=1)
         gb = self.style_mlp(style)
 
-        c1 = self.up1.out_channels
-        c2 = self.up2.out_channels
-        c3 = self.up3.out_channels
+        split_sizes: List[int] = []
+        for c in self.film_channels:
+            split_sizes.extend([c, c])
+        chunks = torch.split(gb, split_sizes, dim=1)
 
-        g1, b1, g2, b2, g3, b3 = torch.split(gb, [c1, c1, c2, c2, c3, c3], dim=1)
-
-        x = F.silu(self._film(self.up1(z_q), g1, b1))
-        x = F.silu(self._film(self.up2(x), g2, b2))
-        x = F.silu(self._film(self.up3(x), g3, b3))
+        x = z_q
+        offset = 0
+        for block, c in zip(self.up_blocks, self.film_channels):
+            gamma = chunks[offset]
+            beta = chunks[offset + 1]
+            offset += 2
+            x = self._run_block(block, x)
+            if gamma.shape[1] != c or beta.shape[1] != c:
+                raise RuntimeError("FiLM parameter shape mismatch")
+            x = F.silu(self._film(x, gamma, beta))
         x = torch.tanh(self.out(x))
         return x
 
@@ -374,6 +424,7 @@ class NeuroQuantHybrid(nn.Module):
         n_modalities: int,
         n_fields: int,
         base_channels: int = 32,
+        channel_multipliers: Tuple[int, ...] = (1, 2, 4, 4),
         anat_channels: int = 64,
         mod_channels: int = 32,
         codebook_size: int = 1024,
@@ -384,6 +435,7 @@ class NeuroQuantHybrid(nn.Module):
         self.encoder = DualStreamEncoder(
             in_channels=1,
             base_channels=base_channels,
+            channel_multipliers=channel_multipliers,
             anat_channels=anat_channels,
             mod_channels=mod_channels,
         )
@@ -399,9 +451,18 @@ class NeuroQuantHybrid(nn.Module):
             n_modalities=n_modalities,
             n_fields=n_fields,
             base_channels=base_channels,
+            channel_multipliers=channel_multipliers,
             out_channels=1,
         )
         self.adversary = ModalityAdversary(anat_channels=anat_channels, n_modalities=n_modalities)
+
+    def enable_gradient_checkpointing(self) -> None:
+        self.encoder.gradient_checkpointing = True
+        self.decoder.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self) -> None:
+        self.encoder.gradient_checkpointing = False
+        self.decoder.gradient_checkpointing = False
 
     def forward_src(self, x_src: torch.Tensor, src_mod: torch.Tensor, src_field: torch.Tensor) -> Dict[str, torch.Tensor]:
         z_anat, z_mod = self.encoder(x_src)
@@ -461,6 +522,7 @@ def train(args: argparse.Namespace) -> None:
         n_modalities=len(args.modalities),
         n_fields=len(args.fields),
         base_channels=args.base_channels,
+        channel_multipliers=tuple(args.channel_multipliers),
         anat_channels=args.anat_channels,
         mod_channels=args.mod_channels,
         codebook_size=args.codebook_size,
@@ -468,10 +530,14 @@ def train(args: argparse.Namespace) -> None:
         vq_beta=args.vq_beta,
     ).to(device)
 
+    if args.gradient_checkpointing:
+        model.enable_gradient_checkpointing()
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     print(f"Device: {device} | AMP: {use_amp}")
+    print(f"Grad checkpointing: {args.gradient_checkpointing}")
     print(f"Batch size: {args.batch_size} | Steps: {args.steps}")
     print(f"Output: {out_dir}")
 
@@ -529,8 +595,8 @@ def train(args: argparse.Namespace) -> None:
                 if paired_mask.any():
                     z_mod_tgt = torch.zeros_like(out_src["z_mod"])
                     with torch.no_grad():
-                        _, z_mod_all_tgt = model.encoder(x_tgt)
-                    z_mod_tgt[paired_mask] = z_mod_all_tgt[paired_mask]
+                        _, z_mod_all_tgt = model.encoder(x_tgt[paired_mask])
+                    z_mod_tgt[paired_mask] = z_mod_all_tgt
 
                     # Placeholder indices sûrs pour unpaired (pas utilisés par le masque)
                     safe_tgt_mod = tgt_mod.clone()
@@ -632,6 +698,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-samples", type=int, default=None)
 
     p.add_argument("--base-channels", type=int, default=32)
+    p.add_argument("--channel-multipliers", nargs="+", type=int, default=[1, 2, 4, 4])
     p.add_argument("--anat-channels", type=int, default=64)
     p.add_argument("--mod-channels", type=int, default=32)
     p.add_argument("--codebook-size", type=int, default=1024)
@@ -661,6 +728,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--use-amp", action="store_true")
+    p.add_argument("--gradient-checkpointing", action="store_true")
 
     return p.parse_args()
 

@@ -71,6 +71,7 @@ module load pytorch-gpu/py3/2.5.0
 # ─── Dépendances utilisateur ─────────────────────────────────────────────────
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 _install_if_missing() {
     python3 -c "import $1" 2>/dev/null || pip install --user --quiet "$2"
@@ -132,9 +133,11 @@ torchrun \
     --splits     retro_train \
     --modalities $MODALITIES \
     --fields     $FIELDS \
-    --batch-size 2 \
+    --batch-size 1 \
     --num-workers 16 \
     --steps      20000 \
+    --channel-multipliers 1 2 4 4 \
+    --gradient-checkpointing \
     --use-amp \
     --output-dir "$OUTPUT_DIR" \
     $RESUME_FLAG
