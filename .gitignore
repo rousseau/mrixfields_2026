@@ -38,7 +38,13 @@ paper/*.synctex.gz
 paper/*.toc
 paper/*.pdf
 
+# ── Logs (jamais versionnés) ────────────────────────────────────────────────
+logs/
+*.log
+
 # ── Résultats lourds (figures de suivi, régénérables) ───────────────────────
+# Les PNG dans results/qc/ et results/cfm/ sont versionnés (évaluation visuelle)
+# Seuls les PNG à la racine de results/ sont exclus
 results/*.png
 results/*.pdf
 
