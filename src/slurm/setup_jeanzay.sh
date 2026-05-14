@@ -8,9 +8,61 @@
 # Ce script :
 #   1. Crée la structure de répertoires sous $WORK/MRIX/
 #   2. Installe les dépendances Python dans $WORK/.local
-#   3. Affiche les commandes rsync pour transférer les données NIfTI
-# ─────────────────────────────────────────────────────────────────────────────
-
+#   3. Affiche les commandes scp pour transférer les données NIfTI
+#   4. Affiche les commandes sbatch pour les entraînements
+#
+# ──── Passage SSH ─────────────────────────────────────────────
+# Jean Zay est accessible via la passerelle SSH de Telecom Bretagne.
+# Pour copier des fichiers depuis/vers sa machine locale :
+#
+#   scp -rp \
+#     -o ProxyCommand="ssh froussea@ssh.telecom-bretagne.eu nc %h %p" \
+#     <fichier_local> <ulq73oz@jean-zay.idris.fr>:<destination>
+#
+# Pour un transfert aller-retour (local -> Jean Zay -> local) :
+#
+#   # Local -> Jean Zay
+#   scp -rp \
+#     -o ProxyCommand="ssh froussea@ssh.telecom-bretagne.eu nc %h %p" \
+#     dossier_local/ <ulq73oz@jean-zay.idris.fr>:<chemin_sur_JZ>
+#
+#   # Jean Zay -> local
+#   scp -rp \
+#     -o ProxyCommand="ssh froussea@ssh.telecom-bretagne.eu nc %h %p" \
+#     <ulq73oz@jean-zay.idris.fr>:<chemin_sur_JZ>/ <dossier_local>
+#
+# ──── Commandes d'entraînement sur Jean Zay ───────────────────
+#
+# Étape 1 -- StarGAN 2D (baseline MICCAI)
+#
+#   sbatch src/slurm/stargan_jeanzay.slurm T1W    retro_scratch
+#   sbatch src/slurm/stargan_jeanzay.slurm T2W    retro_scratch
+#   sbatch src/slurm/stargan_jeanzay.slurm T2FLAIR retro_scratch
+#
+# Étape 2 -- VAE 3D (espace latent)
+#
+#   # AEKL 3D (AutoencoderKL MONAI)
+#   sbatch src/slurm/train_vae_jeanzay.slurm aekl vae3d_T1W
+#
+#   # VQ-VAE 3D (NeuroQuantHybrid, paired+unpaired)
+#   sbatch src/slurm/train_vqvae_jeanzay.slurm vqvae3d_T1W "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T"
+#
+#   # MedVAE fine-tuné (reprend depuis le checkpoint local s'il existe)
+#   sbatch src/slurm/train_vae_jeanzay.slurm medvae medvae_T1W
+#
+# Étape 3 -- CFM 3D latent (une fois un VAE entraîné)
+#
+#   # Avec AEKL (4 canaux latents, UNet 3D 128ch)
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_aekl.yaml
+#
+#   # Avec VQ-VAE (64 canaux latents, UNet 3D 64ch)
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_vqvae.yaml
+#
+#   # Avec MedVAE frozen (4 canaux HuggingFace) ou fine-tuné (checkpoint local)
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae.yaml
+#
+# ────────────────────────────────────────────────────────────────
+#
 set -e
 
 MRIX_ROOT="$WORK/MRIX"
@@ -20,19 +72,19 @@ CHALLENGE_DIR="$MRIX_ROOT/challenge"
 # Le package mrixfields est dans le sous-répertoire Baseline/
 CHALLENGE_BASELINE="$CHALLENGE_DIR/Baseline"
 
-echo "======================================================================="
-echo " Setup Jean Zay — MRIxFields 2026"
+echo "============================================================"
+echo " Setup Jean Zay - MRIxFields 2026"
 echo " MRIX_ROOT : $MRIX_ROOT"
-echo "======================================================================="
+echo "============================================================"
 
-# ─── 1. Répertoires ───────────────────────────────────────────────────────────
+# ─── 1. Répertoires ──────────────────────────────────────────────
 mkdir -p "$DATA_DIR"
 mkdir -p "$PROJECT_DIR/outputs/stargan2d/runs"
 mkdir -p "$PROJECT_DIR/outputs/cfm3d/runs"
 mkdir -p "$PROJECT_DIR/logs"
 echo "[1/4] Répertoires créés"
 
-# ─── 2. Cloner le repo du challenge (pour le package mrixfields) ──────────────
+# ─── 2. Cloner le repo du challenge (pour le package mrixfields) ──
 if [ ! -d "$CHALLENGE_DIR" ]; then
     echo ""
     echo "[2/4] Clonage du code officiel du challenge..."
@@ -45,9 +97,9 @@ else
     echo "[2/4] Challenge repo OK : $CHALLENGE_BASELINE"
 fi
 
-# ─── 3. Installer les dépendances Python ─────────────────────────────────────
+# ─── 3. Installer les dépendances Python ─────────────────────────
 echo ""
-echo "[3/4] Installation des dépendances Python..."
+echo "[3/4] Installation des dépendances Python.."
 
 module purge
 module load arch/h100
@@ -60,10 +112,10 @@ pip install --user --quiet torchcfm pot torchdiffeq nibabel
 
 # Package mrixfields
 if [ -f "$CHALLENGE_BASELINE/setup.py" ]; then
-    # --no-deps : évite tensorflow<2.16 incompatible avec Python 3.12
+    # --no-deps : evite tensorflow<2.16 incompatible avec Python 3.12
     # On n'utilise que mrixfields.data.transforms (aucune dépendance TF)
     pip install --user --quiet --no-deps "$CHALLENGE_BASELINE"
-    echo "  → mrixfields installé (sans dépendances) depuis $CHALLENGE_BASELINE"
+    echo "  -> mrixfields installé (sans dépendances) depuis $CHALLENGE_BASELINE"
 elif [ -d "$CHALLENGE_DIR" ]; then
     echo "  [ATTENTION] setup.py introuvable dans $CHALLENGE_BASELINE"
     echo "  Vérifiez que le repo challenge est bien structuré avec un Baseline/."
@@ -74,31 +126,136 @@ fi
 
 echo "[3/4] Dépendances installées dans \$WORK/.local"
 
-# ─── 4. Transfert des données ─────────────────────────────────────────────────
+# ─── 4. Transfert des données ────────────────────────────────────
 echo ""
 echo "[4/4] Transfert des données (à lancer depuis la machine locale) :"
 echo ""
-echo "  # Données brutes NIfTI (structure challenge) :"
-echo "  rsync -avP ~/Data/MRIxFields_20260414/ \\"
-echo "    <login>@jean-zay.idris.fr:$DATA_DIR/"
+echo "  # ============================================"
+echo "  #   Données brutes NIfTI (structure challenge) "
+echo "  # ============================================"
+echo "  scp -rp \\"
+echo "    -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ~/Data/MRIxFields_20260414/ \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$DATA_DIR/"
 echo ""
-echo "  # Optionnel — transférer des checkpoints existants :"
-echo "  rsync -avP ~/Exp/mrixfields_2026/outputs/stargan2d/runs/ \\"
-echo "    <login>@jean-zay.idris.fr:$PROJECT_DIR/outputs/stargan2d/runs/"
-echo "  rsync -avP ~/Exp/mrixfields_2026/outputs/cfm3d/runs/ \\"
-echo "    <login>@jean-zay.idris.fr:$PROJECT_DIR/outputs/cfm3d/runs/"
+echo "  # ============================================"
+echo "  #   Checkpoints existants (local -> Jean Zay)  "
+echo "  # ============================================"
+echo "  # StarGAN 2D (baseline, ~200 Go) :"
+echo "  scp -rp \\"
+echo "    -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ~/Exp/mrixfields_2026/outputs/stargan2d/runs/ \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/stargan2d/runs/"
 echo ""
-echo "======================================================================="
+echo "  # AEKL VAE 3D :"
+echo "  scp -rp \\"
+echo "    -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ~/Exp/mrixfields_2026/outputs/vae3d/runs/ \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/vae3d/runs/"
+echo ""
+echo "  # MedVAE fine-tuné (si disponible) :"
+echo "  scp -rp \\"
+echo "    -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ~/Exp/mrixfields_2026/outputs/medvae/runs/ \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/medvae/runs/"
+echo ""
+echo "  # CFM 3D latent :"
+echo "  scp -rp \\"
+echo "    -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ~/Exp/mrixfields_2026/outputs/cfm3d/runs/ \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/cfm3d/runs/"
+echo ""
+echo "  # ============================================"
+echo "  #   Récupérer les checkpoints (Jean Zay -> local)  "
+echo "  # ============================================"
+echo "  # Récupérer les checkpoints VAE apres entraînement :"
+echo "  scp -rp \\"
+echo "    -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/vae3d/runs/ \\"
+echo "    ~/Exp/mrixfields_2026/outputs/vae3d/runs/"
+echo ""
+echo "  # Récupérer les checkpoints CFM apres entraînement :"
+echo "  scp -rp \\"
+echo "    -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/cfm3d/runs/ \\"
+echo "    ~/Exp/mrixfields_2026/outputs/cfm3d/runs/"
+echo ""
+echo "============================================================"
 echo " Setup terminé."
 echo ""
-echo " Lancer les entraînements (depuis $PROJECT_DIR) :"
-echo "   # StarGAN v2"
-echo "   sbatch src/slurm/stargan_jeanzay.slurm T1W retro_scratch"
-echo "   sbatch src/slurm/stargan_jeanzay.slurm T2W retro_scratch"
-echo "   sbatch src/slurm/stargan_jeanzay.slurm T2FLAIR retro_scratch"
+echo "============================================================"
+echo " Commandes d'entraînement sur Jean Zay :"
+echo "============================================================"
 echo ""
-echo "   # OT-CFM 3D latent (VAE type au choix : aekl / medvae / vqvae)"
-echo "   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_aekl.yaml"
-echo "   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae.yaml"
-echo "   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_vqvae.yaml"
-echo "======================================================================="
+echo "  # ----------------------------------------"
+echo "  #  Etape 1 - StarGAN v2 (baseline MICCAI)  "
+echo "  # ----------------------------------------"
+echo "  sbatch src/slurm/stargan_jeanzay.slurm T1W    retro_scratch"
+echo "  sbatch src/slurm/stargan_jeanzay.slurm T2W    retro_scratch"
+echo "  sbatch src/slurm/stargan_jeanzay.slurm T2FLAIR retro_scratch"
+echo ""
+echo "  # ----------------------------------------"
+echo "  #  Etape 2 - VAE 3D (espace latent)          "
+echo "  # ----------------------------------------"
+echo "  # AEKL 3D (AutoencoderKL MONAI, 4 canaux latents)"
+echo "  sbatch src/slurm/train_vae_jeanzay.slurm aekl vae3d_T1W"
+echo ""
+echo "  # VQ-VAE 3D (NeuroQuantHybrid, paired+unpaired, 1 GPU)"
+echo "  sbatch src/slurm/train_vqvae_jeanzay.slurm vqvae3d_T1W \"T1W T2W T2FLAIR\" \"0.1T 1.5T 3T 5T 7T\""
+echo ""
+echo "  # MedVAE fine-tuné (reprend depuis le checkpoint local s'il existe)"
+echo "  sbatch src/slurm/train_vae_jeanzay.slurm medvae medvae_T1W"
+echo ""
+echo "  # ----------------------------------------"
+echo "  #  Etape 3 - CFM 3D latent                   "
+echo "  #   (un VAE finalisé requis avant lancement)   "
+echo "  # ----------------------------------------"
+echo "  # Avec AEKL (4 canaux latents, UNet 3D 128ch)"
+echo "  sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_aekl.yaml"
+echo ""
+echo "  # Avec VQ-VAE (64 canaux latents, UNet 3D 64ch)"
+echo "  sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_vqvae.yaml"
+echo ""
+echo "  # Avec MedVAE frozen (4 canaux HuggingFace) ou fine-tuné (checkpoint local)"
+echo "  sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae.yaml"
+echo ""
+echo "  # ============================================"
+echo "  #   Transferts (machine locale <-> Jean Zay)     "
+echo "  # ============================================"
+echo "  # ---  Local -> Jean Zay  ---"
+echo "  # Données NIfTI :"
+echo "  scp -rp -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ~/Data/MRIxFields_20260414/ ulq73oz@jean-zay.idris.fr:\$WORK/MRIX/data/"
+echo ""
+echo "  # StarGAN 2D checkpoints :"
+echo "  scp -rp -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ~/Exp/mrixfields_2026/outputs/stargan2d/runs/ \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/stargan2d/runs/"
+echo ""
+echo "  # AEKL VAE checkpoints :"
+echo "  scp -rp -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ~/Exp/mrixfields_2026/outputs/vae3d/runs/ \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/vae3d/runs/"
+echo ""
+echo "  # MedVAE checkpoints (si disponibles) :"
+echo "  scp -rp -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ~/Exp/mrixfields_2026/outputs/medvae/runs/ \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/medvae/runs/"
+echo ""
+echo "  # CFM 3D checkpoints :"
+echo "  scp -rp -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ~/Exp/mrixfields_2026/outputs/cfm3d/runs/ \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/cfm3d/runs/"
+echo ""
+echo "  # ---  Jean Zay -> Local  ---"
+echo "  # Récupérer les checkpoints VAE apres entraînement :"
+echo "  scp -rp -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/vae3d/runs/ \\"
+echo "    ~/Exp/mrixfields_2026/outputs/vae3d/runs/"
+echo ""
+echo "  # Récupérer les checkpoints CFM apres entraînement :"
+echo "  scp -rp -o ProxyCommand='ssh froussea@ssh.telecom-bretagne.eu nc %h %p' \\"
+echo "    ulq73oz@jean-zay.idris.fr:\$PROJECT_DIR/outputs/cfm3d/runs/ \\"
+echo "    ~/Exp/mrixfields_2026/outputs/cfm3d/runs/"
+echo ""
+echo "============================================================"
