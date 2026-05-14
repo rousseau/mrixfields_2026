@@ -2,7 +2,7 @@
 # Environnement LOCAL (machine rousseau)
 #
 # Utilisation :
-#   python src/train_cfm2d.py --config configs/cfm_T1W.yaml --env local
+#   python src/cfm/train_cfm_3d.py --config configs/cfm3d_T1W_aekl.yaml --env local
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Données brutes MRIxFields 2026 (NIfTI)

@@ -9,7 +9,7 @@
 #   challenge/         ← code officiel du challenge (git clone, pour pip install)
 #
 # Utilisation dans le job SLURM :
-#   python src/train_cfm2d.py --config configs/cfm_T1W.yaml --env jeanzay
+#   python src/cfm/train_cfm_3d.py --config configs/cfm3d_T1W_aekl.yaml --env jeanzay
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Données brutes MRIxFields 2026 (NIfTI)
