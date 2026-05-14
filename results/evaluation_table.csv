@@ -1,0 +1,6 @@
+method,modality,source_field,target_field,nRMSE,SSIM,LPIPS,Dice,VolumeConsistency,checkpoint,notes
+StarGAN 2D (baseline),T1W,any,any,,,,,,task3_any_to_any_T1W/weights/model_final.pth,checkpoint 150k — à évaluer
+AEKL + OT-CFM 3D,T1W,any,any,,,,,,vae3d_T1W/model_best.pth + cfm3d_T1W/model_final.pth,à entraîner (CFM 3D)
+VQ-VAE + OT-CFM 3D,T1W,any,any,,,,,,—,à lancer
+MedVAE (frozen) + CFM,T1W,any,any,,,,,,—,poids HuggingFace
+MedVAE (fine-tuné) + CFM,T1W,any,any,,,,,,—,fine-tuning à lancer
