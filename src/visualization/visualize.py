@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 """
-Visualisation unifiée — StarGAN v2 2D et OT-CFM 2D — MRIxFields 2026
+Visualisation — StarGAN v2 2D — MRIxFields 2026
 
 Génère une figure de comparaison multi-sujet / multi-champ :
   - Lignes  : sujets (Training_prospective)
-  - Colonnes: 0.1T input | 1.5T pred | 1.5T GT | 3T pred | 3T GT | 5T pred | 5T GT | 7T pred | 7T GT
-
-La fonction make_figure est identique pour les deux méthodes.
-L'inférence n'est réalisée que sur la coupe centrale affichée (pas le volume entier).
+  - Colonnes: 0.1T input | (pred + GT) × 4 champs cibles
 
 Usage :
-    python src/visualize.py --method stargan2d --modality T1W \\
-        --checkpoint outputs/stargan2d_jeanzay/.../checkpoint_150000.pth
-
-    python src/visualize.py --method cfm2d --modality T1W \\
-        --checkpoint outputs/cfm2d_jeanzay/.../model_final.pth \\
-        --config configs/cfm_T1W.yaml
+    python src/visualization/visualize.py --method stargan2d --modality T1W \\
+        --checkpoint outputs/stargan2d/runs/task3_any_to_any_T1W/weights/model_final.pth
 
     # Depuis prédictions déjà calculées (sans re-inférer)
-    python src/visualize.py --method stargan2d --modality T1W \\
+    python src/visualization/visualize.py --method stargan2d --modality T1W \\
         --pred-dir outputs/stargan2d/predictions_ckpt/T1W/checkpoint_150000
 """
 
@@ -30,6 +23,7 @@ import sys
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import nibabel as nib
@@ -39,27 +33,21 @@ import yaml
 # ---------------------------------------------------------------------------
 # Chemins par défaut (machine locale) — surchargés via --env
 # ---------------------------------------------------------------------------
-DATA_DIR    = Path("/home/rousseau/Data/MRIxFields_20260414")
+DATA_DIR = Path("/home/rousseau/Data/MRIxFields_20260414")
 RESULTS_DIR = Path("/home/rousseau/Exp/mrixfields_2026/results")
 PROJECT_DIR = Path("/home/rousseau/Exp/mrixfields_2026")
 
 TARGET_FIELDS = ["1.5T", "3T", "5T", "7T"]
-SOURCE_FIELD  = "0.1T"
+SOURCE_FIELD = "0.1T"
 
 # StarGAN (challenge baseline)
-PYTHON        = "/home/rousseau/miniforge3/bin/python"
+PYTHON = "/home/rousseau/miniforge3/bin/python"
 CHALLENGE_DIR = Path("/home/rousseau/Code/MRIxFields2026/Baseline")
-
-# CFM (script local)
-CFM_SCRIPT    = PROJECT_DIR / "src" / "train_cfm2d.py"
-
-# Symboles différés depuis train_cfm2d
-_cfm_imports: dict = {}
 
 
 def _setup_paths(env_arg: str | None) -> None:
     """Charge l'env YAML et met à jour les chemins globaux."""
-    global DATA_DIR, RESULTS_DIR, PROJECT_DIR, PYTHON, CHALLENGE_DIR, CFM_SCRIPT
+    global DATA_DIR, RESULTS_DIR, PROJECT_DIR, PYTHON, CHALLENGE_DIR
     if env_arg is None:
         return
     env_path = env_arg if env_arg.endswith(".yaml") else f"configs/env/{env_arg}.yaml"
@@ -69,21 +57,20 @@ def _setup_paths(env_arg: str | None) -> None:
     with open(env_path) as f:
         raw = yaml.safe_load(f)
     env = {k: Path(os.path.expandvars(str(v))) for k, v in raw.items()}
-    DATA_DIR    = env["data_root"]
+    DATA_DIR = env["data_root"]
     RESULTS_DIR = env["project_root"] / "results"
     PROJECT_DIR = env["project_root"]
-    PYTHON      = str(env.get("python", Path("python3")))
+    PYTHON = str(env.get("python", Path("python3")))
     CHALLENGE_DIR = env.get("challenge_dir", CHALLENGE_DIR)
-    CFM_SCRIPT  = PROJECT_DIR / "src" / "train_cfm2d.py"
-    _cfm_imports.clear()
 
 
 # ---------------------------------------------------------------------------
 # Helpers partagés
 # ---------------------------------------------------------------------------
 
+
 def _load_mid_slice(nifti_path: Path, axis: int = 2) -> np.ndarray:
-    img  = nib.load(str(nifti_path))
+    img = nib.load(str(nifti_path))
     data = img.get_fdata(dtype=np.float32)
     return np.take(data, data.shape[axis] // 2, axis=axis)
 
@@ -126,7 +113,7 @@ def _slices_from_dir(pred_dir: Path, subjects: list, axis: int) -> dict:
     for sid in subjects:
         result[sid] = {}
         for tgt in TARGET_FIELDS:
-            tgt_dir  = pred_dir / f"{SOURCE_FIELD}_to_{tgt}"
+            tgt_dir = pred_dir / f"{SOURCE_FIELD}_to_{tgt}"
             nii_file = _find_subject_file(tgt_dir, sid)
             if nii_file is not None:
                 result[sid][tgt] = _load_mid_slice(nii_file, axis)
@@ -139,6 +126,7 @@ def _slices_from_dir(pred_dir: Path, subjects: list, axis: int) -> dict:
 # Inférence StarGAN — coupe centrale uniquement
 # ---------------------------------------------------------------------------
 
+
 def _infer_stargan_middle_slices(
     checkpoint: Path,
     config: Path,
@@ -149,14 +137,19 @@ def _infer_stargan_middle_slices(
     """Lance inference.py du challenge sur les sujets, sauvegarde les .nii.gz,
     puis charge uniquement la coupe centrale de chacun dans un dict.
     """
-    input_dir = DATA_DIR / "Training_prospective" / modality / SOURCE_FIELD
-    pred_dir  = PROJECT_DIR / "outputs" / "stargan2d" / "predictions_ckpt" \
-                / modality / checkpoint.stem
+    pred_dir = (
+        PROJECT_DIR
+        / "outputs"
+        / "stargan2d"
+        / "predictions_ckpt"
+        / modality
+        / checkpoint.stem
+    )
 
     env_os = {
         **os.environ,
-        "OUTPUT_DIR":       str(PROJECT_DIR / "outputs" / "stargan2d" / "runs"),
-        "DATA_DIR":         str(DATA_DIR),
+        "OUTPUT_DIR": str(PROJECT_DIR / "outputs" / "stargan2d" / "runs"),
+        "DATA_DIR": str(DATA_DIR),
         "PREPROCESSED_DIR": str(PROJECT_DIR / "outputs" / "stargan2d" / "preprocessed"),
     }
 
@@ -171,11 +164,16 @@ def _infer_stargan_middle_slices(
         cmd = [
             PYTHON,
             str(CHALLENGE_DIR / "scripts" / "inference.py"),
-            "--config", str(config),
-            "--checkpoint", str(checkpoint),
-            "--input_dir", str(input_dir),
-            "--output_dir", str(out_dir),
-            "--target_field", tgt,
+            "--config",
+            str(config),
+            "--checkpoint",
+            str(checkpoint),
+            "--input_dir",
+            str(DATA_DIR / "Training_prospective" / modality / SOURCE_FIELD),
+            "--output_dir",
+            str(out_dir),
+            "--target_field",
+            tgt,
         ]
         res = subprocess.run(cmd, env=env_os, capture_output=True, text=True)
         if res.returncode != 0:
@@ -187,94 +185,9 @@ def _infer_stargan_middle_slices(
 
 
 # ---------------------------------------------------------------------------
-# Inférence CFM — coupe centrale uniquement (in-process)
+# Figure
 # ---------------------------------------------------------------------------
 
-def _load_cfm_symbols() -> dict:
-    if _cfm_imports:
-        return _cfm_imports
-    src_dir = str(CFM_SCRIPT.parent)
-    if src_dir not in sys.path:
-        sys.path.insert(0, src_dir)
-    import train_cfm2d as _cfm
-    _cfm_imports.update({
-        "build_unet":       _cfm.build_unet,
-        "_euler_integrate": _cfm._euler_integrate,
-        "DOMAIN_TO_IDX":    _cfm.DOMAIN_TO_IDX,
-        "_pad_slice":       _cfm._pad_slice,
-        "_unpad_slice":     _cfm._unpad_slice,
-        "_resolve_paths":   _cfm._resolve_paths,
-        "_load_env":        _cfm._load_env,
-    })
-    return _cfm_imports
-
-
-def _infer_cfm_middle_slices(
-    checkpoint: Path,
-    config: Path,
-    modality: str,
-    subjects: list,
-    axis: int,
-    env_arg: str | None,
-) -> dict:
-    """Charge le modèle CFM une fois et infère la coupe centrale de chaque sujet × champ."""
-    import torch
-
-    sym = _load_cfm_symbols()
-
-    with open(config) as f:
-        cfg = yaml.safe_load(f)
-    cfg = sym["_resolve_paths"](cfg, sym["_load_env"](env_arg))
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = sym["build_unet"](cfg, use_checkpoint=False).to(device)
-    state  = torch.load(str(checkpoint), map_location=device, weights_only=False)
-    model.load_state_dict(state.get("model", state))
-    model.eval()
-    print(f"Modèle CFM chargé : {checkpoint.name}  ({device})")
-
-    img_size  = cfg["model"]["img_size"]
-    n_steps   = cfg.get("inference", {}).get("n_steps", 50)
-    input_dir = DATA_DIR / "Training_prospective" / modality / SOURCE_FIELD
-
-    result: dict = {}
-    total = len(subjects) * len(TARGET_FIELDS)
-    done  = 0
-    for sid in subjects:
-        src_file = _find_subject_file(input_dir, sid)
-        if src_file is None:
-            print(f"  [ATTENTION] Source introuvable : {sid}")
-            result[sid] = {}
-            continue
-
-        vol    = nib.load(str(src_file)).get_fdata(dtype=np.float32)
-        # Normaliser min-max sur le volume entier (cohérent avec entraînement)
-        vmin, vmax = float(vol.min()), float(vol.max())
-        vol_norm = (vol - vmin) / (vmax - vmin) if vmax > vmin else np.zeros_like(vol)
-        sl_src = np.take(vol_norm, vol_norm.shape[axis] // 2, axis=axis)
-
-        sl_padded, pad_params = sym["_pad_slice"](sl_src, img_size, img_size)
-        orig_h, orig_w, ph1, pw1 = pad_params
-        x_src = torch.from_numpy(sl_padded * 2.0 - 1.0).float()
-        x_src = x_src.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-
-        result[sid] = {}
-        for tgt in TARGET_FIELDS:
-            done += 1
-            print(f"  [{done}/{total}] CFM {SOURCE_FIELD}→{tgt}  sujet {sid} …", flush=True)
-            tgt_idx = sym["DOMAIN_TO_IDX"][tgt]
-            x_out   = sym["_euler_integrate"](model, x_src, tgt_idx, device, n_steps)
-            sl_out  = np.clip((x_out.squeeze().cpu().numpy() + 1.0) / 2.0, 0.0, 1.0)
-            sl_out  = sym["_unpad_slice"](sl_out, orig_h, orig_w, ph1, pw1)
-            result[sid][tgt] = sl_out
-            print(f"      OK")
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Figure — identique pour les deux méthodes
-# ---------------------------------------------------------------------------
 
 def make_figure(
     method_label: str,
@@ -297,7 +210,8 @@ def make_figure(
     n_rows = len(subjects)
 
     fig, axes = plt.subplots(
-        n_rows, n_cols,
+        n_rows,
+        n_cols,
         figsize=(2.2 * n_cols, 2.5 * n_rows),
         squeeze=False,
     )
@@ -307,7 +221,11 @@ def make_figure(
     for row_idx, sid in enumerate(subjects):
         # ---- Source 0.1T ------------------------------------------------
         src_file = _find_subject_file(src_base / SOURCE_FIELD, sid)
-        sl_src   = _normalize(_load_mid_slice(src_file, axis)) if src_file else np.zeros((64, 64))
+        sl_src = (
+            _normalize(_load_mid_slice(src_file, axis))
+            if src_file
+            else np.zeros((64, 64))
+        )
         ax = axes[row_idx][0]
         ax.imshow(sl_src.T, cmap="gray", origin="lower", vmin=0, vmax=1)
         ax.set_title(col_labels[0] if row_idx == 0 else "", fontsize=7)
@@ -317,7 +235,7 @@ def make_figure(
         # ---- Pred + GT par champ cible ----------------------------------
         for tgt_idx, tgt_field in enumerate(TARGET_FIELDS):
             col_pred = 1 + 2 * tgt_idx
-            col_gt   = col_pred + 1
+            col_gt = col_pred + 1
 
             arr = pred_slices.get(sid, {}).get(tgt_field)
             if arr is not None:
@@ -327,7 +245,11 @@ def make_figure(
                 print(f"  [ATTENTION] Prédiction manquante : {sid}/{tgt_field}")
 
             gt_file = _find_subject_file(src_base / tgt_field, sid)
-            sl_gt   = _normalize(_load_mid_slice(gt_file, axis)) if gt_file else np.zeros((64, 64))
+            sl_gt = (
+                _normalize(_load_mid_slice(gt_file, axis))
+                if gt_file
+                else np.zeros((64, 64))
+            )
 
             for col_idx, sl in ((col_pred, sl_pred), (col_gt, sl_gt)):
                 ax = axes[row_idx][col_idx]
@@ -339,7 +261,8 @@ def make_figure(
     fig.suptitle(
         f"{method_label} — {modality} : {SOURCE_FIELD} → champs cibles\n"
         f"(Training_prospective, coupe centrale axe {axis})",
-        fontsize=9, y=1.01,
+        fontsize=9,
+        y=1.01,
     )
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -354,7 +277,6 @@ def make_figure(
 
 _METHOD_LABELS = {
     "stargan2d": "StarGAN v2 2D",
-    "cfm2d":     "OT-CFM 2D",
 }
 
 
@@ -363,23 +285,41 @@ def main() -> None:
         description="Visualisation unifiée MRIxFields 2026",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--method",   required=True, choices=["stargan2d", "cfm2d"],
-                        help="Méthode à visualiser")
+    parser.add_argument(
+        "--method", required=True, choices=["stargan2d"], help="Méthode à visualiser"
+    )
     parser.add_argument("--modality", default="T1W", choices=["T1W", "T2W", "T2FLAIR"])
-    parser.add_argument("--axis",     type=int, default=2,
-                        help="Axe de coupe (0=sagittal, 1=coronal, 2=axial)")
-    parser.add_argument("--subjects", nargs="+", default=None,
-                        help="IDs de sujets (défaut : tous dans Training_prospective)")
-    parser.add_argument("--checkpoint", default=None,
-                        help="Checkpoint .pth — déclenche l'inférence à la volée")
-    parser.add_argument("--config",   default=None,
-                        help="Config YAML (requis pour cfm2d, optionnel pour stargan2d)")
-    parser.add_argument("--pred-dir", default=None,
-                        help="Répertoire de prédictions existantes (skip l'inférence)")
-    parser.add_argument("--out",      default=None,
-                        help="Chemin de sauvegarde de la figure")
-    parser.add_argument("--env",      default=None,
-                        help="Env config : 'local', 'jeanzay', ou chemin .yaml")
+    parser.add_argument(
+        "--axis",
+        type=int,
+        default=2,
+        help="Axe de coupe (0=sagittal, 1=coronal, 2=axial)",
+    )
+    parser.add_argument(
+        "--subjects",
+        nargs="+",
+        default=None,
+        help="IDs de sujets (défaut : tous dans Training_prospective)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Checkpoint .pth — déclenche l'inférence à la volée",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Config YAML StarGAN (optionnel, déduit depuis le challenge dir)",
+    )
+    parser.add_argument(
+        "--pred-dir",
+        default=None,
+        help="Répertoire de prédictions existantes (skip l'inférence)",
+    )
+    parser.add_argument("--out", default=None, help="Chemin de sauvegarde de la figure")
+    parser.add_argument(
+        "--env", default=None, help="Env config : 'local', 'jeanzay', ou chemin .yaml"
+    )
     args = parser.parse_args()
 
     _setup_paths(args.env)
@@ -392,9 +332,8 @@ def main() -> None:
 
     # ---- Construction de pred_slices ------------------------------------
     if args.pred_dir is not None:
-        # Prédictions déjà sur disque (fichiers .nii.gz)
         pred_slices = _slices_from_dir(Path(args.pred_dir), args.subjects, args.axis)
-        step_tag    = Path(args.pred_dir).name
+        step_tag = Path(args.pred_dir).name
 
     elif args.checkpoint is not None:
         ckpt = Path(args.checkpoint)
@@ -402,30 +341,27 @@ def main() -> None:
             print(f"[ERREUR] Checkpoint introuvable : {ckpt}", file=sys.stderr)
             sys.exit(1)
         step_tag = ckpt.stem
-
-        if args.method == "stargan2d":
-            config = Path(args.config) if args.config else (
-                CHALLENGE_DIR / "configs" / "task3" / "stargan"
+        config = (
+            Path(args.config)
+            if args.config
+            else (
+                CHALLENGE_DIR
+                / "configs"
+                / "task3"
+                / "stargan"
                 / f"any_to_any_{args.modality}.yaml"
             )
-            if not config.exists():
-                print(f"[ERREUR] Config introuvable : {config}", file=sys.stderr)
-                sys.exit(1)
-            pred_slices = _infer_stargan_middle_slices(
-                ckpt, config, args.modality, args.subjects, args.axis,
-            )
-
-        else:  # cfm2d
-            config = Path(args.config) if args.config else (
-                PROJECT_DIR / "configs" / f"cfm_{args.modality}.yaml"
-            )
-            if not config.exists():
-                print(f"[ERREUR] Config introuvable : {config}", file=sys.stderr)
-                sys.exit(1)
-            pred_slices = _infer_cfm_middle_slices(
-                ckpt, config, args.modality, args.subjects, args.axis, args.env,
-            )
-
+        )
+        if not config.exists():
+            print(f"[ERREUR] Config introuvable : {config}", file=sys.stderr)
+            sys.exit(1)
+        pred_slices = _infer_stargan_middle_slices(
+            ckpt,
+            config,
+            args.modality,
+            args.subjects,
+            args.axis,
+        )
     else:
         print("[ERREUR] Fournir --checkpoint ou --pred-dir.", file=sys.stderr)
         sys.exit(1)
@@ -433,15 +369,15 @@ def main() -> None:
     # ---- Figure ---------------------------------------------------------
     if args.out is None:
         args.out = str(
-            RESULTS_DIR / f"{args.method}_{args.modality.lower()}_{step_tag}.png"
+            RESULTS_DIR / "qc" / f"{args.method}_{args.modality.lower()}_{step_tag}.png"
         )
     make_figure(
-        method_label = _METHOD_LABELS[args.method],
-        modality     = args.modality,
-        subjects     = args.subjects,
-        axis         = args.axis,
-        out_path     = Path(args.out),
-        pred_slices  = pred_slices,
+        method_label=_METHOD_LABELS[args.method],
+        modality=args.modality,
+        subjects=args.subjects,
+        axis=args.axis,
+        out_path=Path(args.out),
+        pred_slices=pred_slices,
     )
 
 

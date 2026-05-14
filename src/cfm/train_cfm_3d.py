@@ -3,29 +3,32 @@
 OT-CFM 3D en espace latent — Traduction de contraste IRM 3D volumétrique.
 
 Architecture :
-  - VAE 3D pré-entraîné (AutoencoderKL MONAI) → espace latent 8× compressé
-  - OT-CFM en espace latent : UNet 3D conditionné sur modalité source + domaine cible
+  - VAE 3D pré-entraîné (AEKL / MedVAE / VQ-VAE) → espace latent
+  - OT-CFM en espace latent : UNet 3D conditionné sur domaine cible
   - Input du UNet : cat(z_t, z_src)  →  (B, 2*C_lat, H', W', D')
   - Output : champ vectoriel de vitesse → (B, C_lat, H', W', D')
   - Entraîné avec ExactOT conditional flow matching (torchcfm)
 
-Pipeline d'inférence :
-  T1W volume → VAE encode → z_src → Euler/DOPRI5 ODE (t: 0→1) → z_tgt → VAE decode → T2W volume
+VAE supportés (étape 2) :
+  - aekl    : AutoencoderKL MONAI (4 canaux latents, 8x compression)
+  - medvae  : MedVAE Stanford (frozen HuggingFace ou fine-tuné local)
+  - vqvae   : NeuroQuant adapté (src/vae3d/train_vqvae.py, données paired+unpaired)
 
 Usage :
   # Single-GPU
-  python src/train_cfm_3d.py --config configs/cfm3d_latent_T1W.yaml --env local
+  python src/cfm/train_cfm_3d.py --config configs/cfm3d_T1W_aekl.yaml --env local
+  python src/cfm/train_cfm_3d.py --config configs/cfm3d_T1W_medvae.yaml --env local
+  python src/cfm/train_cfm_3d.py --config configs/cfm3d_T1W_vqvae.yaml --env local
 
   # Multi-GPU (torchrun DDP)
-  torchrun --nproc_per_node=4 src/train_cfm_3d.py \\
-      --config configs/cfm3d_latent_T1W.yaml --env jeanzay
+  torchrun --nproc_per_node=4 src/cfm/train_cfm_3d.py \\
+      --config configs/cfm3d_T1W_aekl.yaml --env jeanzay
 
   # Inférence
-  python src/train_cfm_3d.py --mode infer \\
-      --config configs/cfm3d_latent_T1W.yaml \\
-      --checkpoint outputs/cfm3d/.../weights/model_final.pth \\
-      --input_dir /data/T1W/0.1T/ \\
-      --output_dir /data/predictions/cfm3d/ \\
+  python src/cfm/train_cfm_3d.py --mode infer \\
+      --config configs/cfm3d_T1W_aekl.yaml \\
+      --checkpoint outputs/cfm3d/runs/cfm3d_T1W_aekl/weights/model_final.pth \\
+      --input_dir /data/T1W/0.1T/ --output_dir /data/predictions/ \\
       --source_domain 0.1T --target_domain 7T
 """
 
@@ -33,7 +36,9 @@ import argparse
 import inspect
 import os
 import random
+import sys
 import time
+from abc import ABC, abstractmethod
 from collections import deque
 from copy import deepcopy
 from pathlib import Path
@@ -41,29 +46,31 @@ from typing import Dict, List, Optional, Tuple
 
 import nibabel as nib
 import numpy as np
-from scipy.ndimage import zoom as scipy_zoom
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 import yaml
+from scipy.ndimage import zoom as scipy_zoom
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+# Ajouter src/ au path pour les imports locaux (vae3d/)
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
     # MONAI récent (intégration generative dans monai.networks)
     from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
 except ImportError:
     try:
-        # MONAI avec sous-module generative
         from monai.generative.networks.nets import AutoencoderKL, DiffusionModelUNet
     except ImportError:
         try:
-        # MONAI Generative package (namespace séparé)
             from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
         except ImportError as e:
             raise ImportError(
-                "AutoencoderKL/DiffusionModelUNet introuvables. Essayez : "
-                "monai>=1.3, monai[generation], ou monai-generative"
+                "AutoencoderKL/DiffusionModelUNet introuvables. "
+                "Essayez : monai>=1.3, monai[generation], ou monai-generative"
             ) from e
 
 from torchcfm.conditional_flow_matching import (
@@ -83,6 +90,7 @@ NUM_DOMAINS = len(DOMAINS)
 # Utilitaire : rééchantillonnage isotrope
 # ===========================================================================
 
+
 def _resample_volume(
     vol: np.ndarray,
     original_spacing,
@@ -93,23 +101,25 @@ def _resample_volume(
     Exemple : 364×436×364 @ 0.5mm → 182×218×182 @ 1mm (8× moins de voxels).
     """
     orig = np.asarray(original_spacing[:3], dtype=float)
-    tgt  = np.asarray(target_spacing, dtype=float)
+    tgt = np.asarray(target_spacing, dtype=float)
     factors = orig / tgt
     if np.allclose(factors, 1.0, atol=0.02):
         return vol
     return scipy_zoom(vol, factors, order=1).astype(np.float32)
 
+
 _SPLIT_ABBR_TO_DIR = {
     "retro_train": "Training_retrospective",
-    "pro_train":   "Training_prospective",
-    "pro_val":     "Validating_prospective",
-    "pro_test":    "Testing_prospective",
+    "pro_train": "Training_prospective",
+    "pro_val": "Validating_prospective",
+    "pro_test": "Testing_prospective",
 }
 
 
 # ===========================================================================
 # Env / Path resolution
 # ===========================================================================
+
 
 def _load_env(env_arg: Optional[str]) -> Optional[dict]:
     if env_arg is None:
@@ -141,13 +151,19 @@ def _resolve_paths(cfg: dict, env: Optional[dict]) -> dict:
     vae_cfg = cfg.setdefault("vae", {})
     if "vae_root" in env and not vae_cfg.get("checkpoint"):
         subdir = cfg["data"].get("output_subdir", "").replace("cfm3d", "vae3d")
-        vae_cfg["checkpoint"] = str(Path(env["output_root"]) / subdir.replace("cfm3d_latent", "vae3d") / "weights" / "model_best.pth")
+        vae_cfg["checkpoint"] = str(
+            Path(env["output_root"])
+            / subdir.replace("cfm3d_latent", "vae3d")
+            / "weights"
+            / "model_best.pth"
+        )
     return cfg
 
 
 # ===========================================================================
 # Dataset
 # ===========================================================================
+
 
 class NIfTILatentDataset(Dataset):
     """Charge des volumes NIfTI, les normalise et les retourne entiers pour
@@ -194,8 +210,7 @@ class NIfTILatentDataset(Dataset):
                 f"Aucun volume NIfTI dans {data_root}/{split_dir}/{modality}/"
             )
         print(
-            f"  NIfTILatentDataset: {len(self.samples)} volumes"
-            f" ({modality}, {split})"
+            f"  NIfTILatentDataset: {len(self.samples)} volumes ({modality}, {split})"
         )
 
     def _normalize(self, vol: np.ndarray) -> np.ndarray:
@@ -221,7 +236,11 @@ class NIfTILatentDataset(Dataset):
         if ph > 0 or pw > 0 or pd > 0:
             vol = np.pad(
                 vol,
-                [(ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (pd // 2, pd - pd // 2)],
+                [
+                    (ph // 2, ph - ph // 2),
+                    (pw // 2, pw - pw // 2),
+                    (pd // 2, pd - pd // 2),
+                ],
                 mode="reflect",
             )
             h, w, d = vol.shape
@@ -229,7 +248,7 @@ class NIfTILatentDataset(Dataset):
         sh = max((h - th) // 2, 0)
         sw = max((w - tw) // 2, 0)
         sd = max((d - td) // 2, 0)
-        return vol[sh: sh + th, sw: sw + tw, sd: sd + td]
+        return vol[sh : sh + th, sw : sw + tw, sd : sd + td]
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         path, domain_idx = self.samples[idx]
@@ -252,8 +271,139 @@ def _make_infinite(loader: DataLoader):
 
 
 # ===========================================================================
-# Build VAE (chargement)
+# VAE Wrappers — interface unifiée encode / decode
 # ===========================================================================
+
+
+class VAEWrapper(nn.Module, ABC):
+    """
+    Interface unifiée pour tous les VAE de l'étape 2.
+    Expose encode(x) → z et decode(z) → x.
+    L'attribut `latent_channels` indique le nombre de canaux du latent.
+    """
+
+    latent_channels: int
+
+    @abstractmethod
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode x en latent z. (B,1,H,W,D) → (B,C_lat,H',W',D')"""
+
+    @abstractmethod
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Décode z en image. (B,C_lat,H',W',D') → (B,1,H,W,D)"""
+
+
+class AEKLWrapper(VAEWrapper):
+    """
+    Wrapper pour AutoencoderKL (MONAI).
+    vae.encode(x) retourne (z_mu, z_logvar) ; on utilise z_mu pour le CFM.
+    """
+
+    def __init__(self, model: AutoencoderKL):
+        super().__init__()
+        self.model = model
+        # Déduire latent_channels depuis les poids du modèle
+        self.latent_channels: int = _infer_aekl_latent_channels(model)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        z_mu, _ = self.model.encode(x)
+        return z_mu
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.model.decode(z)
+
+
+def _infer_aekl_latent_channels(model: AutoencoderKL) -> int:
+    """Déduit dynamiquement le nombre de canaux latents depuis le modèle."""
+    # Cherche dans les attributs connus
+    for attr in ("latent_channels", "z_channels", "latent_dim"):
+        v = getattr(model, attr, None)
+        if isinstance(v, int):
+            return v
+    # Fallback : forward pass dummy
+    try:
+        with torch.no_grad():
+            dummy = torch.zeros(
+                1, 1, 32, 32, 32, device=next(model.parameters()).device
+            )
+            z_mu, _ = model.encode(dummy)
+            return z_mu.shape[1]
+    except Exception:
+        return 4  # valeur MONAI par défaut
+
+
+class MedVAEWrapper(VAEWrapper):
+    """
+    Wrapper pour MedVAE (StanfordMIMI).
+    Supporte les versions frozen (poids HuggingFace) et fine-tunée (checkpoint local).
+
+    API MedVAE : model.encode(x) → (z,) ou z  |  model.decode(z) → x
+    """
+
+    def __init__(self, model, latent_ch: int):
+        super().__init__()
+        self.model = model
+        self.latent_channels: int = latent_ch
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.model.encode(x)
+        # MedVAE peut retourner un tuple ou un tenseur
+        if isinstance(z, (tuple, list)):
+            z = z[0]
+        return z
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        out = self.model.decode(z)
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        return out
+
+
+class VQVAEWrapper(VAEWrapper):
+    """
+    Wrapper pour NeuroQuantHybrid (VQ-VAE adapté, src/vae3d/train_vqvae.py).
+
+    Le CFM opère dans l'espace latent anatomique quantifié z_q :
+      - encode : x → DualStreamEncoder → (z_anat, z_mod) → quantizer → z_q
+      - decode : z_q + z_mod (caché de l'encode) → FiLMDecoder → x
+
+    Lors de l'inférence (decode sans encode préalable), z_mod = 0.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self._cached_z_mod: Optional[torch.Tensor] = None
+        # latent_channels = anat_channels du quantizer
+        self.latent_channels: int = self.model.quantizer.embedding_dim
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        z_anat, z_mod = self.model.encoder(x)
+        z_q, _, _ = self.model.quantizer(z_anat)
+        # Cache z_mod pour le décodage suivant
+        self._cached_z_mod = z_mod.detach()
+        return z_q
+
+    def decode(self, z_q: torch.Tensor) -> torch.Tensor:
+        b, device = z_q.shape[0], z_q.device
+        # Récupérer z_mod depuis le cache, ou utiliser zéros
+        z_mod = self._cached_z_mod
+        if z_mod is None or z_mod.shape[0] != b:
+            # Taille de z_mod : (B, mod_channels, H', W', D')
+            mod_ch = self.model.encoder.mod_head.out_channels
+            z_mod = torch.zeros(b, mod_ch, *z_q.shape[2:], device=device)
+        else:
+            z_mod = z_mod.to(device)
+        # Indices modalité / champ = 0 par défaut (neutre)
+        mod_idx = torch.zeros(b, dtype=torch.long, device=device)
+        field_idx = torch.zeros(b, dtype=torch.long, device=device)
+        return self.model.decoder(z_q, z_mod, mod_idx, field_idx)
+
+
+# ===========================================================================
+# Chargement des VAE
+# ===========================================================================
+
 
 def _build_vae_from_config(vae_cfg: dict) -> AutoencoderKL:
     """Instancie l'AutoencoderKL 3D depuis une config YAML."""
@@ -296,7 +446,9 @@ def _load_maisi_autoencoder(cache_dir: Optional[str] = None) -> AutoencoderKL:
     try:
         from monai.bundle import download
     except ImportError:
-        raise ImportError("MONAI bundle API non disponible. Mettez à jour MONAI >= 1.3.")
+        raise ImportError(
+            "MONAI bundle API non disponible. Mettez à jour MONAI >= 1.3."
+        )
 
     bundle_dir = Path(cache_dir or os.path.expanduser("~/.cache/monai/bundles"))
     bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -310,7 +462,9 @@ def _load_maisi_autoencoder(cache_dir: Optional[str] = None) -> AutoencoderKL:
     if not autoencoder_ckpt.exists():
         # Chercher dans les fichiers disponibles
         models_dir = bundle_dir / bundle_name / "models"
-        candidates = sorted(models_dir.glob("*autoencoder*")) if models_dir.exists() else []
+        candidates = (
+            sorted(models_dir.glob("*autoencoder*")) if models_dir.exists() else []
+        )
         if not candidates:
             raise FileNotFoundError(
                 f"Autoencoder MAISI introuvable dans {models_dir}.\n"
@@ -346,55 +500,168 @@ def _load_maisi_autoencoder(cache_dir: Optional[str] = None) -> AutoencoderKL:
     return vae
 
 
-def load_vae(cfg: dict, device: torch.device) -> AutoencoderKL:
-    """Charge le VAE 3D selon cfg['vae']['source'].
-
-    source options :
-      'local'       : checkpoint pré-entraîné local (vae.checkpoint, défaut)
-      'maisi'       : autoencoder MAISI (téléchargé depuis MONAI Model Zoo)
-      'random'      : poids aléatoires (pour débugage uniquement)
-
-    Note NVIDIA NV-Generate-MR-Brain :
-      Le repo HuggingFace (nvidia/NV-Generate-MR-Brain) ne contient que le
-      diffusion UNet (diff_unet_3d_rflow-mr-brain_v0.pt, 2.17 GB). La VAE
-      n'est pas disponible séparément. Utilisez 'maisi' ou 'local'.
+def load_vae(cfg: dict, device: torch.device) -> VAEWrapper:
     """
+    Charge le VAE de l'étape 2 et le retourne wrappé dans un VAEWrapper.
+
+    Sélecteur : cfg['vae']['vae_type']
+      'aekl'   (défaut) : AutoencoderKL MONAI
+                          source: 'local' | 'maisi' | 'random'
+      'medvae'           : MedVAE (StanfordMIMI/MedVAE)
+                          source: 'frozen' (HuggingFace) | 'local' (fine-tuné)
+      'vqvae'            : NeuroQuantHybrid (src/vae3d/train_vqvae.py)
+                          source: 'local'
+    """
+    vae_type = cfg["vae"].get("vae_type", "aekl").lower()
     vae_source = cfg["vae"].get("source", "local")
 
-    if vae_source == "maisi":
+    print(f"  [load_vae] type={vae_type}  source={vae_source}")
+
+    if vae_type == "medvae":
+        wrapper = _load_medvae(cfg, device, vae_source)
+
+    elif vae_type == "vqvae":
+        wrapper = _load_vqvae(cfg, device)
+
+    else:  # aekl (défaut)
+        wrapper = _load_aekl(cfg, device, vae_source)
+
+    wrapper = wrapper.to(device)
+    wrapper.eval()
+    for p in wrapper.parameters():
+        p.requires_grad_(False)
+    print(f"  [load_vae] latent_channels={wrapper.latent_channels}")
+    return wrapper
+
+
+def _load_aekl(cfg: dict, device: torch.device, source: str) -> AEKLWrapper:
+    """Charge AutoencoderKL MONAI (source: local | maisi | random)."""
+    if source == "maisi":
         cache_dir = cfg["vae"].get("maisi_cache_dir", None)
-        vae = _load_maisi_autoencoder(cache_dir)
+        model = _load_maisi_autoencoder(cache_dir)
     else:
-        # 'local' ou 'random'
         vae_config_path = cfg["vae"].get("vae_config", "configs/vae3d_T1W.yaml")
         if not os.path.isabs(vae_config_path):
             project_root = Path(__file__).parent.parent
             vae_config_path = str(project_root / vae_config_path)
-
         with open(vae_config_path) as f:
             vae_cfg = yaml.safe_load(f)
-
-        vae = _build_vae_from_config(vae_cfg)
-
-        if vae_source != "random":
+        model = _build_vae_from_config(vae_cfg)
+        if source != "random":
             ckpt_path = cfg["vae"].get("checkpoint", "")
             if ckpt_path and Path(ckpt_path).exists():
                 state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-                vae.load_state_dict(state["model"])
-                print(f"  VAE chargé depuis : {ckpt_path}")
+                model.load_state_dict(state["model"] if "model" in state else state)
+                print(f"  AEKL chargé depuis : {ckpt_path}")
             else:
-                print(f"  [WARN] VAE checkpoint introuvable : '{ckpt_path}' — poids aléatoires.")
+                print(
+                    f"  [WARN] AEKL checkpoint introuvable : '{ckpt_path}' — poids aléatoires."
+                )
+    return AEKLWrapper(model)
 
-    vae = vae.to(device)
-    vae.eval()
-    for p in vae.parameters():
-        p.requires_grad_(False)
-    return vae
+
+def _load_medvae(cfg: dict, device: torch.device, source: str) -> MedVAEWrapper:
+    """
+    Charge MedVAE (https://github.com/StanfordMIMI/MedVAE).
+
+    source='frozen'  → poids originaux depuis HuggingFace (pip install medvae)
+    source='local'   → checkpoint fine-tuné sur MRIxFields (cfg['vae']['checkpoint'])
+    """
+    model_name = cfg["vae"].get("model_name", "medvae_4_1_3d")
+    try:
+        from medvae import MVAE
+    except ImportError:
+        raise ImportError("medvae non installé. Installez avec : pip install medvae")
+    # latent_channels déduits depuis le nom du modèle (format: medvae_<C>_<...>)
+    try:
+        latent_ch = int(model_name.split("_")[1])
+    except Exception:
+        latent_ch = 4
+
+    model = MVAE(model_name=model_name, modality="mri")
+
+    if source == "local":
+        ckpt_path = cfg["vae"].get("checkpoint", "")
+        if ckpt_path and Path(ckpt_path).exists():
+            state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            model.load_state_dict(state["model"] if "model" in state else state)
+            print(f"  MedVAE fine-tuné chargé depuis : {ckpt_path}")
+        else:
+            print(f"  [WARN] MedVAE checkpoint introuvable : '{ckpt_path}'.")
+    else:
+        print(f"  MedVAE frozen chargé depuis HuggingFace ({model_name}).")
+
+    return MedVAEWrapper(model, latent_ch)
+
+
+def _load_vqvae(cfg: dict, device: torch.device) -> VQVAEWrapper:
+    """
+    Charge NeuroQuantHybrid (VQ-VAE adapté).
+    Lit la config vae_config pour reconstruire l'architecture.
+    """
+    # Import local depuis src/vae3d/
+    try:
+        from vae3d.train_vqvae import NeuroQuantHybrid
+    except ImportError:
+        from train_vqvae import NeuroQuantHybrid  # fallback si CWD = src/
+
+    # Lire l'architecture depuis la config du VQ-VAE
+    vae_config_path = cfg["vae"].get("vae_config", "configs/vqvae3d_T1W.yaml")
+    if not os.path.isabs(vae_config_path):
+        project_root = Path(__file__).parent.parent
+        vae_config_path = str(project_root / vae_config_path)
+
+    if Path(vae_config_path).exists():
+        with open(vae_config_path) as f:
+            vqvae_cfg = yaml.safe_load(f)
+        m = vqvae_cfg.get("model", {})
+        model = NeuroQuantHybrid(
+            n_modalities=m.get("n_modalities", 3),
+            n_fields=m.get("n_fields", 5),
+            base_channels=m.get("base_channels", 32),
+            anat_channels=m.get("anat_channels", 64),
+            mod_channels=m.get("mod_channels", 32),
+            codebook_size=m.get("codebook_size", 1024),
+        )
+    else:
+        print(
+            f"  [WARN] Config VQ-VAE introuvable : {vae_config_path} — architecture par défaut."
+        )
+        model = NeuroQuantHybrid(
+            n_modalities=3,
+            n_fields=5,
+            base_channels=32,
+            anat_channels=64,
+            mod_channels=32,
+            codebook_size=1024,
+        )
+
+    ckpt_path = cfg["vae"].get("checkpoint", "")
+    if ckpt_path and Path(ckpt_path).exists():
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = state.get("model", state)
+        # Ignorer les clés incompatibles (field_emb si n_fields différent)
+        current = model.state_dict()
+        compatible = {
+            k: v
+            for k, v in state.items()
+            if k in current and current[k].shape == v.shape
+        }
+        skipped = len(state) - len(compatible)
+        model.load_state_dict(compatible, strict=False)
+        print(f"  VQ-VAE chargé depuis : {ckpt_path}  ({skipped} clé(s) ignorée(s))")
+    else:
+        print(
+            f"  [WARN] VQ-VAE checkpoint introuvable : '{ckpt_path}' — poids aléatoires."
+        )
+
+    return VQVAEWrapper(model)
 
 
 # ===========================================================================
 # Build UNet 3D pour le flow matching en espace latent
 # ===========================================================================
+
 
 def build_unet_3d(cfg: dict, latent_channels: int) -> DiffusionModelUNet:
     """UNet 3D conditionné sur le temps et le domaine cible.
@@ -413,7 +680,7 @@ def build_unet_3d(cfg: dict, latent_channels: int) -> DiffusionModelUNet:
 
     return DiffusionModelUNet(
         spatial_dims=3,
-        in_channels=2 * latent_channels,         # cat(z_t, z_src)
+        in_channels=2 * latent_channels,  # cat(z_t, z_src)
         out_channels=latent_channels,
         **{_ch_kwarg: channels},
         attention_levels=tuple(m.get("attention_levels", [False, True, True])),
@@ -421,8 +688,8 @@ def build_unet_3d(cfg: dict, latent_channels: int) -> DiffusionModelUNet:
         num_head_channels=m.get("num_head_channels", 64),
         norm_num_groups=m.get("norm_num_groups", 32),
         use_flash_attention=m.get("use_flash_attention", False),
-        num_class_embeds=NUM_DOMAINS,            # conditioning sur domaine cible
-        with_conditioning=False,                 # pas de cross-attention texte
+        num_class_embeds=NUM_DOMAINS,  # conditioning sur domaine cible
+        with_conditioning=False,  # pas de cross-attention texte
         resblock_updown=True,
     )
 
@@ -430,6 +697,7 @@ def build_unet_3d(cfg: dict, latent_channels: int) -> DiffusionModelUNet:
 # ===========================================================================
 # EMA (Exponential Moving Average)
 # ===========================================================================
+
 
 class EMAModel:
     """Copie EMA des poids du modèle pour une meilleure généralisation."""
@@ -457,6 +725,7 @@ class EMAModel:
 # Training
 # ===========================================================================
 
+
 def is_main_process() -> bool:
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
@@ -473,33 +742,33 @@ def train(
     if resume is not None:
         cfg["resume"] = resume
 
-    data_root  = cfg["data"].get("data_root")
+    data_root = cfg["data"].get("data_root")
     if data_root is None:
         raise RuntimeError("data_root requis dans la config ou l'env.")
 
-    output_dir  = Path(cfg["data"]["output_dir"])
-    modality    = cfg["data"]["modality"]
-    split       = cfg["data"].get("split", "retro_train")
-    domains     = cfg["data"].get("domains", DOMAINS)
-    p_lo        = cfg["data"].get("percentile_lower", 0.5)
-    p_hi        = cfg["data"].get("percentile_upper", 99.5)
+    output_dir = Path(cfg["data"]["output_dir"])
+    modality = cfg["data"]["modality"]
+    split = cfg["data"].get("split", "retro_train")
+    domains = cfg["data"].get("domains", DOMAINS)
+    p_lo = cfg["data"].get("percentile_lower", 0.5)
+    p_hi = cfg["data"].get("percentile_upper", 99.5)
     max_per_dom = cfg["data"].get("max_volumes_per_domain", None)
-    raw_vs      = cfg["data"].get("volume_size", None)
+    raw_vs = cfg["data"].get("volume_size", None)
     volume_size = tuple(int(v) for v in raw_vs) if raw_vs else None
-    raw_ts      = cfg["data"].get("target_spacing", None)
+    raw_ts = cfg["data"].get("target_spacing", None)
     target_spacing = tuple(float(v) for v in raw_ts) if raw_ts else None
 
     total_iters = cfg["train"]["total_iters"]
-    batch_size  = cfg["train"]["batch_size"]
+    batch_size = cfg["train"]["batch_size"]
     num_workers = cfg["train"].get("num_workers", 4)
-    lr          = cfg["train"]["lr"]
-    sigma       = cfg["train"].get("sigma", 0.0)
-    ot_method   = cfg["train"].get("ot_method", "exact")
-    save_every  = cfg["train"].get("save_every", 5000)
+    lr = cfg["train"]["lr"]
+    sigma = cfg["train"].get("sigma", 0.0)
+    ot_method = cfg["train"].get("ot_method", "exact")
+    save_every = cfg["train"].get("save_every", 5000)
     print_every = cfg["train"].get("print_every", 200)
-    use_amp     = cfg["train"].get("use_amp", True)
-    grad_clip   = cfg["train"].get("grad_clip", 1.0)
-    ema_decay   = cfg["train"].get("ema_decay", 0.9999)
+    use_amp = cfg["train"].get("use_amp", True)
+    grad_clip = cfg["train"].get("grad_clip", 1.0)
+    ema_decay = cfg["train"].get("ema_decay", 0.9999)
 
     # ── Distributed ─────────────────────────────────────────────────────────
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -521,7 +790,8 @@ def train(
 
     # ── VAE (figé) ───────────────────────────────────────────────────────────
     vae = load_vae(cfg, device)
-    latent_channels = cfg["model"]["latent_channels"]
+    # latent_channels deduit du wrapper — pas besoin de le specifier dans la config
+    latent_channels = vae.latent_channels
 
     # ── Dataset ─────────────────────────────────────────────────────────────
     train_ds = NIfTILatentDataset(
@@ -540,13 +810,16 @@ def train(
     domain_loaders: Dict[str, any] = {}
     for d in domains:
         # Sous-ensemble par domaine
-        domain_indices = [i for i, (_, di) in enumerate(train_ds.samples)
-                         if di == DOMAIN_TO_IDX[d]]
+        domain_indices = [
+            i for i, (_, di) in enumerate(train_ds.samples) if di == DOMAIN_TO_IDX[d]
+        ]
         domain_subset = torch.utils.data.Subset(train_ds, domain_indices)
         if not domain_subset:
             continue
-        sampler = DistributedSampler(domain_subset, shuffle=True) if is_distributed else None
-        loader  = DataLoader(
+        sampler = (
+            DistributedSampler(domain_subset, shuffle=True) if is_distributed else None
+        )
+        loader = DataLoader(
             domain_subset,
             batch_size=batch_size,
             shuffle=(sampler is None),
@@ -559,7 +832,9 @@ def train(
 
     available_domains = list(domain_loaders.keys())
     if len(available_domains) < 2:
-        raise RuntimeError(f"Besoin d'au moins 2 domaines, {len(available_domains)} disponible(s).")
+        raise RuntimeError(
+            f"Besoin d'au moins 2 domaines, {len(available_domains)} disponible(s)."
+        )
 
     # ── UNet 3D ──────────────────────────────────────────────────────────────
     unet = build_unet_3d(cfg, latent_channels).to(device)
@@ -612,7 +887,7 @@ def train(
             print(f"Reprise depuis iter {start_iter} : {resume_path}")
 
     weights_dir = output_dir / "weights"
-    amp_dtype   = torch.float16 if use_amp else torch.float32
+    amp_dtype = torch.float16 if use_amp else torch.float32
 
     if is_main_process():
         print(
@@ -635,22 +910,25 @@ def train(
         tgt_idx = DOMAIN_TO_IDX[tgt_domain]
 
         # ── Batches volumétriques ─────────────────────────────────────────────
-        src_vol, _ = next(domain_loaders[src_domain])   # (B, 1, H, W, D) in [-1,1]
+        src_vol, _ = next(domain_loaders[src_domain])  # (B, 1, H, W, D) in [-1,1]
         tgt_vol, _ = next(domain_loaders[tgt_domain])
         src_vol = src_vol.to(device)
         tgt_vol = tgt_vol.to(device)
 
         # ── Encoder VAE (sans gradient, VAE est figé) ─────────────────────────
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-            z_src, _ = vae.encode(src_vol)   # (B, C_lat, H', W', D')
-            z_tgt, _ = vae.encode(tgt_vol)
+        with (
+            torch.no_grad(),
+            torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp),
+        ):
+            z_src = vae.encode(src_vol)  # (B, C_lat, H', W', D')
+            z_tgt = vae.encode(tgt_vol)
 
         # ── OT-CFM matching ───────────────────────────────────────────────────
         t_batch, z_t, ut = FM.sample_location_and_conditional_flow(z_src, z_tgt)
         # t_batch : (B,)  z_t : (B, C_lat, H', W', D')  ut = z_tgt - z_src : cible
 
         # ── Forward UNet 3D ───────────────────────────────────────────────────
-        z_in = torch.cat([z_t, z_src], dim=1)   # (B, 2*C_lat, H', W', D')
+        z_in = torch.cat([z_t, z_src], dim=1)  # (B, 2*C_lat, H', W', D')
         t_vec = t_batch.to(device).float()
         y = torch.full((z_src.shape[0],), tgt_idx, dtype=torch.long, device=device)
 
@@ -679,42 +957,48 @@ def train(
             iter_per_s = print_every / max(window_dt, 1e-9)
             eta_sec = (total_iters - step - 1) / max(iter_per_s, 1e-9)
             lr_cur = scheduler.get_last_lr()[0]
-            mem_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            mem_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
             print(
-                f"[{step+1:6d}/{total_iters}]"
+                f"[{step + 1:6d}/{total_iters}]"
                 f"  loss={avg_recent:.4f}"
                 f"  ema={ema_loss:.4f}"
                 f"  grad={float(grad_norm):.2f}"
                 f"  lr={lr_cur:.2e}"
                 f"  pair={src_domain}→{tgt_domain}"
                 f"  speed={iter_per_s:.2f} it/s"
-                f"  eta={eta_sec/3600:.2f}h"
-                f"  t={elapsed/60:.1f}min"
+                f"  eta={eta_sec / 3600:.2f}h"
+                f"  t={elapsed / 60:.1f}min"
                 f"  mem={mem_gb:.1f}GB"
             )
             last_log_t = time.time()
 
         # ── Checkpoint ────────────────────────────────────────────────────────
         if is_main_process() and (step + 1) % save_every == 0:
-            ckpt_path = weights_dir / f"checkpoint_{step+1}.pth"
-            torch.save({
-                "iter": step,
-                "model": raw_unet.state_dict(),
-                "ema": ema.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "cfg_path": str(cfg_path),
-            }, ckpt_path)
+            ckpt_path = weights_dir / f"checkpoint_{step + 1}.pth"
+            torch.save(
+                {
+                    "iter": step,
+                    "model": raw_unet.state_dict(),
+                    "ema": ema.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "cfg_path": str(cfg_path),
+                },
+                ckpt_path,
+            )
             print(f"  → Checkpoint : {ckpt_path}")
 
     if is_main_process():
         final_path = weights_dir / "model_final.pth"
-        torch.save({
-            "iter": total_iters - 1,
-            "model": raw_unet.state_dict(),
-            "ema": ema.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "cfg_path": str(cfg_path),
-        }, final_path)
+        torch.save(
+            {
+                "iter": total_iters - 1,
+                "model": raw_unet.state_dict(),
+                "ema": ema.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "cfg_path": str(cfg_path),
+            },
+            final_path,
+        )
         print(f"\nEntraînement terminé. Modèle final : {final_path}")
 
     if is_distributed:
@@ -725,6 +1009,7 @@ def train(
 # Inference : T1W volume → T2W volume via ODE integration
 # ===========================================================================
 
+
 @torch.no_grad()
 def _euler_integrate(
     unet: DiffusionModelUNet,
@@ -733,7 +1018,7 @@ def _euler_integrate(
     n_steps: int,
     device: torch.device,
     use_amp: bool = False,
-    amp_dtype = torch.float16,
+    amp_dtype=torch.float16,
 ) -> torch.Tensor:
     """Intégration Euler : z_src → z_tgt via le champ vectoriel appris."""
     dt = 1.0 / n_steps
@@ -743,7 +1028,7 @@ def _euler_integrate(
     for step_i in range(n_steps):
         t_val = step_i * dt
         t_vec = torch.tensor([t_val], dtype=torch.float32, device=device)
-        z_in = torch.cat([z, z_src], dim=1)   # (1, 2*C_lat, H', W', D')
+        z_in = torch.cat([z, z_src], dim=1)  # (1, 2*C_lat, H', W', D')
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             vt = unet(x=z_in, timesteps=t_vec, class_labels=y)
         z = z + dt * vt
@@ -780,6 +1065,7 @@ def infer(
 
     # ── Charger VAE ──────────────────────────────────────────────────────────
     vae = load_vae(cfg, device)
+    latent_channels = vae.latent_channels
 
     # ── Charger UNet ─────────────────────────────────────────────────────────
     unet = build_unet_3d(cfg, latent_channels).to(device)
@@ -806,18 +1092,28 @@ def infer(
         lo = np.percentile(vol, p_lo)
         hi = np.percentile(vol, p_hi)
         vol_norm = np.clip((vol - lo) / max(hi - lo, 1e-8), 0.0, 1.0) * 2.0 - 1.0
-        vol_tensor = torch.from_numpy(vol_norm).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W,D)
+        vol_tensor = (
+            torch.from_numpy(vol_norm).unsqueeze(0).unsqueeze(0).to(device)
+        )  # (1,1,H,W,D)
 
         # Encode
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-            z_src, _ = vae.encode(vol_tensor)   # (1, C_lat, H', W', D')
+        with (
+            torch.no_grad(),
+            torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp),
+        ):
+            z_src = vae.encode(vol_tensor)  # (1, C_lat, H', W', D')
 
         # ODE integration
-        z_pred = _euler_integrate(unet, z_src, tgt_idx, n_steps, device, use_amp, amp_dtype)
+        z_pred = _euler_integrate(
+            unet, z_src, tgt_idx, n_steps, device, use_amp, amp_dtype
+        )
 
         # Decode
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-            recon = vae.decode(z_pred)   # (1, 1, H, W, D)
+        with (
+            torch.no_grad(),
+            torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp),
+        ):
+            recon = vae.decode(z_pred)  # (1, 1, H, W, D)
 
         pred_vol = recon.squeeze().cpu().numpy()
         # Dénormalisation vers [0, 1] (espace de données d'origine)
@@ -838,20 +1134,23 @@ def infer(
 # CLI
 # ===========================================================================
 
+
 def _parse() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="OT-CFM 3D — Traduction de contraste IRM 3D")
-    p.add_argument("--mode",          default="train", choices=["train", "infer"])
-    p.add_argument("--config",        required=True)
-    p.add_argument("--env",           default=None)
-    p.add_argument("--resume",        default=None)
+    p = argparse.ArgumentParser(
+        description="OT-CFM 3D — Traduction de contraste IRM 3D"
+    )
+    p.add_argument("--mode", default="train", choices=["train", "infer"])
+    p.add_argument("--config", required=True)
+    p.add_argument("--env", default=None)
+    p.add_argument("--resume", default=None)
     # Inférence
-    p.add_argument("--checkpoint",    default=None)
-    p.add_argument("--input_dir",     default=None)
-    p.add_argument("--output_dir",    default=None)
+    p.add_argument("--checkpoint", default=None)
+    p.add_argument("--input_dir", default=None)
+    p.add_argument("--output_dir", default=None)
     p.add_argument("--source_domain", default=None)
     p.add_argument("--target_domain", default=None)
-    p.add_argument("--n_steps",       type=int, default=None)
-    p.add_argument("--no_ema",        action="store_true")
+    p.add_argument("--n_steps", type=int, default=None)
+    p.add_argument("--no_ema", action="store_true")
     return p.parse_args()
 
 
@@ -860,8 +1159,15 @@ if __name__ == "__main__":
     if args.mode == "train":
         train(args.config, env_path=args.env, resume=args.resume)
     else:
-        if not all([args.checkpoint, args.input_dir, args.output_dir,
-                    args.source_domain, args.target_domain]):
+        if not all(
+            [
+                args.checkpoint,
+                args.input_dir,
+                args.output_dir,
+                args.source_domain,
+                args.target_domain,
+            ]
+        ):
             raise ValueError(
                 "Mode infer : --checkpoint, --input_dir, --output_dir, "
                 "--source_domain, --target_domain requis."
