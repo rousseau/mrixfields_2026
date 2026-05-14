@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Script SLURM — Entraînement VQ-VAE 3D multimodal sur Jean Zay (H100 SXM5 80GB)
 #
-# Partition gpu_p6 : H100 SXM5 80GB, 4 GPUs/nœud
+# Partition gpu_p6 : H100 SXM5 80GB — 1 GPU (train_vqvae.py ne supporte pas DDP)
 # QOS : qos_gpu_h100-t4 (100h max)
 #
 # Lancement :
@@ -27,9 +27,9 @@
 #SBATCH -C h100
 
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:4
-#SBATCH --ntasks=1               # torchrun gère les 4 sous-processus GPU
-#SBATCH --cpus-per-task=64       # 16 CPUs × 4 GPUs (workers DataLoader)
+#SBATCH --gres=gpu:1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16       # 16 CPUs pour DataLoader workers
 
 #SBATCH --partition=gpu_p6
 #SBATCH --qos=qos_gpu_h100-t4
@@ -49,7 +49,7 @@ FIELDS="${3:-0.1T 1.5T 3T 5T 7T}"
 
 CODE_DIR="$WORK/MRIX/mrixfields_2026"
 DATA_ROOT="$WORK/MRIX/data"
-OUTPUT_DIR="$WORK/MRIX/outputs/vqvae3d/${RUN_NAME}"  # Simplified output path structure
+OUTPUT_DIR="$WORK/MRIX/mrixfields_2026/outputs/vqvae3d/runs/${RUN_NAME}"
 
 mkdir -p "$CODE_DIR/logs"
 
@@ -104,7 +104,10 @@ WEIGHTS_DIR="${OUTPUT_DIR}/weights"
 RESUME_FLAG=""
 
 if [ -d "$WEIGHTS_DIR" ]; then
-    LAST_CKPT=$(ls -t "${WEIGHTS_DIR}"/checkpoint_*.pth 2>/dev/null | head -1 || true)
+    LAST_CKPT=""
+    if [ -f "${WEIGHTS_DIR}/model_final.pth" ]; then
+        LAST_CKPT="${WEIGHTS_DIR}/model_final.pth"
+    fi
     if [ -n "$LAST_CKPT" ]; then
         RESUME_FLAG="--resume $LAST_CKPT"
         echo "Reprise depuis  : $LAST_CKPT"
@@ -115,20 +118,14 @@ else
     echo "Aucun répertoire weights — démarrage à zéro."
 fi
 
-# ─── Lancement multi-GPU (torchrun DDP 4×H100) ───────────────────────────────
+# ─── Lancement (1 GPU H100) ──────────────────────────────────────────────────
 cd "$CODE_DIR"
 
 echo "======================================================================="
-echo " Démarrage torchrun (4 GPUs H100)"
+echo " Démarrage python (1 GPU H100)"
 echo "======================================================================="
 
-torchrun \
-    --nproc_per_node=4 \
-    --nnodes=1 \
-    --node_rank=0 \
-    --master_addr=localhost \
-    --master_port=29500 \
-    src/train_vqvae.py \
+python3 src/vae3d/train_vqvae.py \
     --data-root  "$DATA_ROOT" \
     --splits     retro_train \
     --modalities $MODALITIES \
