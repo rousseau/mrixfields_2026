@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Environnement JEAN ZAY (IDRIS — H100 SXM5)
 #
-# $WORK = /lustre/fswork/projects/rech/crp/ulq73oz
+# $WORK = /lustre/fswork/projects/rech/crp/<LOGIN>
 #
 # Structure attendue sous $WORK/MRIX/ :
 #   data/              ← données brutes MRIxFields (NIfTI, challenge structure)

@@ -48,9 +48,12 @@ logs/
 results/*.png
 results/*.pdf
 
-# ── OS / IDE ─────────────────────────────────────────────────────────────────
+# ── OS / IDE ───────────────────────────────────────────────────────────────
 .DS_Store
 ._.DS_Store
 **/._.DS_Store
 .vscode/
 *.swp
+
+# ── Scripts locaux (hors repo public, contient des identifiants) ──
+scripts/
