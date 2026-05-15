@@ -19,6 +19,15 @@
 #
 # Pour configurer scripts/jz_sync.sh : voir scripts/jz_sync.template
 #
+# ──── Compte SLURM (SBATCH_ACCOUNT) ──────────────────────────
+# Les scripts SLURM ne hardcodent PAS le compte projet.
+# Définir la variable avant tout sbatch :
+#
+#   export SBATCH_ACCOUNT=<projet>@h100
+#
+# Pour le rendre permanent, ajouter dans ~/.bashrc sur Jean Zay :
+#   echo 'export SBATCH_ACCOUNT=<projet>@h100' >> ~/.bashrc
+#
 # ──── Commandes d'entraînement sur Jean Zay ───────────────────
 #
 # Étape 1 -- StarGAN 2D (baseline MICCAI)

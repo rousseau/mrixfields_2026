@@ -20,7 +20,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=cfm3d
-#SBATCH -A crp@h100
+# SBATCH_ACCOUNT doit être défini dans l'environnement avant sbatch :
+#   export SBATCH_ACCOUNT=<projet>@h100   (ex: crp@h100)
+# SLURM lit automatiquement cette variable — ne pas hardcoder ici.
 #SBATCH -C h100
 
 #SBATCH --nodes=1
@@ -132,18 +134,18 @@ echo "GPU            : $(nvidia-smi --query-gpu=name,memory.total --format=csv,n
 cd "$CODE_DIR"
 
 if [ "$PHASE" = "vae" ]; then
-    SCRIPT="src/train_vae_3d.py"
+    SCRIPT="src/vae3d/train_vae_3d.py"
     if [ -n "$CONFIG_ARG" ]; then
         CONFIG="$CONFIG_ARG"
     else
-        CONFIG="configs/vae3d_${MODALITY}.yaml"
+        CONFIG="configs/vae3d_T1W.yaml"
     fi
 elif [ "$PHASE" = "cfm" ]; then
-    SCRIPT="src/train_cfm_3d.py"
+    SCRIPT="src/cfm/train_cfm_3d.py"
     if [ -n "$CONFIG_ARG" ]; then
         CONFIG="$CONFIG_ARG"
     else
-        CONFIG="configs/cfm3d_latent_${MODALITY}.yaml"
+        CONFIG="configs/cfm3d_T1W_aekl.yaml"
     fi
 else
     echo "[ERREUR] Phase inconnue : '$PHASE'. Utiliser 'vae' ou 'cfm'."
@@ -167,12 +169,12 @@ with open('$CONFIG') as f:
 print(c.get('data', {}).get('output_subdir', ''))
 " 2>/dev/null || echo "")
 
-WEIGHTS_DIR="$WORK/MRIX/outputs/${OUTPUT_SUBDIR}/weights"
+WEIGHTS_DIR="$WORK/MRIX/mrixfields_2026/outputs/${OUTPUT_SUBDIR}/weights"
 RESUME_FLAG=""
 
 if [ -d "$WEIGHTS_DIR" ]; then
     # Cherche le checkpoint le plus récent (checkpoint_XXXXX.pth)
-    LAST_CKPT=$(ls -t "${WEIGHTS_DIR}"/checkpoint_*.pth 2>/dev/null | head -1 || true)
+    LAST_CKPT=$(ls -t "${WEIGHTS_DIR}"/checkpoint_*.pth "${WEIGHTS_DIR}"/model_final.pth 2>/dev/null | head -1 || true)
     if [ -n "$LAST_CKPT" ]; then
         RESUME_FLAG="--resume $LAST_CKPT"
         echo "Reprise depuis  : $LAST_CKPT"

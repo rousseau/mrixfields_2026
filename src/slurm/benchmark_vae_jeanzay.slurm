@@ -16,7 +16,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=benchmark_vae
-#SBATCH -A crp@h100
+# SBATCH_ACCOUNT doit être défini dans l'environnement avant sbatch :
+#   export SBATCH_ACCOUNT=<projet>@h100   (ex: crp@h100)
+# SLURM lit automatiquement cette variable — ne pas hardcoder ici.
 #SBATCH -C h100
 
 #SBATCH --nodes=1
@@ -38,7 +40,7 @@ FIELD="${2:-0.1T}"
 
 CODE_DIR="$WORK/MRIX/mrixfields_2026"
 DATA_ROOT="$WORK/MRIX/data"
-OUTPUT_DIR="$WORK/MRIX/outputs/benchmark/runs"
+OUTPUT_DIR="$WORK/MRIX/mrixfields_2026/outputs/benchmark/runs"
 
 mkdir -p "$CODE_DIR/logs"
 mkdir -p "$OUTPUT_DIR"
@@ -90,13 +92,13 @@ echo ""
 echo "Démarrage benchmark..."
 echo ""
 
-python3 src/benchmark_vae.py \
+python3 src/vae3d/benchmark_vae.py \
     --data-root "$DATA_ROOT" \
     --modality "$MODALITY" \
     --field "$FIELD" \
     --max-samples 3 \
     --aekl-ckpt "outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth" \
-    --vqvae-ckpt "outputs/vqvae3d/runs/smoke_vqvae/weights/vqvae_step_000001.pth" \
+    --vqvae-ckpt "outputs/vqvae3d/runs/vqvae3d_T1W/weights/model_best.pth" \
     --output-dir "$OUTPUT_DIR" \
     --device cuda
 

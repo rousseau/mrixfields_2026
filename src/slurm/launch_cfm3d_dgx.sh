@@ -39,10 +39,10 @@ print(e.get('python', 'python3'))
 # ── Config selon la phase ────────────────────────────────────────────────────
 if [[ "$PHASE" == "vae" ]]; then
     CONFIG="${CONFIG_OVERRIDE:-configs/vae3d_T1W.yaml}"
-    SCRIPT="src/train_vae_3d.py"
+    SCRIPT="src/vae3d/train_vae_3d.py"
 elif [[ "$PHASE" == "cfm" ]]; then
-    CONFIG="${CONFIG_OVERRIDE:-configs/cfm3d_latent_${MODALITY}.yaml}"
-    SCRIPT="src/train_cfm_3d.py"
+    CONFIG="${CONFIG_OVERRIDE:-configs/cfm3d_T1W_aekl.yaml}"
+    SCRIPT="src/cfm/train_cfm_3d.py"
 else
     echo "ERREUR : PHASE doit être 'vae' ou 'cfm' (reçu : '$PHASE')" >&2
     exit 1
@@ -69,7 +69,16 @@ print(e['output_root'] + '/' + subdir)
 
 RESUME_ARG=""
 if [[ -n "$OUTPUT_ROOT" && -d "$OUTPUT_ROOT/weights" ]]; then
-    LAST_CKPT=$(ls -t "$OUTPUT_ROOT/weights"/*.pth 2>/dev/null | head -1 || echo "")
+    LAST_CKPT=""
+    for preferred in model_best.pth model_final.pth; do
+        if [[ -f "$OUTPUT_ROOT/weights/$preferred" ]]; then
+            LAST_CKPT="$OUTPUT_ROOT/weights/$preferred"
+            break
+        fi
+    done
+    if [[ -z "$LAST_CKPT" ]]; then
+        LAST_CKPT=$(ls -t "$OUTPUT_ROOT/weights"/checkpoint_*.pth 2>/dev/null | head -1 || echo "")
+    fi
     if [[ -n "$LAST_CKPT" ]]; then
         RESUME_ARG="--resume $LAST_CKPT"
         echo "  Reprise depuis : $LAST_CKPT"

@@ -20,11 +20,13 @@
 # Prérequis (une seule fois via setup_jeanzay.sh) :
 #   $WORK/MRIX/mrixfields_2026/   ← ce repo (git clone)
 #   $WORK/MRIX/challenge/         ← code officiel du challenge (git clone)
-#   $WORK/MRIX/data/              ← données NIfTI (rsync depuis machine locale)
+#   $WORK/MRIX/data/              ← données NIfTI (scp via scripts/jz_sync.sh)
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=stargan2d
-#SBATCH -A crp@h100
+# SBATCH_ACCOUNT doit être défini dans l'environnement avant sbatch :
+#   export SBATCH_ACCOUNT=<projet>@h100   (ex: crp@h100)
+# SLURM lit automatiquement cette variable — ne pas hardcoder ici.
 #SBATCH -C h100
 
 #SBATCH --nodes=1
@@ -113,7 +115,7 @@ export PYTHON="python3"
 
 # srun : alloue correctement GPU/CPUs dans le contexte SLURM
 # Le & + wait permet au trap USR1 d'intercepter le signal de requeue
-srun bash src/train_stargan2d.sh "${MODALITY}" "${MODE}" &
+srun bash src/stargan/train_stargan2d.sh "${MODALITY}" "${MODE}" &
 
 wait $!
 echo "Entraînement terminé (exit: $?)"

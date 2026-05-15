@@ -23,7 +23,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=vqvae3d
-#SBATCH -A crp@h100
+# SBATCH_ACCOUNT doit être défini dans l'environnement avant sbatch :
+#   export SBATCH_ACCOUNT=<projet>@h100   (ex: crp@h100)
+# SLURM lit automatiquement cette variable — ne pas hardcoder ici.
 #SBATCH -C h100
 
 #SBATCH --nodes=1

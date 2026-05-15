@@ -16,7 +16,9 @@
 #   --export=ALL,STEPS=20000,BATCH_SIZE=2,LR=1e-4,TIME_LIMIT=48:00:00
 
 #SBATCH --job-name=vae_train
-#SBATCH -A crp@h100
+# SBATCH_ACCOUNT doit être défini dans l'environnement avant sbatch :
+#   export SBATCH_ACCOUNT=<projet>@h100   (ex: crp@h100)
+# SLURM lit automatiquement cette variable — ne pas hardcoder ici.
 #SBATCH -C h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

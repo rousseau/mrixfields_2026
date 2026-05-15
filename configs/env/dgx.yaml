@@ -2,15 +2,15 @@
 # Environnement DGX Station (debug multi-GPU local)
 #
 # Utilisation single-GPU :
-#   python src/train_cfm_3d.py --config configs/cfm3d_latent_T1W.yaml --env dgx
+#   python src/cfm/train_cfm_3d.py --config configs/cfm3d_T1W_aekl.yaml --env dgx
 #
 # Multi-GPU (torchrun) :
-#   torchrun --nproc_per_node=4 src/train_cfm_3d.py \
-#       --config configs/cfm3d_latent_T1W.yaml --env dgx
+#   torchrun --nproc_per_node=4 src/cfm/train_cfm_3d.py \
+#       --config configs/cfm3d_T1W_aekl.yaml --env dgx
 #
 # Ou via le script de lancement :
-#   bash src/launch_cfm3d_dgx.sh vae   T1W 2      # 2 GPUs, phase VAE
-#   bash src/launch_cfm3d_dgx.sh cfm   T1W 4      # 4 GPUs, phase CFM
+#   bash src/slurm/launch_cfm3d_dgx.sh vae T1W 2    # 2 GPUs, phase VAE
+#   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4    # 4 GPUs, phase CFM
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Données brutes MRIxFields 2026 (NIfTI)
