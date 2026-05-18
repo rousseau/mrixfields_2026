@@ -27,6 +27,7 @@
 # SBATCH_ACCOUNT doit être défini dans l'environnement avant sbatch :
 #   export SBATCH_ACCOUNT=<projet>@h100   (ex: crp@h100)
 # SLURM lit automatiquement cette variable — ne pas hardcoder ici.
+#SBATCH -A crp@h100
 #SBATCH -C h100
 
 #SBATCH --nodes=1

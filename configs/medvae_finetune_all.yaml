@@ -1,0 +1,69 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Config fine-tuning MedVAE 3D — toutes modalités × tous champs
+#
+# Fine-tuning de medvae_4_1_3d (Stanford MIMI) sur Training_retrospective
+# complet : T1W + T2W + T2FLAIR × 0.1T + 1.5T + 3T + 5T + 7T (~1939 volumes).
+#
+# Différences avec le training précédent (train_vae.py / 3 volumes) :
+#   - Dataset complet : 1939 volumes (vs 3)
+#   - Toutes modalités (modèle généraliste cross-field / cross-modalité)
+#   - LR 1e-5 avec warmup cosine (fine-tuning)
+#   - 20 000 steps ≈ 10 epochs sur 1939 volumes avec batch=1
+#
+# Lancement :
+#   python src/vae3d/finetune_medvae.py --config configs/medvae_finetune_all.yaml --env local
+#   sbatch src/slurm/finetune_medvae_jeanzay.slurm
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: medvae_finetune
+task_name: medvae_finetune_all
+
+# ─── Architecture MedVAE ──────────────────────────────────────────────────────
+medvae:
+  model_name: medvae_4_1_3d     # 4× compression spatiale, 1 canal latent
+  freeze_encoder: false         # Fine-tuning complet (encoder + decoder)
+  freeze_decoder: false         # Mettre true pour adapter seulement le décodeur
+
+# ─── Données ──────────────────────────────────────────────────────────────────
+data:
+  split: retro_train            # Training_retrospective (~1939 volumes)
+  modalities: [T1W, T2W, T2FLAIR]
+  fields: [0.1T, 1.5T, 3T, 5T, 7T]
+
+  # Chemin résolu depuis configs/env/{local,jeanzay}.yaml
+  output_subdir: medvae/runs/medvae_finetune_all
+
+  # Taille de patch : divisible par 4 (2 niveaux de downsampling dans MedVAE 4×)
+  # (128, 128, 80) → latent (1, 32, 32, 20) — identique à la config AEKL
+  patch_size: [128, 128, 80]
+
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  target_spacing: [1.0, 1.0, 1.0]   # Rééchantillonnage isotrope 1mm
+
+  # Fraction du dataset train utilisée comme validation si Validating_prospective
+  # est indisponible.
+  val_fraction: 0.1
+
+# ─── Entraînement ─────────────────────────────────────────────────────────────
+train:
+  batch_size: 1
+  num_workers: 8                # 16 sur Jean Zay H100 (64 CPUs/nœud)
+  total_steps: 20000            # ≈ 10 epochs sur 1939 volumes
+
+  # Fine-tuning : LR 10× plus faible qu'un training from scratch
+  lr: 1.0e-5
+  lr_warmup_steps: 500          # Warmup linéaire sur les 500 premiers steps
+
+  save_every: 2000              # Checkpoint + validation toutes les 2000 steps
+  print_every: 100              # Log toutes les 100 steps
+
+  use_amp: true                 # float16 AMP (H100 / GB10 supportés)
+  grad_clip: 1.0
+
+  # Pondération des termes de la loss
+  lambda_l1: 1.0                # Loss de reconstruction L1 (principale)
+  lambda_kl: 0.0                # KL divergence (0 si encode() retourne z directement)
+                                # Mettre 1e-6 si encode() retourne (mean, logvar)
+
+  dist_backend: nccl            # Backend DDP pour multi-GPU (torchrun)

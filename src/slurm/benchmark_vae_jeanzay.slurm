@@ -19,6 +19,7 @@
 # SBATCH_ACCOUNT doit être défini dans l'environnement avant sbatch :
 #   export SBATCH_ACCOUNT=<projet>@h100   (ex: crp@h100)
 # SLURM lit automatiquement cette variable — ne pas hardcoder ici.
+#SBATCH -A crp@h100
 #SBATCH -C h100
 
 #SBATCH --nodes=1
@@ -97,8 +98,9 @@ python3 src/vae3d/benchmark_vae.py \
     --modality "$MODALITY" \
     --field "$FIELD" \
     --max-samples 3 \
-    --aekl-ckpt "outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth" \
-    --vqvae-ckpt "outputs/vqvae3d/runs/vqvae3d_T1W/weights/model_best.pth" \
+    --aekl-ckpt  "outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth" \
+    --vqvae-ckpt "outputs/vqvae3d/runs/vqvae_full/weights/vqvae_final.pth" \
+    --medvae-finetuned-ckpt "outputs/medvae/runs/medvae_T1W/weights/model_final.pth" \
     --output-dir "$OUTPUT_DIR" \
     --device cuda
 
