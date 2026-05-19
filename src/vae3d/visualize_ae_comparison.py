@@ -49,7 +49,10 @@ from vae3d.benchmark_vae import (
 # ─── Constantes ──────────────────────────────────────────────────────────────
 MODALITIES = ["T1W", "T2W", "T2FLAIR"]
 FIELDS = ["0.1T", "1.5T", "3T", "5T", "7T"]
-AE_NAMES = ["AEKL", "VQ-VAE", "MedVAE frozen", "MedVAE ft"]
+AE_NAMES = ["AEKL", "VQ-VAE", "MedVAE 4×1", "MedVAE 4×1 ft", "MedVAE 8×1"]
+
+# Champ de référence pour le calcul de z_best (robuste pour tous les AE)
+REF_FIELD = "3T"
 
 # Taille du patch : multiple de 16 (VQ-VAE 16× downsample) et de 4 (AEKL/MedVAE)
 # (256, 256, 80) → axial = patch[:, :, 40] de forme (256, 256) — aspect carré
@@ -65,79 +68,125 @@ ROW_COLORS = {
     "Original": "#88ccff",
     "AEKL": "#ffcc66",
     "VQ-VAE": "#88ff88",
-    "MedVAE frozen": "#ff9999",
-    "MedVAE ft": "#ff66ff",
+    "MedVAE 4×1": "#ff9999",
+    "MedVAE 4×1 ft": "#ff66ff",
+    "MedVAE 8×1": "#ff9944",
 }
 
 
 # ─── Utilitaires données ──────────────────────────────────────────────────────
 
 
-def _normalize(vol: np.ndarray, lo: float = 0.5, hi: float = 99.5) -> np.ndarray:
+def _normalize_model(vol: np.ndarray, lo: float = 0.5, hi: float = 99.5) -> np.ndarray:
+    """
+    Normalisation [-1, 1] pour l'entrée des modèles.
+    Identique à benchmark_vae._normalize — les modèles ont été entraînés sur ce range.
+    """
     p_lo, p_hi = np.percentile(vol, lo), np.percentile(vol, hi)
     if p_hi <= p_lo:
         return np.zeros_like(vol, dtype=np.float32)
-    return np.clip((vol - p_lo) / (p_hi - p_lo), 0.0, 1.0).astype(np.float32)
+    clipped = np.clip((vol - p_lo) / (p_hi - p_lo), 0.0, 1.0)
+    return (clipped * 2.0 - 1.0).astype(np.float32)  # [-1, 1]
+
+
+def _model_to_display(arr: np.ndarray) -> np.ndarray:
+    """Convertit la sortie du modèle [-1, 1] → [0, 1] pour l'affichage matplotlib."""
+    return np.clip((arr + 1.0) / 2.0, 0.0, 1.0).astype(np.float32)
+
+
+def _find_z_best(
+    vol_raw: np.ndarray, x0: int, y0: int, patch_xy: int, size_smooth: int = 20
+) -> int:
+    """
+    Trouve l'indice de la tranche axiale la plus brillante dans la région [x0,y0]
+    du volume brut (non normalisé). Utilisé comme référence inter-champs.
+    """
+    roi = vol_raw[x0 : x0 + patch_xy, y0 : y0 + patch_xy, :].astype(np.float32)
+    # Normalisation locale pour ne pas être biaisé par les intensités absolues
+    lo, hi = np.percentile(roi, 0.5), np.percentile(roi, 99.5)
+    roi_n = np.clip((roi - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+    z_means = roi_n.mean(axis=(0, 1))
+    z_smooth = uniform_filter1d(z_means, size=size_smooth)
+    return int(np.argmax(z_smooth))
 
 
 def load_and_patch(
     path: Path,
     patch_xy: int = PATCH_XY,
     patch_z: int = PATCH_Z,
+    z_best_ref: int = -1,
 ):
     """
-    Charge un volume NIfTI, normalise, extrait un patch (patch_xy, patch_xy, patch_z).
+    Charge un volume NIfTI et extrait un patch (patch_xy, patch_xy, patch_z).
 
     Centrage :
-      - x, y  : centre géométrique du volume (coupes sagittale et coronale)
-      - z      : tranche axiale la plus brillante (maximum d'intensité moyenne)
-                 → approximativement au niveau des ventricules latéraux
+      - x, y  : centre géométrique du volume
+      - z      : si z_best_ref >= 0, utilise cette position de référence
+                 (indispensable pour données recalées, même sujet différents champs)
+                 sinon calcule la tranche la plus brillante
 
-    Retourne : (patch_3d,  z_local)  avec  z_local ≈ patch_z // 2
+    Retourne :
+      patch_model   : array [-1, 1]  → entrée modèles
+      patch_display : array [0, 1]   → affichage de l'original
+      z_best        : indice de la tranche de référence dans le volume complet
+      x0, y0        : coin supérieur gauche du patch en x, y
     """
     img = nib.load(str(path))
-    vol = _normalize(img.get_fdata(dtype=np.float32))
-    H, W, D = vol.shape
+    vol_raw = img.get_fdata(dtype=np.float32)
+    H, W, D = vol_raw.shape
 
     # Centre en x, y
-    x0 = max((H - patch_xy) // 2, 0)
-    y0 = max((W - patch_xy) // 2, 0)
-    x0 = min(x0, max(H - patch_xy, 0))
-    y0 = min(y0, max(W - patch_xy, 0))
+    x0 = min(max((H - patch_xy) // 2, 0), max(H - patch_xy, 0))
+    y0 = min(max((W - patch_xy) // 2, 0), max(W - patch_xy, 0))
 
-    # Tranche axiale la plus brillante (sur la région x,y du patch)
-    roi = vol[x0 : x0 + patch_xy, y0 : y0 + patch_xy, :]
-    z_means = roi.mean(axis=(0, 1))
-    z_smooth = uniform_filter1d(z_means, size=20)
-    z_best = int(np.argmax(z_smooth))
+    # Tranche axiale de référence
+    if z_best_ref < 0:
+        z_best = _find_z_best(vol_raw, x0, y0, patch_xy)
+    else:
+        z_best = int(np.clip(z_best_ref, patch_z // 2, D - patch_z // 2 - 1))
 
     # Centre en z autour de z_best
-    z0 = max(0, z_best - patch_z // 2)
-    z0 = min(z0, max(D - patch_z, 0))
+    z0 = int(np.clip(z_best - patch_z // 2, 0, max(D - patch_z, 0)))
+    z_local = z_best - z0  # index dans le patch (≈ patch_z // 2)
 
-    patch = vol[x0 : x0 + patch_xy, y0 : y0 + patch_xy, z0 : z0 + patch_z]
+    # Extraction du patch
+    def _extract(v):
+        p = v[x0 : x0 + patch_xy, y0 : y0 + patch_xy, z0 : z0 + patch_z]
+        pad = [
+            (0, max(0, patch_xy - p.shape[0])),
+            (0, max(0, patch_xy - p.shape[1])),
+            (0, max(0, patch_z - p.shape[2])),
+        ]
+        return np.pad(p, pad, mode="reflect") if any(q[1] > 0 for q in pad) else p
 
-    # Padding si nécessaire
-    pad = [
-        (0, max(0, patch_xy - patch.shape[0])),
-        (0, max(0, patch_xy - patch.shape[1])),
-        (0, max(0, patch_z - patch.shape[2])),
-    ]
-    if any(p[1] > 0 for p in pad):
-        patch = np.pad(patch, pad, mode="reflect")
+    patch_raw = _extract(vol_raw)
+    patch_model = _normalize_model(patch_raw)  # [-1, 1]
+    patch_display = _model_to_display(patch_model)  # [0, 1]
 
-    z_local = z_best - z0  # ≈ patch_z // 2
-    return patch.astype(np.float32), z_local
+    return (
+        patch_model.astype(np.float32),
+        patch_display.astype(np.float32),
+        z_best,
+        x0,
+        y0,
+    )
 
 
 # ─── Inférence modèle ────────────────────────────────────────────────────────
 
 
 def reconstruct(
-    model: nn.Module, patch: np.ndarray, device: torch.device
+    model: nn.Module, patch_model: np.ndarray, device: torch.device
 ) -> np.ndarray:
-    """Encode → decode un seul patch 3D. Retourne le volume reconstruit."""
-    x = torch.from_numpy(patch)[None, None].to(device)  # (1, 1, H, W, D)
+    """
+    Encode → decode un seul patch 3D.
+
+    Args:
+      patch_model : array [-1, 1] (normalisation modèle)
+    Returns:
+      array [0, 1] prêt pour l'affichage matplotlib
+    """
+    x = torch.from_numpy(patch_model)[None, None].to(device)  # (1, 1, H, W, D)
     with torch.no_grad():
         z = model.encode(x)
         if isinstance(z, tuple):
@@ -145,13 +194,13 @@ def reconstruct(
         xr = model.decode(z)
     out = xr.squeeze().cpu().float().numpy()
 
-    # Recadrage si la taille de sortie diffère (ne devrait pas arriver avec des
-    # patches multiples de 16, mais sécurité)
-    if out.shape != patch.shape:
-        factors = tuple(t / s for t, s in zip(patch.shape, out.shape))
+    # Recadrage si la taille de sortie diffère
+    if out.shape != patch_model.shape:
+        factors = tuple(t / s for t, s in zip(patch_model.shape, out.shape))
         out = scipy_zoom(out, factors, order=1)
 
-    return np.clip(out, 0.0, 1.0).astype(np.float32)
+    # Sortie du modèle en [-1,1] → [0,1] pour l'affichage
+    return _model_to_display(out)
 
 
 # ─── Métriques ───────────────────────────────────────────────────────────────
@@ -359,13 +408,21 @@ def main():
         "--patch-xy",
         type=int,
         default=256,
-        help="Taille du patch dans les dimensions x et y (doit être multiple de 16).",
+        help="Taille du patch dans les dimensions x et y (doit être multiple de 16). "
+        "Pour VQ-VAE, utiliser 112 (entraîné sur 112x128x80).",
     )
     parser.add_argument(
         "--patch-z",
         type=int,
         default=80,
-        help="Épaisseur du patch dans la dimension axiale (doit être multiple de 16).",
+        help="Épaisseur du patch dans la dimension axiale (doit être multiple de 16). "
+        "Pour VQ-VAE, utiliser 80 (entraîné sur 112x128x80).",
+    )
+    parser.add_argument(
+        "--vqvae-training-patch",
+        action="store_true",
+        help="Forcer la taille de patch d'entraînement VQ-VAE (112,128) "
+        "pour une comparaison équitable.",
     )
     args = parser.parse_args()
 
@@ -380,7 +437,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     data_root = Path(args.data_root)
 
-    # ── Chargement des modèles (une seule fois) ───────────────────────────────
+    # ── Chargement des modèles (une seule fois) ───────────────────────────────────
     print("📦 Chargement des modèles…")
 
     aekl = load_aekl(args.aekl_ckpt, device)
@@ -389,39 +446,99 @@ def main():
 
     vqvae_base = load_vqvae(args.vqvae_ckpt, device)
 
-    medvae_frz = load_medvae(args.medvae_model_name, device, checkpoint_path=None)
-    if medvae_frz:
-        medvae_frz.eval()
+    # --- Vérification patch size pour VQ-VAE ---
+    VQ_TRAINING_PATCH = (112, 128, 80)
+    if args.vqvae_training_patch:
+        patch_xy, patch_z = VQ_TRAINING_PATCH[0], VQ_TRAINING_PATCH[2]
+        print(f"⚠ VQ-VAE patch override → ({patch_xy}, {patch_xy}, {patch_z})")
+    else:
+        patch_xy, patch_z = args.patch_xy, args.patch_z
+        if vqvae_base is not None:
+            if (patch_xy, patch_z) != (VQ_TRAINING_PATCH[0], VQ_TRAINING_PATCH[2]):
+                print(
+                    f"⚠ VQ-VAE patch mismatch: evaluation ({patch_xy},{patch_z}) vs training {VQ_TRAINING_PATCH}"
+                )
+                print(
+                    f"   → Ajouter --vqvae-training-patch pour une comparaison équitable"
+                )
 
+    # MedVAE 4×1 frozen (poids HuggingFace)
+    medvae_4x1 = load_medvae("medvae_4_1_3d", device, checkpoint_path=None)
+    if medvae_4x1:
+        medvae_4x1.eval()
+
+    # MedVAE 4×1 fine-tuné
     ckpt_ft = Path(args.medvae_finetuned_ckpt)
-    medvae_ft = load_medvae(
-        args.medvae_model_name,
+    medvae_4x1_ft = load_medvae(
+        "medvae_4_1_3d",
         device,
         checkpoint_path=ckpt_ft if ckpt_ft.exists() else None,
     )
-    if medvae_ft:
-        medvae_ft.eval()
+    if medvae_4x1_ft:
+        medvae_4x1_ft.eval()
+
+    # MedVAE 8×1 frozen (poids HuggingFace — compression 8× par dim, 512× total)
+    medvae_8x1 = load_medvae("medvae_8_1_3d", device, checkpoint_path=None)
+    if medvae_8x1:
+        medvae_8x1.eval()
 
     loaded = [
         n
         for n, m in [
             ("AEKL", aekl),
             ("VQ-VAE", vqvae_base),
-            ("MedVAE frozen", medvae_frz),
-            ("MedVAE ft", medvae_ft),
+            ("MedVAE 4×1", medvae_4x1),
+            ("MedVAE 4×1 ft", medvae_4x1_ft),
+            ("MedVAE 8×1", medvae_8x1),
         ]
         if m is not None
     ]
     print(f"✓ Modèles chargés : {loaded}\n")
 
-    # ── Boucle sur les modalités ──────────────────────────────────────────────
+    # ── Boucle sur les modalités ──────────────────────────────────────────────────
+    BAR = "\u2550" * 60  # ═════════════════════════════════════════════════════
     for modality in MODALITIES:
-        print(f"\n{'═' * 60}")
+        print(f"\n{BAR}")
         print(f"  Modalité : {modality}")
-        print(f"{'═' * 60}")
+        print(f"{BAR}")
 
         slices_dict: dict = {}
         ssim_dict: dict = {}
+
+        # ── Étape 1 : calculer z_best depuis le champ de référence (3T) ─────────
+        # Pour les données prospectives recalées, tous les volumes ont le même
+        # espace ; on utilise z_best du volume 3T pour assurer la même coupe
+        # anatomique dans toutes les colonnes (résoudre le bug 7T z_best=197).
+        ref_path = (
+            (
+                data_root
+                / args.split
+                / modality
+                / REF_FIELD
+                / sorted(
+                    (data_root / args.split / modality / REF_FIELD).glob("*.nii.gz")
+                )[args.subject_idx % 3]
+            )
+            if (data_root / args.split / modality / REF_FIELD).exists()
+            else None
+        )
+
+        z_best_ref = -1  # défaut : calculé par volume
+        x0_ref = y0_ref = -1
+
+        if ref_path and ref_path.exists():
+            import nibabel as _nib
+
+            _img = _nib.load(str(ref_path))
+            _vol = _img.get_fdata(dtype=np.float32)
+            _H, _W, _ = _vol.shape
+            _x0 = min(max((_H - patch_xy) // 2, 0), max(_H - patch_xy, 0))
+            _y0 = min(max((_W - patch_xy) // 2, 0), max(_W - patch_xy, 0))
+            z_best_ref = _find_z_best(_vol, _x0, _y0, patch_xy)
+            x0_ref, y0_ref = _x0, _y0
+            print(
+                f"  Coupe de référence ({REF_FIELD}) : z_best={z_best_ref}  x0={x0_ref} y0={y0_ref}"
+            )
 
         # Récupère l'ID du premier sujet pour le titre
         sample_dir = data_root / args.split / modality / FIELDS[0]
@@ -429,9 +546,9 @@ def main():
         subject_id = ""
         if sample_files:
             fname = sample_files[args.subject_idx % len(sample_files)].stem
-            # Ex : P_T1W_0.1T_0006 → subject ID = 0006
             subject_id = fname.split("_")[-1]
 
+        # ── Étape 2 : traiter chaque champ ──────────────────────────────────────
         for field in FIELDS:
             print(f"\n  ── {field} ──")
 
@@ -447,70 +564,59 @@ def main():
             path = files[args.subject_idx % len(files)]
             print(f"    Fichier : {path.name}")
 
-            # Extraction du patch
-            patch, z_loc = load_and_patch(path, args.patch_xy, args.patch_z)
-            orig_axial = patch[:, :, z_loc]
+            # Extraction du patch (z_best_ref fixé depuis la référence 3T)
+            patch_model, patch_display, z_best, x0, y0 = load_and_patch(
+                path, patch_xy, patch_z, z_best_ref=z_best_ref
+            )
+            z_loc = z_best - max(0, z_best - patch_z // 2)
+            # z_loc dans le patch = z_best_ref - z0, clamped dans [0, patch_z-1]
+            z_loc = int(np.clip(z_loc, 0, patch_z - 1))
+            orig_axial = patch_display[:, :, z_loc]
             slices_dict[("Original", field)] = orig_axial
-            print(f"    Patch   : {patch.shape}  z_loc={z_loc}")
+            print(f"    Patch   : {patch_model.shape}  z_best={z_best}  z_loc={z_loc}")
 
-            # ── AEKL ─────────────────────────────────────────────────────
-            if modality == "T1W" and aekl is not None:
+            def _run(model, key, patch_m=patch_model):
                 try:
-                    rec = reconstruct(aekl, patch, device)
+                    rec = reconstruct(model, patch_m, device)
                     sl = rec[:, :, z_loc]
-                    slices_dict[("AEKL", field)] = sl
-                    ssim_dict[("AEKL", field)] = _ssim_2d(orig_axial, sl)
-                    print(f"    AEKL        SSIM={ssim_dict[('AEKL', field)]:.4f}")
+                    slices_dict[(key, field)] = sl
+                    ssim_dict[(key, field)] = _ssim_2d(orig_axial, sl)
+                    print(f"    {key:16s} SSIM={ssim_dict[(key, field)]:.4f}")
                 except Exception as e:
-                    print(f"    AEKL error : {e}")
-                    slices_dict[("AEKL", field)] = None
-            else:
-                slices_dict[("AEKL", field)] = None  # N/A pour T2W / T2FLAIR
+                    print(f"    {key} error : {e}")
+                    import traceback
 
-            # ── VQ-VAE ───────────────────────────────────────────────────
+                    traceback.print_exc()
+                    slices_dict[(key, field)] = None
+
+            # AEKL — T1W uniquement
+            if modality == "T1W" and aekl is not None:
+                _run(aekl, "AEKL")
+            else:
+                slices_dict[("AEKL", field)] = None
+
+            # VQ-VAE
             if vqvae_base is not None:
                 mod_idx = MODALITIES_IDX.get(modality, 0)
                 field_idx = FIELDS_IDX.get(field, 0)
                 vqvae = VQVAECompatWrapper(
                     vqvae_base, mod_idx=mod_idx, field_idx=field_idx
                 ).to(device)
-                try:
-                    rec = reconstruct(vqvae, patch, device)
-                    sl = rec[:, :, z_loc]
-                    slices_dict[("VQ-VAE", field)] = sl
-                    ssim_dict[("VQ-VAE", field)] = _ssim_2d(orig_axial, sl)
-                    print(f"    VQ-VAE      SSIM={ssim_dict[('VQ-VAE', field)]:.4f}")
-                except Exception as e:
-                    print(f"    VQ-VAE error : {e}")
-                    slices_dict[("VQ-VAE", field)] = None
+                _run(vqvae, "VQ-VAE")
 
-            # ── MedVAE frozen ─────────────────────────────────────────────
-            if medvae_frz is not None:
-                try:
-                    rec = reconstruct(medvae_frz, patch, device)
-                    sl = rec[:, :, z_loc]
-                    slices_dict[("MedVAE frozen", field)] = sl
-                    ssim_dict[("MedVAE frozen", field)] = _ssim_2d(orig_axial, sl)
-                    print(
-                        f"    MedVAE frz  SSIM={ssim_dict[('MedVAE frozen', field)]:.4f}"
-                    )
-                except Exception as e:
-                    print(f"    MedVAE frozen error : {e}")
-                    slices_dict[("MedVAE frozen", field)] = None
+            # MedVAE 4×1 frozen
+            if medvae_4x1 is not None:
+                _run(medvae_4x1, "MedVAE 4×1")
 
-            # ── MedVAE ft ────────────────────────────────────────────────
-            if medvae_ft is not None:
-                try:
-                    rec = reconstruct(medvae_ft, patch, device)
-                    sl = rec[:, :, z_loc]
-                    slices_dict[("MedVAE ft", field)] = sl
-                    ssim_dict[("MedVAE ft", field)] = _ssim_2d(orig_axial, sl)
-                    print(f"    MedVAE ft   SSIM={ssim_dict[('MedVAE ft', field)]:.4f}")
-                except Exception as e:
-                    print(f"    MedVAE ft error : {e}")
-                    slices_dict[("MedVAE ft", field)] = None
+            # MedVAE 4×1 fine-tuné
+            if medvae_4x1_ft is not None:
+                _run(medvae_4x1_ft, "MedVAE 4×1 ft")
 
-        # ── Génération et sauvegarde de la figure ─────────────────────────
+            # MedVAE 8×1 frozen
+            if medvae_8x1 is not None:
+                _run(medvae_8x1, "MedVAE 8×1")
+
+        # ── Génération et sauvegarde de la figure ─────────────────────────────
         print(f"\n  Génération de la figure…")
         fig = make_figure(modality, slices_dict, ssim_dict, subject_id=subject_id)
 
