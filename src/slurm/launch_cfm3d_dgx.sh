@@ -14,8 +14,9 @@
 # Exemples :
 #   bash src/launch_cfm3d_dgx.sh vae T1W          # auto-détection GPUs
 #   bash src/launch_cfm3d_dgx.sh vae T1W 1        # single-GPU, débug rapide
-#   bash src/launch_cfm3d_dgx.sh cfm T1W 4        # 4 GPUs, entraînement complet
-#   bash src/launch_cfm3d_dgx.sh cfm T1W 4 configs/cfm3d_latent_T1W_debug.yaml
+#   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4                                            # medvae finetuned (défaut)
+#   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4 configs/cfm3d_T1W_medvae_0p1T_7T.yaml     # bidomaine 0.1T↔7T
+#   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4 configs/cfm3d_T1W_medvae_finetuned.yaml   # 5 domaines (défaut)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -41,7 +42,7 @@ if [[ "$PHASE" == "vae" ]]; then
     CONFIG="${CONFIG_OVERRIDE:-configs/vae3d_T1W.yaml}"
     SCRIPT="src/vae3d/train_vae_3d.py"
 elif [[ "$PHASE" == "cfm" ]]; then
-    CONFIG="${CONFIG_OVERRIDE:-configs/cfm3d_T1W_aekl.yaml}"
+    CONFIG="${CONFIG_OVERRIDE:-configs/cfm3d_T1W_medvae_finetuned.yaml}"
     SCRIPT="src/cfm/train_cfm_3d.py"
 else
     echo "ERREUR : PHASE doit être 'vae' ou 'cfm' (reçu : '$PHASE')" >&2
@@ -57,6 +58,9 @@ if [[ -z "$N_GPUS" ]]; then
     fi
 fi
 echo "Lancement : PHASE=$PHASE | MODALITY=$MODALITY | N_GPUS=$N_GPUS | CONFIG=$CONFIG"
+if [[ "$N_GPUS" -gt 1 ]]; then
+    echo "  Multi-GPU DDP : batch effectif = $((2 * N_GPUS)) (batch_size=2/GPU × $N_GPUS GPUs)"
+fi
 
 # ── Résolution du dernier checkpoint (resume automatique) ───────────────────
 OUTPUT_ROOT=$($PYTHON -c "

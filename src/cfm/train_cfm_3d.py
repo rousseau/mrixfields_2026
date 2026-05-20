@@ -108,6 +108,32 @@ def _resample_volume(
     return scipy_zoom(vol, factors, order=1).astype(np.float32)
 
 
+def _center_crop_or_pad_np(
+    vol: np.ndarray, volume_size: Tuple[int, int, int]
+) -> np.ndarray:
+    """Centre-crop ou pad un volume 3D NumPy vers volume_size (H, W, D)."""
+    th, tw, td = volume_size
+    h, w, d = vol.shape
+
+    # Pad si le volume est trop petit
+    ph = max(0, th - h)
+    pw = max(0, tw - w)
+    pd = max(0, td - d)
+    if ph > 0 or pw > 0 or pd > 0:
+        vol = np.pad(
+            vol,
+            [(ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (pd // 2, pd - pd // 2)],
+            mode="reflect",
+        )
+        h, w, d = vol.shape
+
+    # Crop centré
+    sh = max((h - th) // 2, 0)
+    sw = max((w - tw) // 2, 0)
+    sd = max((d - td) // 2, 0)
+    return vol[sh : sh + th, sw : sw + tw, sd : sd + td]
+
+
 _SPLIT_ABBR_TO_DIR = {
     "retro_train": "Training_retrospective",
     "pro_train": "Training_prospective",
@@ -346,8 +372,11 @@ class MedVAEWrapper(VAEWrapper):
         self.latent_channels: int = latent_ch
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode x → z (déterministe : prend la mean si MVAE retourne (mean, logvar)).
+        Le modèle doit être en .eval() — garanti par load_vae()."""
         z = self.model.encode(x)
-        # MedVAE peut retourner un tuple ou un tenseur
+        # MVAE peut retourner (mean, logvar) ou directement z.
+        # On prend z[0] = mean pour garantir l'encodage déterministe.
         if isinstance(z, (tuple, list)):
             z = z[0]
         return z
@@ -572,12 +601,6 @@ def _load_medvae(cfg: dict, device: torch.device, source: str) -> MedVAEWrapper:
         from medvae import MVAE
     except ImportError:
         raise ImportError("medvae non installé. Installez avec : pip install medvae")
-    # latent_channels déduits depuis le nom du modèle (format: medvae_<C>_<...>)
-    try:
-        latent_ch = int(model_name.split("_")[1])
-    except Exception:
-        latent_ch = 4
-
     model = MVAE(model_name=model_name, modality="mri")
 
     if source == "local":
@@ -590,6 +613,27 @@ def _load_medvae(cfg: dict, device: torch.device, source: str) -> MedVAEWrapper:
             print(f"  [WARN] MedVAE checkpoint introuvable : '{ckpt_path}'.")
     else:
         print(f"  MedVAE frozen chargé depuis HuggingFace ({model_name}).")
+
+    # ── Déduire latent_channels via forward pass dummy ─────────────────────────
+    # Le nom 'medvae_4_1_3d' signifie : 4× compression spatiale, 1 canal latent.
+    # split("_")[1] = "4" (facteur spatial), split("_")[2] = "1" (canaux latents).
+    # On préfère un forward pass pour être robuste à tout format de nom.
+    try:
+        model.eval()
+        with torch.no_grad():
+            _dummy = torch.zeros(1, 1, 32, 32, 32)
+            _z = model.encode(_dummy)
+            if isinstance(_z, (tuple, list)):
+                _z = _z[0]
+            latent_ch = int(_z.shape[1])
+        print(f"  MedVAE latent_channels={latent_ch} (déduit via forward pass dummy)")
+    except Exception:
+        # Fallback : parser le nom (format: medvae_<spatial>_<channels>_3d)
+        try:
+            latent_ch = int(model_name.split("_")[2])
+        except Exception:
+            latent_ch = 1  # valeur par défaut pour medvae_4_1_3d
+        print(f"  MedVAE latent_channels={latent_ch} (déduit depuis le nom)")
 
     return MedVAEWrapper(model, latent_ch)
 
@@ -1055,11 +1099,18 @@ def infer(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = cfg["train"].get("use_amp", False)
     amp_dtype = torch.float16 if use_amp else torch.float32
-    latent_channels = cfg["model"]["latent_channels"]
+    latent_channels = cfg["model"].get(
+        "latent_channels", None
+    )  # sera recalculé depuis le VAE
     n_steps = n_steps or cfg["inference"].get("n_steps", 50)
     tgt_idx = DOMAIN_TO_IDX[target_domain]
     p_lo = cfg["data"].get("percentile_lower", 0.5)
     p_hi = cfg["data"].get("percentile_upper", 99.5)
+
+    raw_vs = cfg["data"].get("volume_size", None)
+    volume_size_inf = tuple(int(v) for v in raw_vs) if raw_vs else None
+    raw_ts = cfg["data"].get("target_spacing", None)
+    target_spacing_inf = tuple(float(v) for v in raw_ts) if raw_ts else None
 
     print(f"Inférence CFM 3D : {source_domain} → {target_domain} | {n_steps} steps")
 
@@ -1086,15 +1137,43 @@ def infer(
     for nii_path in input_files:
         t_start = time.time()
         img_nib = nib.load(str(nii_path))
+        orig_spacing = np.abs(np.diag(img_nib.affine)[:3])
         vol = img_nib.get_fdata(dtype=np.float32)
 
-        # Normalisation per-volume
+        # ── Rééchantillonnage (même preprocessing qu'à l'entraînement) ─────────
+        if target_spacing_inf is not None:
+            vol = _resample_volume(vol, orig_spacing, target_spacing_inf)
+
+        # ── Normalisation percentile → [-1, 1] ───────────────────────────────
         lo = np.percentile(vol, p_lo)
         hi = np.percentile(vol, p_hi)
         vol_norm = np.clip((vol - lo) / max(hi - lo, 1e-8), 0.0, 1.0) * 2.0 - 1.0
+
+        # ── Center crop / pad vers volume_size ────────────────────────────────
+        if volume_size_inf is not None:
+            vol_norm = _center_crop_or_pad_np(vol_norm, volume_size_inf)
+
         vol_tensor = (
             torch.from_numpy(vol_norm).unsqueeze(0).unsqueeze(0).to(device)
-        )  # (1,1,H,W,D)
+        )  # (1, 1, H, W, D)
+
+        # ── Affine ajusté (espace rééchantillonné + croppé) ──────────────────
+        # Utilisé pour la sauvegarde NIfTI du volume prédit
+        out_affine = img_nib.affine.copy().astype(float)
+        if target_spacing_inf is not None:
+            for i in range(3):
+                scale_i = target_spacing_inf[i] / max(float(orig_spacing[i]), 1e-8)
+                out_affine[:3, i] *= scale_i
+            resampled_shape = np.array(vol.shape[:3])
+        else:
+            resampled_shape = np.array(img_nib.shape[:3])
+
+        if volume_size_inf is not None:
+            th, tw, td = volume_size_inf
+            sh_off = int(max((resampled_shape[0] - th) // 2, 0))
+            sw_off = int(max((resampled_shape[1] - tw) // 2, 0))
+            sd_off = int(max((resampled_shape[2] - td) // 2, 0))
+            out_affine[:3, 3] += out_affine[:3, :3] @ np.array([sh_off, sw_off, sd_off])
 
         # Encode
         with (
@@ -1119,8 +1198,8 @@ def infer(
         # Dénormalisation vers [0, 1] (espace de données d'origine)
         pred_vol = (np.clip(pred_vol, -1.0, 1.0) + 1.0) / 2.0
 
-        # Sauvegarde avec le même espace/affine que l'entrée
-        out_nii = nib.Nifti1Image(pred_vol, img_nib.affine, img_nib.header)
+        # Sauvegarde dans l'espace d'inférence (rééchantillonné + croppé)
+        out_nii = nib.Nifti1Image(pred_vol, out_affine)
         out_path = out_dir / nii_path.name
         nib.save(out_nii, str(out_path))
 

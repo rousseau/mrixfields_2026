@@ -1,0 +1,86 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# OT-CFM 3D — MedVAE fine-tuné + 5 domaines T1W (any-to-any)
+#
+# VAE       : medvae_4_1_3d fine-tuné sur MRIxFields (20k steps, toutes modalities)
+#             '4_1_3d' = 4× compression spatiale, 1 canal latent
+# Latent    : (B, 1, 32, 32, 20) pour volumes (1, 1, 128, 128, 80)
+# UNet      : DiffusionModelUNet 3D — [128,256,512] canaux — ~178M params
+#             in=2 (cat z_t+z_src), out=1, class_embeds=5 (NUM_DOMAINS)
+# Domaines  : 0.1T / 1.5T / 3T / 5T / 7T (20 paires dirigées)
+# Données   : 703 volumes T1W rétrospectifs
+# Matériel  : 1× GB10 (local) ou 4× H100 SXM5 (Jean Zay, torchrun DDP)
+#
+# Lancement :
+#   # Local single-GPU
+#   python src/cfm/train_cfm_3d.py --config configs/cfm3d_T1W_medvae_finetuned.yaml --env local
+#   # Jean Zay 4×H100
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae_finetuned.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: cfm3d
+task_name: cfm3d_T1W_medvae_finetuned
+
+# ─── VAE : MedVAE fine-tuné sur MRIxFields ────────────────────────────────────
+vae:
+  vae_type: medvae
+  source: local # local = checkpoint fine-tuné (vs frozen = HuggingFace)
+  model_name: medvae_4_1_3d # 4× compression spatiale, 1 canal latent → latent (B,1,32,32,20)
+  checkpoint: "outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth"
+  # Référence : SSIM reconstruction @0.1T=0.846, @7T=0.839 (benchmark_comparison CSV)
+
+# ─── UNet 3D pour le flow matching ────────────────────────────────────────────
+# in_channels  = 2 × latent_channels = 8  (cat z_t + z_src)
+# out_channels = latent_channels     = 4  (champ de vitesse)
+# Déduit automatiquement depuis vae.latent_channels — ne pas spécifier ici.
+model:
+  spatial_dims: 3
+  model_channels: 128 # canaux de base → [128, 256, 512]
+  num_res_blocks: 2
+  channel_mult: [1, 2, 4]
+  attention_levels: [false, true, true] # attention aux 2 niveaux les plus profonds
+  num_head_channels: 64
+  use_gradient_checkpointing: true # économise ~30% de VRAM (recommandé)
+  use_flash_attention: false # désactivé (compatibilité MONAI)
+  norm_num_groups: 32
+
+# ─── Données ──────────────────────────────────────────────────────────────────
+data:
+  modality: T1W
+  split: retro_train # Training_retrospective (703 volumes T1W)
+  output_subdir: cfm3d/runs/cfm3d_T1W_medvae_finetuned
+
+  # 5 domaines → 20 paires dirigées — couverture complète Task 3 (any-to-any)
+  domains:
+    - 0.1T # 100 volumes
+    - 1.5T # 104 volumes
+    - 3T # 143 volumes
+    - 5T # 121 volumes
+    - 7T # 235 volumes
+
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  target_spacing: [1.0, 1.0, 1.0] # Rééchantillonnage isotrope 1mm
+  # (364,436,364)@0.5mm → (182,218,182)@1mm → crop[27:155,45:173,51:131] → (128,128,80)
+  volume_size: [128, 128, 80] # Latent MedVAE : (1,32,32,20) — divisible par 4
+  max_volumes_per_domain: null # Utilise tous les volumes disponibles
+
+# ─── Entraînement ─────────────────────────────────────────────────────────────
+train:
+  batch_size: 2 # Par GPU — batch effectif = 8 avec 4×H100 DDP
+  num_workers: 4 # Par GPU local (16 sur Jean Zay H100 : ajuster via CLI)
+  total_iters: 150000 # ≈ 2.4M paires vues (150k × batch_eff 8 × DDP 4) — ~10% des pas sur 0.1T↔7T
+  lr: 1.0e-4
+  sigma: 0.0 # OT-CFM sans bruit (déterministe optimal)
+  ot_method: exact # ExactOT — optimal pour paires (0.1T,7T) très dissimilaires
+  save_every: 5000 # 30 checkpoints au total
+  print_every: 200
+  use_amp: true # float16 AMP (GB10 / H100 supportés)
+  grad_clip: 1.0
+  ema_decay: 0.9999 # EMA pour la qualité finale des poids
+
+# ─── Inférence ────────────────────────────────────────────────────────────────
+inference:
+  n_steps: 50 # Steps Euler pour l'intégration ODE
+  ode_solver: euler # euler (rapide) | dopri5 (plus précis, plus lent)
+  source_domain: 0.1T # Domaine source par défaut pour l'inférence
+  target_domain: 7T # Domaine cible par défaut (Task 2 : low-field enhancement)

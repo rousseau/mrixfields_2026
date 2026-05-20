@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# OT-CFM 3D — MedVAE fine-tuné + 2 domaines T1W (0.1T ↔ 7T uniquement)
+#
+# Variante bidomaine : entraîné exclusivement sur les paires (0.1T, 7T).
+# Données   : 100 vols 0.1T + 235 vols 7T = 335 volumes
+# Objectif  : comparer avec la config 5-domaines (cfm3d_T1W_medvae_finetuned)
+#             → plus focalisé, mais moins de diversité / régularisation
+# Task      : Task 2 (low-field enhancement 0.1T→7T)
+#
+# Lancement :
+#   python src/cfm/train_cfm_3d.py --config configs/cfm3d_T1W_medvae_0p1T_7T.yaml --env local
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae_0p1T_7T.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: cfm3d
+task_name: cfm3d_T1W_medvae_0p1T_7T
+
+# ─── VAE : MedVAE fine-tuné sur MRIxFields ────────────────────────────────────
+vae:
+  vae_type: medvae
+  source: local
+  model_name: medvae_4_1_3d # 4× compression spatiale, 1 canal latent → latent (B,1,32,32,20)
+  checkpoint: "outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth"
+
+# ─── UNet 3D (identique à la config 5-domaines) ───────────────────────────────
+# in_channels=2 (cat z_t+z_src), out_channels=1, class_embeds=5 (NUM_DOMAINS)
+model:
+  spatial_dims: 3
+  model_channels: 128
+  num_res_blocks: 2
+  channel_mult: [1, 2, 4]
+  attention_levels: [false, true, true]
+  num_head_channels: 64
+  use_gradient_checkpointing: true
+  use_flash_attention: false
+  norm_num_groups: 32
+
+# ─── Données ──────────────────────────────────────────────────────────────────
+data:
+  modality: T1W
+  split: retro_train
+  output_subdir: cfm3d/runs/cfm3d_T1W_medvae_0p1T_7T
+
+  # 2 domaines uniquement → paires exclusivement (0.1T↔7T)
+  # 0.1T : 100 volumes | 7T : 235 volumes | total : 335 volumes
+  # Prob. tirée de la paire 0.1T→7T : 50% (vs ~10% avec 5 domaines)
+  domains:
+    - 0.1T
+    - 7T
+
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  target_spacing: [1.0, 1.0, 1.0]
+  volume_size: [128, 128, 80]
+  max_volumes_per_domain: null
+
+# ─── Entraînement ─────────────────────────────────────────────────────────────
+train:
+  batch_size: 2
+  num_workers: 4
+  total_iters: 100000 # Réduit : moins de diversité → convergence plus rapide
+  lr: 1.0e-4
+  sigma: 0.0
+  ot_method: exact
+  save_every: 5000
+  print_every: 200
+  use_amp: true
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+# ─── Inférence ────────────────────────────────────────────────────────────────
+inference:
+  n_steps: 50
+  ode_solver: euler
+  source_domain: 0.1T
+  target_domain: 7T

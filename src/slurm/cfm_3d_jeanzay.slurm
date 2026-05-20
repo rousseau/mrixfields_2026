@@ -10,8 +10,9 @@
 #   sbatch src/slurm/cfm_3d_jeanzay.slurm vae T1W
 #
 #   # Phase 3 — OT-CFM 3D en espace latent
-#   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W
-#   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_latent_T1W_custom.yaml
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae_finetuned.yaml
+#   # Variante bidomaine 0.1T↔7T uniquement :
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae_0p1T_7T.yaml
 #
 # Prérequis (via setup_jeanzay.sh) :
 #   $WORK/MRIX/mrixfields_2026/   ← ce repo
@@ -146,7 +147,7 @@ elif [ "$PHASE" = "cfm" ]; then
     if [ -n "$CONFIG_ARG" ]; then
         CONFIG="$CONFIG_ARG"
     else
-        CONFIG="configs/cfm3d_T1W_aekl.yaml"
+        CONFIG="configs/cfm3d_T1W_medvae_finetuned.yaml"
     fi
 else
     echo "[ERREUR] Phase inconnue : '$PHASE'. Utiliser 'vae' ou 'cfm'."
@@ -188,6 +189,10 @@ fi
 
 echo "Output dir     : $WEIGHTS_DIR"
 echo "Env            : jeanzay"
+echo "Config CFM     : $CONFIG"
+
+# Optimisation DataLoader : 16 workers/GPU × 4 GPUs = 64 CPUs utilisés
+export DATALOADER_NUM_WORKERS=16
 
 # ─── Lancement multi-GPU (torchrun DDP 4×H100) ───────────────────────────────
 echo "======================================================================="

@@ -4,3 +4,30 @@ AEKL + OT-CFM 3D,T1W,any,any,,,,,,vae3d_T1W/model_best.pth + cfm3d_T1W/model_fin
 VQ-VAE + OT-CFM 3D,T1W,any,any,,,,,,—,à lancer
 MedVAE (frozen) + CFM,T1W,any,any,,,,,,—,poids HuggingFace
 MedVAE (fine-tuné) + CFM,T1W,any,any,,,,,,—,fine-tuning à lancer
+# --- Benchmark reconstruction VAE (encode-decode) — 2026-05-19 --- 1 vol/champ
+AEKL (recon),T1W,0.1T,0.1T,,0.6836,,,,vae3d_T1W_jeanzay/weights/model_final.pth,MAE=0.4059 MSE=0.2799 t=31.9s/vol 3.0GB
+AEKL (recon),T1W,1.5T,1.5T,,0.7064,,,,vae3d_T1W_jeanzay/weights/model_final.pth,MAE=0.3770 MSE=0.2556 t=36.2s/vol 3.0GB
+AEKL (recon),T1W,3T,3T,,0.6544,,,,vae3d_T1W_jeanzay/weights/model_final.pth,MAE=0.3886 MSE=0.2718 t=31.9s/vol 3.0GB
+AEKL (recon),T1W,5T,5T,,0.7021,,,,vae3d_T1W_jeanzay/weights/model_final.pth,MAE=0.3698 MSE=0.2419 t=31.9s/vol 3.0GB
+AEKL (recon),T1W,7T,7T,,0.6843,,,,vae3d_T1W_jeanzay/weights/model_final.pth,MAE=0.3794 MSE=0.2586 t=31.9s/vol 3.0GB
+VQ-VAE (recon),T1W,0.1T,0.1T,,0.7436,,,,vqvae_final/weights/model_best.pth,MAE=0.3700 MSE=0.2247 t=4.9s/vol 1.4GB
+VQ-VAE (recon),T1W,1.5T,1.5T,,0.7140,,,,vqvae_final/weights/model_best.pth,MAE=0.3873 MSE=0.2343 t=5.5s/vol 1.4GB
+VQ-VAE (recon),T1W,3T,3T,,0.7007,,,,vqvae_final/weights/model_best.pth,MAE=0.3602 MSE=0.2208 t=4.9s/vol 1.4GB
+VQ-VAE (recon),T1W,5T,5T,,0.6873,,,,vqvae_final/weights/model_best.pth,MAE=0.4074 MSE=0.2405 t=4.9s/vol 1.4GB
+VQ-VAE (recon),T1W,7T,7T,,0.7176,,,,vqvae_final/weights/model_best.pth,MAE=0.3456 MSE=0.2107 t=4.9s/vol 1.4GB
+VQ-VAE (recon),T2W,3T,3T,,0.5410,,,,vqvae_final/weights/model_best.pth,MAE=0.5351 MSE=0.4093 t=6.1s/vol 1.4GB
+VQ-VAE (recon),T2FLAIR,3T,3T,,0.7025,,,,vqvae_final/weights/model_best.pth,MAE=0.3838 MSE=0.2310 t=5.8s/vol 1.4GB
+MedVAE frozen (recon),T1W,0.1T,0.1T,,0.8450,,,,HuggingFace medvae_4_1_3d,MAE=0.1561 MSE=0.1493 t=137.6s/vol 6.9GB
+MedVAE frozen (recon),T1W,1.5T,1.5T,,0.8395,,,,HuggingFace medvae_4_1_3d,MAE=0.1605 MSE=0.1498 t=124.4s/vol 6.9GB
+MedVAE frozen (recon),T1W,3T,3T,,0.8340,,,,HuggingFace medvae_4_1_3d,MAE=0.1625 MSE=0.1502 t=124.7s/vol 6.9GB
+MedVAE frozen (recon),T1W,5T,5T,,0.8180,,,,HuggingFace medvae_4_1_3d,MAE=0.1703 MSE=0.1522 t=124.1s/vol 6.9GB
+MedVAE frozen (recon),T1W,7T,7T,,0.8352,,,,HuggingFace medvae_4_1_3d,MAE=0.1618 MSE=0.1502 t=126.3s/vol 6.9GB
+MedVAE frozen (recon),T2W,3T,3T,,0.8233,,,,HuggingFace medvae_4_1_3d,MAE=0.1674 MSE=0.1515 t=129.6s/vol 6.9GB
+MedVAE frozen (recon),T2FLAIR,3T,3T,,0.8361,,,,HuggingFace medvae_4_1_3d,MAE=0.1620 MSE=0.1501 t=120.8s/vol 6.9GB
+MedVAE fine-tuné (recon),T1W,0.1T,0.1T,,0.8461,,,,medvae_finetune_all/weights/model_final.pth,MAE=0.1524 MSE=0.1491 t=138.6s/vol 6.9GB
+MedVAE fine-tuné (recon),T1W,1.5T,1.5T,,0.8424,,,,medvae_finetune_all/weights/model_final.pth,MAE=0.1559 MSE=0.1494 t=124.1s/vol 6.9GB
+MedVAE fine-tuné (recon),T1W,3T,3T,,0.8373,,,,medvae_finetune_all/weights/model_final.pth,MAE=0.1589 MSE=0.1498 t=125.4s/vol 6.9GB
+MedVAE fine-tuné (recon),T1W,5T,5T,,0.8258,,,,medvae_finetune_all/weights/model_final.pth,MAE=0.1646 MSE=0.1511 t=124.8s/vol 6.9GB
+MedVAE fine-tuné (recon),T1W,7T,7T,,0.8386,,,,medvae_finetune_all/weights/model_final.pth,MAE=0.1578 MSE=0.1498 t=129.7s/vol 6.9GB
+MedVAE fine-tuné (recon),T2W,3T,3T,,0.8281,,,,medvae_finetune_all/weights/model_final.pth,MAE=0.1635 MSE=0.1509 t=128.6s/vol 6.9GB
+MedVAE fine-tuné (recon),T2FLAIR,3T,3T,,0.8392,,,,medvae_finetune_all/weights/model_final.pth,MAE=0.1584 MSE=0.1498 t=119.3s/vol 6.9GB
