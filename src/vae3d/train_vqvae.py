@@ -7,6 +7,12 @@ Objectif:
 - Ajouter un entraînement hybride pour exploiter:
   1) données unpaired: reconstruction intra-modale
   2) données paired: reconstruction cross-modale supervisée
+- Se rapprocher au maximum de l'implémentation NeuroQuant originale (CVPR 2026)
+  * Factorized convs + Multi-axis attention
+  * Dead-code revival + k-means init
+  * MLP FiLM avec identity init
+  * Mid block entre encoder/decoder
+  * SSIM3D + foreground weighting
 
 Ce script est volontairement autonome pour tester l'approche avant intégration CFM.
 """
@@ -25,6 +31,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 from scipy.ndimage import zoom as scipy_zoom
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torch.utils.data import DataLoader, Dataset
@@ -221,7 +228,265 @@ def grad_reverse(x: torch.Tensor, lambd: float) -> torch.Tensor:
     return GradReverse.apply(x, lambd)
 
 
+# ──── NeuroQuant-style blocks ──────────────────────────────────────
+
+
+class Normalize(nn.Module):
+    """GroupNorm with num_groups=32 (or min(32, channels))."""
+
+    def __init__(self, channels: int, num_groups: int = 32):
+        super().__init__()
+        self.norm = nn.GroupNorm(
+            num_groups=min(num_groups, channels),
+            num_channels=channels,
+            eps=1e-6,
+            affine=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x)
+
+
+class FactoredConv3d(nn.Module):
+    """Spatial (H,W) conv + Depth (D) conv, factorized.
+
+    In 2D mode (depth_mode="2d"), the depth conv is skipped, so the model
+    can process single slices (D=1) without artifacts.
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        spatial_kernel: int = 3,
+        depth_kernel: int = 3,
+        stride: int = 1,
+        depth_stride: int = 1,
+    ):
+        super().__init__()
+        sp = spatial_kernel // 2
+        dp = depth_kernel // 2
+
+        self.spatial_conv = nn.Conv3d(
+            in_ch,
+            out_ch,
+            kernel_size=(1, spatial_kernel, spatial_kernel),
+            stride=(1, stride, stride),
+            padding=(0, sp, sp),
+        )
+        self.depth_conv = nn.Conv3d(
+            out_ch,
+            out_ch,
+            kernel_size=(depth_kernel, 1, 1),
+            stride=(depth_stride, 1, 1),
+            padding=(dp, 1, 1) if depth_stride > 1 else (dp, 0, 0),
+        )
+        # Initialize depth conv as identity-like for smooth 2D->3D transition
+        nn.init.dirac_(self.depth_conv.weight)
+        if self.depth_conv.bias is not None:
+            nn.init.zeros_(self.depth_conv.bias)
+
+    def forward(self, x: torch.Tensor, depth_mode: str = "3d") -> torch.Tensor:
+        x = self.spatial_conv(x)
+        if depth_mode == "3d":
+            x = self.depth_conv(x)
+        return x
+
+
+class FactoredResBlock(nn.Module):
+    """ResBlock built on factored spatial + depth convolutions."""
+
+    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = Normalize(in_ch)
+        self.conv1 = FactoredConv3d(in_ch, out_ch)
+        self.norm2 = Normalize(out_ch)
+        self.conv2 = FactoredConv3d(out_ch, out_ch)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.skip = nn.Conv3d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x: torch.Tensor, depth_mode: str = "3d") -> torch.Tensor:
+        h = self.conv1(F.silu(self.norm1(x)), depth_mode)
+        h = self.conv2(self.dropout(F.silu(self.norm2(h))), depth_mode)
+        return h + self.skip(x)
+
+
+class AxisAttention(nn.Module):
+    """Self-attention along a single axis."""
+
+    def __init__(self, channels: int, num_heads: int = 8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.norm = Normalize(channels)
+        self.qkv = nn.Linear(channels, 3 * channels)
+        self.proj = nn.Linear(channels, channels)
+
+    def forward(self, x: torch.Tensor, axis: str = "d") -> torch.Tensor:
+        B, C, D, H, W = x.shape
+        h = self.norm(x)
+
+        if axis == "d":
+            h = rearrange(h, "b c d h w -> (b h w) d c")
+        elif axis == "h":
+            h = rearrange(h, "b c d h w -> (b d w) h c")
+        elif axis == "w":
+            h = rearrange(h, "b c d h w -> (b d h) w c")
+
+        qkv = self.qkv(h)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        head_dim = C // self.num_heads
+        q = rearrange(q, "b s (nh hd) -> b nh s hd", nh=self.num_heads, hd=head_dim)
+        k = rearrange(k, "b s (nh hd) -> b nh s hd", nh=self.num_heads, hd=head_dim)
+        v = rearrange(v, "b s (nh hd) -> b nh s hd", nh=self.num_heads, hd=head_dim)
+
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = rearrange(out, "b nh s hd -> b s (nh hd)")
+        out = self.proj(out)
+
+        if axis == "d":
+            out = rearrange(out, "(b h w) d c -> b c d h w", b=B, h=H, w=W)
+        elif axis == "h":
+            out = rearrange(out, "(b d w) h c -> b c d h w", b=B, d=D, w=W)
+        elif axis == "w":
+            out = rearrange(out, "(b d h) w c -> b c d h w", b=B, d=D, h=H)
+
+        return x + out
+
+
+class MultiAxisAttention(nn.Module):
+    """Sequential attention along all three axes (D, H, W)."""
+
+    def __init__(self, channels: int, num_heads: int = 8):
+        super().__init__()
+        self.attn_d = AxisAttention(channels, num_heads)
+        self.attn_h = AxisAttention(channels, num_heads)
+        self.attn_w = AxisAttention(channels, num_heads)
+
+    def forward(self, x: torch.Tensor, depth_mode: str = "3d") -> torch.Tensor:
+        if depth_mode == "3d":
+            x = self.attn_d(x, axis="d")
+        x = self.attn_h(x, axis="h")
+        x = self.attn_w(x, axis="w")
+        return x
+
+
+class Downsample3D(nn.Module):
+    """Spatial 2x downsample + optional depth 2x downsample."""
+
+    def __init__(self, channels: int, downsample_depth: bool = True):
+        super().__init__()
+        self.downsample_depth = downsample_depth
+        if downsample_depth:
+            self.conv = nn.Conv3d(channels, channels, 3, stride=2, padding=1)
+        else:
+            self.conv = nn.Conv3d(
+                channels, channels, (1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)
+            )
+
+    def forward(self, x: torch.Tensor, depth_mode: str = "3d") -> torch.Tensor:
+        if depth_mode == "3d" and self.downsample_depth:
+            return self.conv(x)
+        elif not self.downsample_depth:
+            return self.conv(x)
+        else:
+            return F.interpolate(
+                x, scale_factor=(1, 0.5, 0.5), mode="trilinear", align_corners=False
+            )
+
+
+class Upsample3D(nn.Module):
+    """Spatial 2x upsample + optional depth 2x upsample."""
+
+    def __init__(self, channels: int, upsample_depth: bool = True):
+        super().__init__()
+        self.upsample_depth = upsample_depth
+        self.conv = nn.Conv3d(channels, channels, 3, padding=1)
+
+    def forward(self, x: torch.Tensor, depth_mode: str = "3d") -> torch.Tensor:
+        if depth_mode == "3d" and self.upsample_depth:
+            x = F.interpolate(x, scale_factor=2, mode="trilinear", align_corners=False)
+        else:
+            x = F.interpolate(
+                x, scale_factor=(1, 2, 2), mode="trilinear", align_corners=False
+            )
+        return self.conv(x)
+
+
+def weighted_recon_loss(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    mode: str = "l1",
+    fg_weight: float = 5.0,
+    bg_threshold: float = -0.9,
+) -> torch.Tensor:
+    """L1 / L2 reconstruction loss with brain-foreground weighting."""
+    if mode == "l1":
+        pixel_loss = (recon - target).abs()
+    elif mode == "mse":
+        pixel_loss = (recon - target) ** 2
+    else:
+        raise ValueError(f"Unknown recon loss mode: {mode}")
+
+    with torch.no_grad():
+        fg_mask = (target > bg_threshold).float()
+        weight = 1.0 + (fg_weight - 1.0) * fg_mask
+        weight = weight / weight.mean()
+
+    return (pixel_loss * weight).mean()
+
+
+def ssim3d(
+    x: torch.Tensor, y: torch.Tensor, window_size: int = 7, data_range: float = 2.0
+) -> torch.Tensor:
+    """Differentiable 3D SSIM (mean over the volume)."""
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+
+    if x.shape[2] == 1:
+        # 2D fallback
+        x2 = x[:, :, 0]
+        y2 = y[:, :, 0]
+        coords = torch.arange(window_size, dtype=x.dtype, device=x.device)
+        coords = coords - (window_size - 1) / 2.0
+        g = torch.exp(-(coords**2) / (2.0 * 1.5**2))
+        g = g / g.sum()
+        k = (g[:, None] * g[None, :]).view(1, 1, window_size, window_size)
+        pad = window_size // 2
+        mu_x = F.conv2d(x2, k, padding=pad)
+        mu_y = F.conv2d(y2, k, padding=pad)
+        mu_x2, mu_y2, mu_xy = mu_x * mu_x, mu_y * mu_y, mu_x * mu_y
+        sigma_x2 = F.conv2d(x2 * x2, k, padding=pad) - mu_x2
+        sigma_y2 = F.conv2d(y2 * y2, k, padding=pad) - mu_y2
+        sigma_xy = F.conv2d(x2 * y2, k, padding=pad) - mu_xy
+        ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / (
+            (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
+        )
+        return ssim_map.mean()
+
+    # 3D Gaussian kernel
+    coords = torch.arange(window_size, dtype=x.dtype, device=x.device)
+    coords = coords - (window_size - 1) / 2.0
+    g = torch.exp(-(coords**2) / (2.0 * 1.5**2))
+    g = g / g.sum()
+    k3 = g[:, None, None] * g[None, :, None] * g[None, None, :]
+    k3 = k3.view(1, 1, window_size, window_size, window_size)
+    pad = window_size // 2
+    mu_x = F.conv3d(x, k3, padding=pad)
+    mu_y = F.conv3d(y, k3, padding=pad)
+    mu_x2, mu_y2, mu_xy = mu_x * mu_x, mu_y * mu_y, mu_x * mu_y
+    sigma_x2 = F.conv3d(x * x, k3, padding=pad) - mu_x2
+    sigma_y2 = F.conv3d(y * y, k3, padding=pad) - mu_y2
+    sigma_xy = F.conv3d(x * y, k3, padding=pad) - mu_xy
+    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / (
+        (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
+    )
+    return ssim_map.mean()
+
+
 class EMAVectorQuantizer(nn.Module):
+    """EMA VectorQuantizer with k-means cold-start and adaptive dead-code revival (NeuroQuant)."""
+
     def __init__(
         self,
         num_embeddings: int,
@@ -229,64 +494,137 @@ class EMAVectorQuantizer(nn.Module):
         decay: float = 0.99,
         eps: float = 1e-5,
         beta: float = 0.25,
+        revive_dead: bool = True,
+        revive_threshold: float = 0.1,
     ):
         super().__init__()
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
+        self.K = num_embeddings
+        self.D = embedding_dim
+        self.beta = beta
         self.decay = decay
         self.eps = eps
-        self.beta = beta
+        self.revive_dead = revive_dead
+        self.revive_threshold = revive_threshold
 
-        # Match NeuroQuant-style small codebook init to avoid early distance explosions.
+        # The codebook is a buffer (NOT a parameter): updated by EMA, not by grad.
         embed = torch.empty(num_embeddings, embedding_dim)
         embed.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
         self.register_buffer("embedding", embed)
-        self.register_buffer("ema_count", torch.zeros(num_embeddings))
-        self.register_buffer("ema_weight", embed.clone())
+
+        # EMA accumulators
+        self.register_buffer("ema_cluster_size", torch.zeros(num_embeddings))
+        self.register_buffer("ema_w", embed.clone())
+        self.register_buffer("initialized", torch.tensor(False))
+
+        # Reservoir for cold-start k-means init: lets us accumulate encoder
+        # vectors across multiple forward calls when a single batch has fewer
+        # tokens than K. We keep at most 2*K vectors; once full, init fires.
+        self.register_buffer("init_reservoir", torch.empty(0, embedding_dim))
+
+    @torch.no_grad()
+    def _ema_update(self, flat: torch.Tensor, encodings: torch.Tensor):
+        """Update codebook in place via EMA."""
+        # 1) update cluster sizes
+        cluster_size_new = encodings.sum(dim=0)  # (K,)
+        self.ema_cluster_size.mul_(self.decay).add_(
+            cluster_size_new, alpha=1.0 - self.decay
+        )
+
+        # 2) update sums of assigned vectors
+        dw = encodings.t() @ flat  # (K, D)
+        self.ema_weight.mul_(self.decay).add_(dw, alpha=1.0 - self.decay)
+
+        # 3) Laplace smoothing
+        n = self.ema_cluster_size.sum()
+        smoothed = (self.ema_cluster_size + self.eps) / (n + self.K * self.eps) * n
+        self.embedding.copy_(self.ema_w / smoothed.unsqueeze(1))
+
+        if self.revive_dead:
+            avg = self.ema_cluster_size.mean()
+            threshold = max(
+                self.revive_threshold * avg, torch.tensor(1e-3, device=avg.device)
+            )
+            dead = self.ema_cluster_size < threshold
+            n_dead = int(dead.sum().item())
+            if n_dead > 0 and flat.size(0) > 0:
+                rand_idx = torch.randint(0, flat.size(0), (n_dead,), device=flat.device)
+                self.embedding[dead] = flat[rand_idx]
+                # reset their EMA stats so they get a fresh start
+                self.ema_cluster_size[dead] = self.revive_threshold
+                self.ema_w[dead] = flat[rand_idx]
 
     def forward(
         self, z_e: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # z_e: (B,C,H,W,D)
         b, c, h, w, d = z_e.shape
         # Compute VQ assignment in fp32 for numerical stability under AMP.
         z_flat = z_e.float().permute(0, 2, 3, 4, 1).contiguous().view(-1, c)
         embedding_fp32 = self.embedding.float()
 
-        # distances L2
+        # (B, C, D, H, W) -> (B, D, H, W, C) -> (N, C)
+        z_perm = z_e.permute(0, 2, 3, 4, 1).contiguous()
+
+        if self.training and not bool(self.initialized.item()):
+            with torch.no_grad():
+                self.init_reservoir = torch.cat(
+                    [
+                        self.init_reservoir.to(z_flat.device, dtype=z_flat.dtype),
+                        z_flat.detach(),
+                    ],
+                    dim=0,
+                )
+                # Cap reservoir at 2*K to keep memory bounded if init is slow.
+                if self.init_reservoir.size(0) > 2 * self.K:
+                    perm = torch.randperm(
+                        self.init_reservoir.size(0), device=z_flat.device
+                    )[: 2 * self.K]
+                    self.init_reservoir = self.init_reservoir[perm]
+
+                if self.init_reservoir.size(0) >= self.K:
+                    idx = torch.randperm(
+                        self.init_reservoir.size(0), device=z_flat.device
+                    )[: self.K]
+                    self.embedding.copy_(self.init_reservoir[idx])
+                    self.ema_w.copy_(self.embedding)
+                    self.ema_cluster_size.fill_(1.0)
+                    self.initialized.fill_(True)
+                    # Free reservoir
+                    self.init_reservoir = torch.empty(
+                        0, self.D, device=z_flat.device, dtype=z_flat.dtype
+                    )
+
+        # Squared L2 distances: ||z||^2 + ||e||^2 - 2 z·e
         dist = (
             z_flat.pow(2).sum(dim=1, keepdim=True)
-            - 2 * z_flat @ embedding_fp32.t()
-            + embedding_fp32.pow(2).sum(dim=1, keepdim=True).t()
+            + embedding_fp32.pow(2).sum(dim=1)
+            - 2.0 * z_flat @ embedding_fp32.t()
         )
-        indices = torch.argmin(dist, dim=1)
-        z_q = embedding_fp32.index_select(0, indices)
-        z_q = z_q.view(b, h, w, d, c).permute(0, 4, 1, 2, 3).contiguous()
-        z_q = z_q.to(dtype=z_e.dtype)
 
+        indices_flat = dist.argmin(dim=1)  # (N,)
+        encodings = F.one_hot(indices_flat, num_classes=self.K).type(z_flat.dtype)
+        z_q_flat = encodings @ embedding_fp32  # (N, D)
+        z_q = z_q_flat.view(z_perm.shape)  # (B, D, H, W, C)
+
+        # EMA codebook update (only in training)
         if self.training:
-            onehot = F.one_hot(indices, self.num_embeddings).type_as(z_flat)
-            count = onehot.sum(dim=0)
-            weight = onehot.t() @ z_flat
+            self._ema_update(z_flat.detach(), encodings.detach())
 
-            self.ema_count.mul_(self.decay).add_(count, alpha=1 - self.decay)
-            self.ema_weight.mul_(self.decay).add_(weight, alpha=1 - self.decay)
+        # Commitment loss only — codebook is updated by EMA, not by grad.
+        commitment_loss = F.mse_loss(z_perm, z_q.detach())
+        vq_loss = self.beta * commitment_loss
 
-            n = self.ema_count.sum()
-            smoothed = (
-                (self.ema_count + self.eps) / (n + self.num_embeddings * self.eps) * n
-            )
-            smoothed = smoothed.clamp_min(1e-6)
-            self.embedding.copy_(self.ema_weight / smoothed.unsqueeze(1))
+        # Straight-through estimator
+        z_q = z_perm + (z_q - z_perm).detach()
+        z_q = z_q.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, D, H, W)
 
-        # straight-through + commitment
-        z_q_st = z_e + (z_q - z_e).detach()
-        commit_loss = self.beta * F.mse_loss(z_e.float(), z_q.detach().float())
+        # Perplexity (codebook usage)
+        with torch.no_grad():
+            avg_probs = encodings.mean(dim=0)
+            perplexity = torch.exp(-(avg_probs * (avg_probs + 1e-10).log()).sum())
 
-        probs = F.one_hot(indices, self.num_embeddings).float().mean(dim=0)
-        perplexity = torch.exp(-(probs * torch.log(probs + 1e-10)).sum())
-
-        return z_q_st, commit_loss, perplexity
+        indices = indices_flat.view(z_perm.shape[:-1])  # (B, D, H, W)
+        return z_q, vq_loss, indices, perplexity
 
 
 class ConvBlock3D(nn.Module):
@@ -306,188 +644,321 @@ class ConvBlock3D(nn.Module):
 
 
 class DualStreamEncoder(nn.Module):
+    """Dual-stream encoder with factorized convs + multi-axis attention (NeuroQuant)."""
+
     def __init__(
         self,
         in_channels: int = 1,
-        base_channels: int = 32,
+        base_channels: int = 64,
         channel_multipliers: Tuple[int, ...] = (1, 2, 4, 4),
         anat_channels: int = 64,
         mod_channels: int = 32,
+        dropout: float = 0.0,
+        attention_levels: Tuple[int, ...] = (2, 3),
+        num_heads: int = 8,
     ):
         super().__init__()
         self.gradient_checkpointing = False
-        channels = [base_channels * m for m in channel_multipliers]
-        if len(channels) < 2:
+        self.channels = [base_channels * m for m in channel_multipliers]
+        if len(self.channels) < 2:
             raise ValueError("channel_multipliers must contain at least 2 values")
 
-        self.stem = ConvBlock3D(in_channels, channels[0])
+        self.conv_in = nn.Conv3d(in_channels, base_channels, 3, padding=1)
 
         self.down_blocks = nn.ModuleList()
-        in_ch = channels[0]
-        for out_ch in channels:
-            self.down_blocks.append(
-                nn.Sequential(
-                    nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1),
-                    nn.SiLU(inplace=True),
-                    nn.Conv3d(out_ch, out_ch, kernel_size=4, stride=2, padding=1),
-                    nn.SiLU(inplace=True),
-                )
-            )
-            in_ch = out_ch
+        in_ch = base_channels
+        for i, out_ch in enumerate(self.channels):
+            block = nn.ModuleDict()
+            res_blocks = nn.ModuleList()
+            for _ in range(2):  # num_res_blocks=2
+                res_blocks.append(FactoredResBlock(in_ch, out_ch, dropout))
+                in_ch = out_ch
+            block["res"] = res_blocks
+            if i in attention_levels:
+                block["attn"] = MultiAxisAttention(out_ch, num_heads)
+            block["down"] = Downsample3D(out_ch, downsample_depth=True)
+            self.down_blocks.append(block)
 
-        hidden = channels[-1]
-        self.anat_head = nn.Conv3d(hidden, anat_channels, kernel_size=1)
-        self.mod_head = nn.Conv3d(hidden, mod_channels, kernel_size=1)
+        # Mid block (global context) - NeuroQuant style
+        self.mid_res1 = FactoredResBlock(self.channels[-1], self.channels[-1], dropout)
+        self.mid_attn = MultiAxisAttention(self.channels[-1], num_heads)
+        self.mid_res2 = FactoredResBlock(self.channels[-1], self.channels[-1], dropout)
 
-    def _run_block(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        if self.training and self.gradient_checkpointing and x.requires_grad:
-            return torch_checkpoint(block, x, use_reentrant=False)
-        return block(x)
+        self.norm_out = Normalize(self.channels[-1])
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self._run_block(self.stem, x)
+        # Dual-stream heads - both see the same shared feature map
+        self.head_anat = nn.Conv3d(self.channels[-1], anat_channels, 1)
+        self.head_mod = nn.Conv3d(self.channels[-1], mod_channels, 1)
+
+    def _run_stage(
+        self, block: nn.ModuleDict, h: torch.Tensor, depth_mode: str = "3d"
+    ) -> torch.Tensor:
+        for res in block["res"]:
+            h = res(h, depth_mode)
+        if "attn" in block:
+            h = block["attn"](h, depth_mode)
+        h = block["down"](h, depth_mode)
+        return h
+
+    def _run_mid(self, h: torch.Tensor, depth_mode: str = "3d") -> torch.Tensor:
+        h = self.mid_res1(h, depth_mode)
+        h = self.mid_attn(h, depth_mode)
+        h = self.mid_res2(h, depth_mode)
+        return h
+
+    def forward(
+        self, x: torch.Tensor, depth_mode: str = "3d"
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.conv_in(x)
+
         for block in self.down_blocks:
-            h = self._run_block(block, h)
-        z_anat = self.anat_head(h)
-        z_mod = self.mod_head(h)
+            if self.gradient_checkpointing and self.training:
+                h = torch_checkpoint(
+                    self._run_stage, block, h, depth_mode, use_reentrant=False
+                )
+            else:
+                h = self._run_stage(block, h, depth_mode)
+
+        if self.gradient_checkpointing and self.training:
+            h = torch_checkpoint(self._run_mid, h, depth_mode, use_reentrant=False)
+        else:
+            h = self._run_mid(h, depth_mode)
+
+        h = F.silu(self.norm_out(h))  # shared F^(t)
+        z_anat = self.head_anat(h)  # (B, C_a, D', H', W')
+        z_mod = self.head_mod(h)  # (B, C_m, D', H', W')
         return z_anat, z_mod
 
 
-class FiLMDecoder(nn.Module):
+class FiLMGenerator(nn.Module):
+    """MLP that predicts (gamma_l, beta_l) for each decoder layer (NeuroQuant)."""
+
+    def __init__(self, in_dim: int, layer_channels: List[int], hidden_dim: int = 256):
+        super().__init__()
+        self.layer_channels = layer_channels
+        total = sum(2 * c for c in layer_channels)  # gamma + beta per layer
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, total),
+        )
+        # Initialize last layer so initial FiLM ≈ identity (gamma=1, beta=0)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, u: torch.Tensor) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        raw = self.mlp(u)  # (B, total)
+        params = []
+        offset = 0
+        for c in self.layer_channels:
+            gamma = 1.0 + raw[:, offset : offset + c]  # identity init
+            offset += c
+            beta = raw[:, offset : offset + c]
+            offset += c
+            params.append((gamma, beta))
+        return params
+
+
+def film_apply(
+    x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor
+) -> torch.Tensor:
+    """Channel-wise affine: h' = gamma * h + beta. h is (B, C, D, H, W)."""
+    g = gamma.view(gamma.size(0), gamma.size(1), 1, 1, 1)
+    b = beta.view(beta.size(0), beta.size(1), 1, 1, 1)
+    return g * x + b
+
+
+class FiLMDecoder3D(nn.Module):
+    """FiLM decoder 3D (NeuroQuant style)."""
+
     def __init__(
         self,
-        anat_channels: int,
-        mod_channels: int,
-        n_modalities: int,
-        n_fields: int,
-        base_channels: int = 32,
-        channel_multipliers: Tuple[int, ...] = (1, 2, 4, 4),
         out_channels: int = 1,
+        base_channels: int = 64,
+        channel_multipliers: Tuple[int, ...] = (1, 2, 4, 4),
+        num_res_blocks: int = 2,
+        anat_channels: int = 64,
+        dropout: float = 0.0,
+        attention_levels: Tuple[int, ...] = (2, 3),
+        num_heads: int = 8,
     ):
         super().__init__()
         self.gradient_checkpointing = False
-        self.mod_emb = nn.Embedding(n_modalities, 16)
-        self.field_emb = nn.Embedding(n_fields, 8)
+        self.channels = [base_channels * m for m in channel_multipliers]
 
-        channels = [base_channels * m for m in channel_multipliers]
-        if len(channels) < 2:
-            raise ValueError("channel_multipliers must contain at least 2 values")
-        rev_channels = list(reversed(channels))
+        self.conv_in = nn.Conv3d(anat_channels, self.channels[-1], 3, padding=1)
 
-        style_in = mod_channels + 16 + 8
-        film_total = 2 * sum(rev_channels)
-        self.style_mlp = nn.Sequential(
-            nn.Linear(style_in, 128),
-            nn.SiLU(inplace=True),
-            nn.Linear(128, film_total),
-        )
+        # Mid block
+        self.mid_res1 = FactoredResBlock(self.channels[-1], self.channels[-1], dropout)
+        self.mid_attn = MultiAxisAttention(self.channels[-1], num_heads)
+        self.mid_res2 = FactoredResBlock(self.channels[-1], self.channels[-1], dropout)
 
+        # Up blocks (reverse order)
         self.up_blocks = nn.ModuleList()
-        in_ch = anat_channels
-        for out_ch in rev_channels:
-            self.up_blocks.append(
-                nn.ConvTranspose3d(in_ch, out_ch, kernel_size=4, stride=2, padding=1)
-            )
-            in_ch = out_ch
-        self.film_channels = rev_channels
-        self.out = nn.Conv3d(rev_channels[-1], out_channels, kernel_size=3, padding=1)
+        in_ch = self.channels[-1]
+        rev_channels = list(reversed(self.channels))
+        rev_attn_levels = [len(self.channels) - 1 - l for l in attention_levels]
+        for i, out_ch in enumerate(rev_channels):
+            block = nn.ModuleDict()
+            block["up"] = Upsample3D(in_ch, upsample_depth=True)
+            res_blocks = nn.ModuleList()
+            for _ in range(num_res_blocks):
+                res_blocks.append(FactoredResBlock(in_ch, out_ch, dropout))
+                in_ch = out_ch
+            block["res"] = res_blocks
+            if i in rev_attn_levels:
+                block["attn"] = MultiAxisAttention(out_ch, num_heads)
+            self.up_blocks.append(block)
 
-    def _film(
-        self, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor
+        self.norm_out = Normalize(self.channels[0])
+        self.conv_out = nn.Conv3d(self.channels[0], out_channels, 3, padding=1)
+
+        # Channel sequence used by the FiLM generator: 1 entry per modulated stage.
+        # Order: [mid (channels[-1]), up_block_0_out, up_block_1_out, ..., final_out]
+        self.film_layer_channels = [self.channels[-1]] + list(rev_channels)
+
+    def _run_mid(self, h: torch.Tensor, depth_mode: str = "3d") -> torch.Tensor:
+        h = self.mid_res1(h, depth_mode)
+        h = self.mid_attn(h, depth_mode)
+        h = self.mid_res2(h, depth_mode)
+        return h
+
+    def _run_stage(
+        self, block: nn.ModuleDict, h: torch.Tensor, depth_mode: str = "3d"
     ) -> torch.Tensor:
-        # gamma/beta: (B,C)
-        return x * (1.0 + gamma[:, :, None, None, None]) + beta[:, :, None, None, None]
-
-    def _run_block(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        if self.training and self.gradient_checkpointing and x.requires_grad:
-            return torch_checkpoint(block, x, use_reentrant=False)
-        return block(x)
+        h = block["up"](h, depth_mode)
+        for res in block["res"]:
+            h = res(h, depth_mode)
+        if "attn" in block:
+            h = block["attn"](h, depth_mode)
+        return h
 
     def forward(
         self,
         z_q: torch.Tensor,
-        z_mod: torch.Tensor,
-        mod_idx: torch.Tensor,
-        field_idx: torch.Tensor,
+        film_params: List[Tuple[torch.Tensor, torch.Tensor]],
+        depth_mode: str = "3d",
     ) -> torch.Tensor:
-        z_mod_pool = z_mod.mean(dim=(2, 3, 4))
-        style = torch.cat(
-            [z_mod_pool, self.mod_emb(mod_idx), self.field_emb(field_idx)], dim=1
+        assert len(film_params) == len(self.film_layer_channels), (
+            f"FiLM expects {len(self.film_layer_channels)} (gamma,beta) pairs, "
+            f"got {len(film_params)}"
         )
-        gb = self.style_mlp(style)
 
-        split_sizes: List[int] = []
-        for c in self.film_channels:
-            split_sizes.extend([c, c])
-        chunks = torch.split(gb, split_sizes, dim=1)
+        h = self.conv_in(z_q)
 
-        x = z_q
-        offset = 0
-        for block, c in zip(self.up_blocks, self.film_channels):
-            gamma = chunks[offset]
-            beta = chunks[offset + 1]
-            offset += 2
-            x = self._run_block(block, x)
-            if gamma.shape[1] != c or beta.shape[1] != c:
-                raise RuntimeError("FiLM parameter shape mismatch")
-            x = F.silu(self._film(x, gamma, beta))
-        x = torch.tanh(self.out(x))
-        return x
+        # Mid block + FiLM_0
+        if self.gradient_checkpointing and self.training:
+            h = torch_checkpoint(self._run_mid, h, depth_mode, use_reentrant=False)
+        else:
+            h = self._run_mid(h, depth_mode)
+        gamma, beta = film_params[0]
+        h = film_apply(h, gamma, beta)
+
+        # Up blocks + FiLM_{l>=1}
+        for i, block in enumerate(self.up_blocks):
+            if self.gradient_checkpointing and self.training:
+                h = torch_checkpoint(
+                    self._run_stage, block, h, depth_mode, use_reentrant=False
+                )
+            else:
+                h = self._run_stage(block, h, depth_mode)
+            gamma, beta = film_params[i + 1]
+            h = film_apply(h, gamma, beta)
+
+        h = self.conv_out(F.silu(self.norm_out(h)))
+        return torch.tanh(h)
 
 
 class ModalityAdversary(nn.Module):
-    def __init__(self, anat_channels: int, n_modalities: int):
+    """Gradient-reversed modality classifier on z_anat (NeuroQuant)."""
+
+    def __init__(self, in_channels: int, num_modalities: int = 2, hidden: int = 128):
         super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(anat_channels, 128),
-            nn.SiLU(inplace=True),
-            nn.Linear(128, n_modalities),
+        self.net = nn.Sequential(
+            nn.Conv3d(in_channels, hidden, 1),
+            nn.GroupNorm(min(32, hidden), hidden),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, num_modalities),
         )
 
-    def forward(self, z_anat: torch.Tensor, grl_lambda: float) -> torch.Tensor:
-        pooled = z_anat.mean(dim=(2, 3, 4))
-        pooled = grad_reverse(pooled, grl_lambda)
-        return self.head(pooled)
+    def forward(self, z_anat: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+        z_rev = grad_reverse(z_anat, alpha)
+        return self.net(z_rev)
 
 
 class NeuroQuantHybrid(nn.Module):
+    """Dual-stream 3D VQ-VAE (NeuroQuant-inspired, with cross-modal swap)."""
+
     def __init__(
         self,
-        n_modalities: int,
-        n_fields: int,
-        base_channels: int = 32,
+        n_modalities: int = 3,
+        n_fields: int = 5,
+        base_channels: int = 64,
         channel_multipliers: Tuple[int, ...] = (1, 2, 4, 4),
         anat_channels: int = 64,
         mod_channels: int = 32,
-        codebook_size: int = 1024,
+        codebook_size: int = 4096,
         vq_decay: float = 0.99,
         vq_beta: float = 0.25,
+        modality_embed_dim: int = 32,
+        film_hidden: int = 256,
+        dropout: float = 0.0,
+        attention_levels: Tuple[int, ...] = (2, 3),
+        num_heads: int = 8,
+        adv_alpha: float = 1.0,
     ):
         super().__init__()
+        self.adv_alpha = adv_alpha
+
         self.encoder = DualStreamEncoder(
             in_channels=1,
             base_channels=base_channels,
             channel_multipliers=channel_multipliers,
             anat_channels=anat_channels,
             mod_channels=mod_channels,
+            dropout=dropout,
+            attention_levels=attention_levels,
+            num_heads=num_heads,
         )
+
         self.quantizer = EMAVectorQuantizer(
             num_embeddings=codebook_size,
             embedding_dim=anat_channels,
             decay=vq_decay,
+            eps=1e-5,
             beta=vq_beta,
+            revive_dead=True,
+            revive_threshold=0.1,
         )
-        self.decoder = FiLMDecoder(
-            anat_channels=anat_channels,
-            mod_channels=mod_channels,
-            n_modalities=n_modalities,
-            n_fields=n_fields,
+
+        self.decoder = FiLMDecoder3D(
+            out_channels=1,
             base_channels=base_channels,
             channel_multipliers=channel_multipliers,
-            out_channels=1,
+            num_res_blocks=2,
+            anat_channels=anat_channels,
+            dropout=dropout,
+            attention_levels=attention_levels,
+            num_heads=num_heads,
         )
+
+        # Per-modality learned embedding s_m (NeuroQuant)
+        self.modality_embedding = nn.Embedding(max(n_modalities, 2), modality_embed_dim)
+        self.film_generator = FiLMGenerator(
+            in_dim=mod_channels + modality_embed_dim,
+            layer_channels=self.decoder.film_layer_channels,
+            hidden_dim=film_hidden,
+        )
+
         self.adversary = ModalityAdversary(
-            anat_channels=anat_channels, n_modalities=n_modalities
+            in_channels=anat_channels,
+            num_modalities=max(n_modalities, 2),
         )
 
     def enable_gradient_checkpointing(self) -> None:
@@ -498,19 +969,41 @@ class NeuroQuantHybrid(nn.Module):
         self.encoder.gradient_checkpointing = False
         self.decoder.gradient_checkpointing = False
 
+    def compute_film(
+        self, z_mod: torch.Tensor, modality: torch.Tensor
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """Build u_m = concat(GAP(z_mod), s_m) and predict FiLM params."""
+        gap = F.adaptive_avg_pool3d(z_mod, 1).flatten(1)  # (B, C_m)
+        s_m = self.modality_embedding(modality)  # (B, C_s)
+        u_m = torch.cat([gap, s_m], dim=1)
+        return self.film_generator(u_m)
+
     def forward_src(
-        self, x_src: torch.Tensor, src_mod: torch.Tensor, src_field: torch.Tensor
+        self,
+        x_src: torch.Tensor,
+        src_mod: torch.Tensor,
+        src_field: torch.Tensor,
+        depth_mode: str = "3d",
     ) -> Dict[str, torch.Tensor]:
-        z_anat, z_mod = self.encoder(x_src)
-        z_q, vq_loss, perplexity = self.quantizer(z_anat)
-        x_rec = self.decoder(z_q, z_mod, src_mod, src_field)
+        z_anat, z_mod = self.encoder(x_src, depth_mode)
+        z_anat_q, vq_loss, indices, perplexity = self.quantizer(z_anat)
+
+        film_params = self.compute_film(z_mod, src_mod)
+        recon = self.decoder(z_anat_q, film_params, depth_mode)
+
+        mod_logits = None
+        mod_logits = self.adversary(z_anat, alpha=self.adv_alpha)
+
         return {
             "z_anat": z_anat,
             "z_mod": z_mod,
-            "z_q": z_q,
+            "z_q": z_anat_q,
+            "indices": indices,
             "vq_loss": vq_loss,
             "perplexity": perplexity,
-            "x_rec": x_rec,
+            "film_params": film_params,
+            "x_rec": recon,
+            "mod_logits": mod_logits,
         }
 
 
@@ -568,6 +1061,12 @@ def train(args: argparse.Namespace) -> None:
         codebook_size=args.codebook_size,
         vq_decay=args.vq_decay,
         vq_beta=args.vq_beta,
+        modality_embed_dim=32,
+        film_hidden=256,
+        dropout=0.0,
+        attention_levels=(2, 3),
+        num_heads=8,
+        adv_alpha=1.0,
     ).to(device)
 
     if args.gradient_checkpointing:
@@ -636,31 +1135,39 @@ def train(args: argparse.Namespace) -> None:
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 out_src = model.forward_src(x_src, src_mod, src_field)
                 x_rec = out_src["x_rec"]
-                recon_loss = F.l1_loss(x_rec, x_src)
+
+                # SSIM3D + foreground weighting (NeuroQuant)
+                recon_loss = weighted_recon_loss(
+                    x_rec, x_src, "l1", fg_weight=5.0, bg_threshold=-0.9
+                )
+                ssim_term = 1.0 - ssim3d(
+                    x_rec.float(), x_src.float(), window_size=7, data_range=2.0
+                )
+                recon_loss = recon_loss + 0.5 * ssim_term  # ssim_weight=0.5
+
                 vq_loss = out_src["vq_loss"]
 
                 # Adversary modalité sur code anatomique (invariance)
-                logits_adv = model.adversary(out_src["z_anat"], grl_lambda=grl_lambda)
+                logits_adv = out_src["mod_logits"]
                 adv_loss = F.cross_entropy(logits_adv, src_mod)
 
-                # Cross loss (paired uniquement)
+                # Cross loss (paired uniquement) - NeuroQuant style
                 paired_mask = is_paired > 0.5
                 if paired_mask.any():
-                    z_mod_tgt = torch.zeros_like(out_src["z_mod"])
+                    # Get z_mod for target modality
                     with torch.no_grad():
                         _, z_mod_all_tgt = model.encoder(x_tgt[paired_mask])
-                    z_mod_tgt[paired_mask] = z_mod_all_tgt
 
-                    # Placeholder indices sûrs pour unpaired (pas utilisés par le masque)
-                    safe_tgt_mod = tgt_mod.clone()
-                    safe_tgt_field = tgt_field.clone()
-                    safe_tgt_mod[~paired_mask] = src_mod[~paired_mask]
-                    safe_tgt_field[~paired_mask] = src_field[~paired_mask]
-
-                    x_cross = model.decoder(
-                        out_src["z_q"], z_mod_tgt, safe_tgt_mod, safe_tgt_field
+                    # Compute FiLM params for target modality
+                    film_params_tgt = model.compute_film(
+                        z_mod_all_tgt, tgt_mod[paired_mask]
                     )
-                    cross_loss = F.l1_loss(x_cross[paired_mask], x_tgt[paired_mask])
+
+                    # Reconstruct with z_q_src + film_params_tgt
+                    x_cross = model.decoder(
+                        out_src["z_q"][paired_mask], film_params_tgt
+                    )
+                    cross_loss = F.l1_loss(x_cross, x_tgt[paired_mask])
                 else:
                     cross_loss = torch.zeros([], device=device)
 
@@ -770,12 +1277,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--paired-prob", type=float, default=0.5)
     p.add_argument("--max-samples", type=int, default=None)
 
-    p.add_argument("--base-channels", type=int, default=32)
+    p.add_argument(
+        "--base-channels", type=int, default=64, help="NeuroQuant base_channels=64"
+    )
     p.add_argument("--channel-multipliers", nargs="+", type=int, default=[1, 2, 4, 4])
     p.add_argument("--anat-channels", type=int, default=64)
     p.add_argument("--mod-channels", type=int, default=32)
-    p.add_argument("--codebook-size", type=int, default=1024)
-    p.add_argument("--vq-decay", type=float, default=0.99)
+    p.add_argument(
+        "--codebook-size", type=int, default=4096, help="NeuroQuant codebook_size=4096"
+    )
+    p.add_argument("--vq-decay", type=float, default=0.99, help="NeuroQuant decay=0.99")
     p.add_argument("--vq-beta", type=float, default=0.25)
 
     p.add_argument("--batch-size", type=int, default=1)
