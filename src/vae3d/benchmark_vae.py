@@ -180,11 +180,12 @@ def load_aekl(checkpoint_path: Path, device: torch.device) -> nn.Module:
 
 class VQVAECompatWrapper(nn.Module):
     """
-    Wraps NeuroQuantHybrid pour être compatible avec PatchedVAE (interface encode/decode).
+    Wraps NeuroQuantHybrid (nouvelle architecture) pour être compatible
+    avec PatchedVAE (interface encode/decode).
 
     Stratégie : encode() concatène [z_q | z_mod] sur l'axe canal (64+32=96 ch).
-                decode() découpe les deux parties et appelle le décodeur FiLM
-                avec les indices de modalité/champ corrects.
+                decode() découpe les deux parties, calcule les FiLM params
+                via compute_film() et appelle le décodeur FiLMDecoder3D.
     """
 
     MOD_CHANNELS = 32  # mod_channels du NeuroQuantHybrid
@@ -194,22 +195,27 @@ class VQVAECompatWrapper(nn.Module):
         super().__init__()
         self.vqvae = vqvae
         self.mod_idx = mod_idx
-        self.field_idx = field_idx
+        self.field_idx = (
+            field_idx  # conservé pour compatibilité, non utilisé par FiLMDecoder3D
+        )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode : retourne torch.cat([z_q, z_mod], dim=1)."""
-        z_anat, z_mod = self.vqvae.encoder(x)
-        z_q, _vq_loss, _perplexity = self.vqvae.quantizer(z_anat)
+        z_anat, z_mod = self.vqvae.encoder(x, depth_mode="3d")
+        # quantizer retourne maintenant 4 valeurs : z_q, vq_loss, indices, perplexity
+        z_q, _vq_loss, _indices, _perplexity = self.vqvae.quantizer(z_anat)
         return torch.cat([z_q, z_mod], dim=1)  # (B, 96, H', W', D')
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode : découpe z_q/z_mod, appelle le décodeur FiLM."""
+        """Decode : découpe z_q/z_mod, calcule les FiLM params et décode."""
         z_q = z[:, : self.ANAT_CHANNELS]
         z_mod = z[:, self.ANAT_CHANNELS :]
         b, device = z_q.shape[0], z_q.device
-        mod_idx = torch.full((b,), self.mod_idx, dtype=torch.long, device=device)
-        field_idx = torch.full((b,), self.field_idx, dtype=torch.long, device=device)
-        return self.vqvae.decoder(z_q, z_mod, mod_idx, field_idx)
+        # L'embedding de modalité doit être un index valide pour nn.Embedding
+        modality = torch.full((b,), self.mod_idx, dtype=torch.long, device=device)
+        # compute_film : concat(GAP(z_mod), s_m) → MLP → [(γ_l, β_l)]
+        film_params = self.vqvae.compute_film(z_mod, modality)
+        return self.vqvae.decoder(z_q, film_params, depth_mode="3d")
 
 
 def load_vqvae(
@@ -218,40 +224,63 @@ def load_vqvae(
     n_modalities: int = 3,
     n_fields: int = 5,
 ) -> nn.Module:
-    """Load VQ-VAE from checkpoint."""
+    """Load VQ-VAE from checkpoint.
+
+    Les hyperparamètres du modèle (base_channels, codebook_size, etc.) sont lus
+    directement depuis le checkpoint si disponibles, sinon les defaults NeuroQuant
+    sont utilisés (base_channels=64, codebook_size=4096).
+    """
     print("[VQ-VAE] Loading checkpoint...")
-    model = NeuroQuantHybrid(
-        n_modalities=n_modalities,
-        n_fields=n_fields,
-        base_channels=32,
-        anat_channels=64,
-        mod_channels=32,
-        codebook_size=1024,
-    ).to(device)
 
     if checkpoint_path is None or not Path(checkpoint_path).exists():
-        return None
+        # Construit un modèle vide (pour smoke tests)
+        model = NeuroQuantHybrid(
+            n_modalities=n_modalities,
+            n_fields=n_fields,
+        ).to(device)
+        return model
+
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
+    args_d = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    if hasattr(args_d, "__dict__"):
+        args_d = vars(args_d)  # Namespace → dict
 
-    # Handle field_emb mismatch (checkpoint may have different n_fields)
-    decoder_state = {k: v for k, v in state.items() if k.startswith("decoder.")}
-    for k in list(decoder_state.keys()):
-        if "field_emb" in k:
-            # Keep only the checkpoint's field_emb, ignore shape mismatch
-            old_shape = decoder_state[k].shape
-            new_shape = (
-                model.state_dict()[k].shape if k in model.state_dict() else old_shape
-            )
-            if old_shape != new_shape:
-                print(f"  ⚠️  Skipping {k}: shape mismatch {old_shape} vs {new_shape}")
-                del state[k]
+    # Lecture des hyper-params depuis le checkpoint (ou defaults NeuroQuant)
+    base_channels = int(args_d.get("base_channels", 64))
+    anat_channels = int(args_d.get("anat_channels", 64))
+    mod_channels = int(args_d.get("mod_channels", 32))
+    codebook_size = int(args_d.get("codebook_size", 4096))
+    vq_decay = float(args_d.get("vq_decay", 0.99))
+    vq_beta = float(args_d.get("vq_beta", 0.25))
+    mods_saved = args_d.get("modalities", None)
+    fields_saved = args_d.get("fields", None)
+    n_mods_ckpt = len(mods_saved) if mods_saved else n_modalities
+    n_fields_ckpt = len(fields_saved) if fields_saved else n_fields
+
+    print(
+        f"  Checkpoint config : base_ch={base_channels}  codebook={codebook_size}  "
+        f"n_mod={n_mods_ckpt}  n_fields={n_fields_ckpt}  step={ckpt.get('step', '?')}"
+    )
+
+    model = NeuroQuantHybrid(
+        n_modalities=n_mods_ckpt,
+        n_fields=n_fields_ckpt,
+        base_channels=base_channels,
+        anat_channels=anat_channels,
+        mod_channels=mod_channels,
+        codebook_size=codebook_size,
+        vq_decay=vq_decay,
+        vq_beta=vq_beta,
+    ).to(device)
 
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         print(f"  ⚠  VQ-VAE {len(missing)} clé(s) manquante(s)")
     if unexpected:
         print(f"  ⚠  VQ-VAE {len(unexpected)} clé(s) inattendue(s)")
+    if not missing and not unexpected:
+        print(f"  ✓ Chargement parfait (0 missing, 0 unexpected)")
     model.eval()
     print(f"  → VQ-VAE loaded from {Path(checkpoint_path).name}")
     return model

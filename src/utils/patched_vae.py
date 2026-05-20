@@ -5,18 +5,19 @@ Handles patch extraction, encoding, decoding, and reconstruction blending
 for any VAE architecture (AEKL, VQ-VAE, MedVAE).
 """
 
-from typing import Dict, List, Tuple, Optional, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pathlib import Path
 
 
 class PatchedVAE(nn.Module):
     """
     Wraps any VAE to process full-resolution volumes via patch-based inference.
-    
+
     Supports:
     - Sliding window extraction with configurable overlap
     - Reconstruction blending for seamless output
@@ -50,16 +51,29 @@ class PatchedVAE(nn.Module):
         self.stride = stride
 
         # Precompute blending weights (Hann window)
-        self.register_buffer("blend_weights", self._create_blend_weights(patch_size, blend_mode))
+        self.register_buffer(
+            "blend_weights", self._create_blend_weights(patch_size, blend_mode)
+        )
 
-    def _create_blend_weights(self, size: Tuple[int, int, int], mode: str) -> torch.Tensor:
+    def _create_blend_weights(
+        self, size: Tuple[int, int, int], mode: str
+    ) -> torch.Tensor:
         """Create blending weights for patch overlaps."""
         h, w, d = size
         if mode == "gaussian":
             # Gaussian falloff at edges
-            wh = torch.exp(-((torch.arange(h, dtype=torch.float32) - h/2) ** 2) / (2 * (h/8) ** 2))
-            ww = torch.exp(-((torch.arange(w, dtype=torch.float32) - w/2) ** 2) / (2 * (w/8) ** 2))
-            wd = torch.exp(-((torch.arange(d, dtype=torch.float32) - d/2) ** 2) / (2 * (d/8) ** 2))
+            wh = torch.exp(
+                -((torch.arange(h, dtype=torch.float32) - h / 2) ** 2)
+                / (2 * (h / 8) ** 2)
+            )
+            ww = torch.exp(
+                -((torch.arange(w, dtype=torch.float32) - w / 2) ** 2)
+                / (2 * (w / 8) ** 2)
+            )
+            wd = torch.exp(
+                -((torch.arange(d, dtype=torch.float32) - d / 2) ** 2)
+                / (2 * (d / 8) ** 2)
+            )
         elif mode == "linear":
             # Hann window
             wh = torch.hann_window(h, periodic=False)
@@ -74,7 +88,9 @@ class PatchedVAE(nn.Module):
         weights = wh[:, None, None] * ww[None, :, None] * wd[None, None, :]
         return weights / (weights.max() + 1e-8)  # normalize to [0, 1]
 
-    def _get_patches(self, x: torch.Tensor) -> List[Tuple[torch.Tensor, Tuple[int, int, int]]]:
+    def _get_patches(
+        self, x: torch.Tensor
+    ) -> List[Tuple[torch.Tensor, Tuple[int, int, int]]]:
         """Extract patches from input volume."""
         b, c, h, w, d = x.shape
         ph, pw, pd = self.patch_size
@@ -87,7 +103,7 @@ class PatchedVAE(nn.Module):
         for i in range(0, h - ph + 1, sh):
             for j in range(0, w - pw + 1, sw):
                 for k in range(0, d - pd + 1, sd):
-                    patch = x[:, :, i:i+ph, j:j+pw, k:k+pd]
+                    patch = x[:, :, i : i + ph, j : j + pw, k : k + pd]
                     patches.append(patch)
                     positions.append((i, j, k))
 
@@ -99,7 +115,13 @@ class PatchedVAE(nn.Module):
                     i_start = max(0, h - ph)
                     j_start = max(0, w - pw)
                     k_start = max(0, d - pd)
-                    patch = x[:, :, i_start:i_start+ph, j_start:j_start+pw, k_start:k_start+pd]
+                    patch = x[
+                        :,
+                        :,
+                        i_start : i_start + ph,
+                        j_start : j_start + pw,
+                        k_start : k_start + pd,
+                    ]
                     if (i_start, j_start, k_start) not in positions:
                         patches.append(patch)
                         positions.append((i_start, j_start, k_start))
@@ -109,7 +131,7 @@ class PatchedVAE(nn.Module):
     def encode(self, x: torch.Tensor, batch_size: int = 1) -> torch.Tensor:
         """
         Encode full-resolution volume into latent patches.
-        
+
         Returns latent tensor with preserved spatial structure.
         """
         b, c, h, w, d = x.shape
@@ -128,11 +150,11 @@ class PatchedVAE(nn.Module):
 
             with torch.no_grad():
                 # Call appropriate encode method based on VAE type
-                if hasattr(self.vae, 'encode'):  # AEKL, MedVAE
+                if hasattr(self.vae, "encode"):  # AEKL, MedVAE
                     z = self.vae.encode(batch_patches)
                     if isinstance(z, tuple):
                         z = z[0]  # Handle (mean, logvar) output
-                elif hasattr(self.vae, 'encoder'):  # VQ-VAE
+                elif hasattr(self.vae, "encoder"):  # VQ-VAE
                     z_anat, z_mod = self.vae.encoder(batch_patches)
                     z = z_anat
                 else:
@@ -144,11 +166,16 @@ class PatchedVAE(nn.Module):
         all_latents = torch.cat(latents, dim=0)
         return all_latents, positions
 
-    def decode(self, latents: torch.Tensor, positions: List[Tuple[int, int, int]], 
-               full_shape: Tuple[int, int, int], device: torch.device) -> torch.Tensor:
+    def decode(
+        self,
+        latents: torch.Tensor,
+        positions: List[Tuple[int, int, int]],
+        full_shape: Tuple[int, int, int],
+        device: torch.device,
+    ) -> torch.Tensor:
         """
         Decode latent patches and blend into full-resolution reconstruction.
-        
+
         Args:
             latents: stacked latent patches (N_patches, latent_channels, h_lat, w_lat, d_lat)
             positions: list of (i, j, k) patch positions
@@ -159,31 +186,30 @@ class PatchedVAE(nn.Module):
         ph, pw, pd = self.patch_size
 
         # Initialize accumulator and weight map
-        reconstruction = torch.zeros(1, 1, h_full, w_full, d_full, device=device, dtype=torch.float32)
-        weights_map = torch.zeros(1, 1, h_full, w_full, d_full, device=device, dtype=torch.float32)
+        reconstruction = torch.zeros(
+            1, 1, h_full, w_full, d_full, device=device, dtype=torch.float32
+        )
+        weights_map = torch.zeros(
+            1, 1, h_full, w_full, d_full, device=device, dtype=torch.float32
+        )
 
         # Decode patches
         latents = latents.to(device)
         for patch_idx, (i, j, k) in enumerate(positions):
-            z_patch = latents[patch_idx:patch_idx+1]
+            z_patch = latents[patch_idx : patch_idx + 1]
 
             with torch.no_grad():
-                if hasattr(self.vae, 'decode'):  # AEKL, MedVAE
+                if hasattr(self.vae, "decode"):  # AEKL, MedVAE, VQVAECompatWrapper
                     x_rec = self.vae.decode(z_patch)
-                elif hasattr(self.vae, 'decoder'):  # VQ-VAE
-                    # For VQ-VAE, need z_anat and z_mod; here use quantized + dummy mod
-                    if hasattr(self.vae, 'quantizer'):
-                        # Assuming z_patch is already quantized in encode path
-                        # Create dummy z_mod (mean pooled or zeros)
-                        z_mod_dummy = torch.zeros(z_patch.shape[0], 32, 
-                                                 z_patch.shape[2], z_patch.shape[3], z_patch.shape[4],
-                                                 device=device)
-                        # Dummy modality/field indices
-                        mod_idx = torch.zeros(z_patch.shape[0], dtype=torch.long, device=device)
-                        field_idx = torch.zeros(z_patch.shape[0], dtype=torch.long, device=device)
-                        x_rec = self.vae.decoder(z_patch, z_mod_dummy, mod_idx, field_idx)
-                    else:
-                        x_rec = self.vae.decoder(z_patch)
+                elif hasattr(self.vae, "decoder"):  # NeuroQuantHybrid direct (rare)
+                    # Le chemin direct du NeuroQuantHybrid n'est jamais utilisé ici :
+                    # on passe toujours par VQVAECompatWrapper qui expose decode().
+                    # Ce bloc reste comme filet de sécurité.
+                    raise ValueError(
+                        "Utilisez VQVAECompatWrapper pour wraper NeuroQuantHybrid. "
+                        "PatchedVAE ne peut pas appeler directement FiLMDecoder3D "
+                        "(il manque les film_params)."
+                    )
                 else:
                     raise ValueError("VAE must have decode() or decoder attribute")
 
@@ -193,8 +219,12 @@ class PatchedVAE(nn.Module):
 
             # Blend into accumulator using weights
             weights = self.blend_weights.to(device)
-            reconstruction[:, :, i:i+ph, j:j+pw, k:k+pd] += x_rec * weights[None, None, :, :, :]
-            weights_map[:, :, i:i+ph, j:j+pw, k:k+pd] += weights[None, None, :, :, :]
+            reconstruction[:, :, i : i + ph, j : j + pw, k : k + pd] += (
+                x_rec * weights[None, None, :, :, :]
+            )
+            weights_map[:, :, i : i + ph, j : j + pw, k : k + pd] += weights[
+                None, None, :, :, :
+            ]
 
         # Normalize by weights
         weights_map = torch.clamp(weights_map, min=1e-8)
@@ -202,16 +232,17 @@ class PatchedVAE(nn.Module):
 
         return reconstruction.squeeze(0).squeeze(0)  # Remove batch and channel dims
 
-    def forward(self, x: torch.Tensor, encode_only: bool = False, 
-                batch_size: int = 1) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, encode_only: bool = False, batch_size: int = 1
+    ) -> Dict[str, torch.Tensor]:
         """
         Full encode-decode cycle on patched full-resolution volume.
-        
+
         Args:
             x: input volume (1, 1, H, W, D)
             encode_only: if True, return only latent encoding
             batch_size: batch size for patch processing
-        
+
         Returns:
             dict with 'latent' and optionally 'reconstruction'
         """
@@ -239,14 +270,16 @@ def create_patched_vae(
 ) -> PatchedVAE:
     """
     Factory function to create a PatchedVAE wrapper.
-    
+
     Args:
         vae: base VAE model
         vae_type: "aekl", "vqvae", or "medvae"
         patch_size: spatial patch dimensions
         overlap: overlap ratio for sliding window
-    
+
     Returns:
         PatchedVAE instance
     """
-    return PatchedVAE(vae, patch_size=patch_size, overlap=overlap, blend_mode="gaussian")
+    return PatchedVAE(
+        vae, patch_size=patch_size, overlap=overlap, blend_mode="gaussian"
+    )

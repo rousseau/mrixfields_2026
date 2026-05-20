@@ -532,7 +532,7 @@ class EMAVectorQuantizer(nn.Module):
 
         # 2) update sums of assigned vectors
         dw = encodings.t() @ flat  # (K, D)
-        self.ema_weight.mul_(self.decay).add_(dw, alpha=1.0 - self.decay)
+        self.ema_w.mul_(self.decay).add_(dw, alpha=1.0 - self.decay)
 
         # 3) Laplace smoothing
         n = self.ema_cluster_size.sum()
