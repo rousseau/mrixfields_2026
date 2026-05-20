@@ -439,7 +439,10 @@ def weighted_recon_loss(
 def ssim3d(
     x: torch.Tensor, y: torch.Tensor, window_size: int = 7, data_range: float = 2.0
 ) -> torch.Tensor:
-    """Differentiable 3D SSIM (mean over the volume)."""
+    """Differentiable 3D SSIM (mean over the volume).
+
+    Protégé contre la division par zéro (variance=0).
+    """
     C1 = (0.01 * data_range) ** 2
     C2 = (0.03 * data_range) ** 2
 
@@ -459,9 +462,9 @@ def ssim3d(
         sigma_x2 = F.conv2d(x2 * x2, k, padding=pad) - mu_x2
         sigma_y2 = F.conv2d(y2 * y2, k, padding=pad) - mu_y2
         sigma_xy = F.conv2d(x2 * y2, k, padding=pad) - mu_xy
-        ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / (
-            (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
-        )
+        # + eps prevents division by zero
+        denom = (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2) + 1e-8
+        ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / denom
         return ssim_map.mean()
 
     # 3D Gaussian kernel
@@ -478,9 +481,9 @@ def ssim3d(
     sigma_x2 = F.conv3d(x * x, k3, padding=pad) - mu_x2
     sigma_y2 = F.conv3d(y * y, k3, padding=pad) - mu_y2
     sigma_xy = F.conv3d(x * y, k3, padding=pad) - mu_xy
-    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / (
-        (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
-    )
+    # + 1e-8 prevents division by zero (variance = 0 → constant region)
+    denom = (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2) + 1e-8
+    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / denom
     return ssim_map.mean()
 
 
@@ -1192,6 +1195,17 @@ def train(args: argparse.Namespace) -> None:
                 continue
 
             scaler.scale(total).backward()
+            # Check gradients for NaN before clipping (critical with AMP)
+            has_nan = False
+            for p in model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    has_nan = True
+                    break
+            if has_nan:
+                print(f"  [WARN] step={step} NaN gradient detected — skipping step")
+                opt.zero_grad(set_to_none=True)
+                continue
+
             if args.grad_clip > 0:
                 scaler.unscale_(opt)
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -1312,7 +1326,12 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--use-amp", action="store_true")
-    p.add_argument("--gradient-checkpointing", action="store_true")
+    # gradient_checkpointing désactivé par défaut : incompatible avec AMP → NaN
+    p.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Activé seulement si AMP=off. Par défaut: désactivé (cause de NaN avec AMP).",
+    )
 
     return p.parse_args()
 
