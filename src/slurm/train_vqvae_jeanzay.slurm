@@ -102,15 +102,25 @@ _requeue_handler() {
 }
 trap '_requeue_handler' USR1
 
-# ─── Détection du dernier checkpoint pour reprise ────────────────────────────
+# ─── Détection du dernier checkpoint pour reprise ─────────────────────────────────
 WEIGHTS_DIR="${OUTPUT_DIR}/weights"
 RESUME_FLAG=""
 
 if [ -d "$WEIGHTS_DIR" ]; then
-    LAST_CKPT=""
-    if [ -f "${WEIGHTS_DIR}/model_final.pth" ]; then
+    # Priorité 1 : dernier checkpoint périodique vqvae_step_*.pth (le plus récent)
+    LAST_STEP_CKPT=$(ls -t "${WEIGHTS_DIR}"/vqvae_step_*.pth 2>/dev/null | head -1)
+    # Priorité 2 : model_final.pth
+    # Priorité 3 : model_best.pth
+    if [ -n "$LAST_STEP_CKPT" ]; then
+        LAST_CKPT="$LAST_STEP_CKPT"
+    elif [ -f "${WEIGHTS_DIR}/model_final.pth" ]; then
         LAST_CKPT="${WEIGHTS_DIR}/model_final.pth"
+    elif [ -f "${WEIGHTS_DIR}/model_best.pth" ]; then
+        LAST_CKPT="${WEIGHTS_DIR}/model_best.pth"
+    else
+        LAST_CKPT=""
     fi
+
     if [ -n "$LAST_CKPT" ]; then
         RESUME_FLAG="--resume $LAST_CKPT"
         echo "Reprise depuis  : $LAST_CKPT"

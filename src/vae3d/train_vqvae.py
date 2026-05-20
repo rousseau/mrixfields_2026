@@ -1089,6 +1089,41 @@ def train(args: argparse.Namespace) -> None:
     t0 = time.time()
     best_recon_loss = float("inf")
 
+    # ── Reprise depuis un checkpoint (─resume) ────────────────────────────────────
+    if args.resume and Path(args.resume).exists():
+        print(f"Chargement du checkpoint : {args.resume}")
+        ckpt_r = torch.load(args.resume, map_location=device, weights_only=False)
+
+        # Poids du modèle
+        missing, unexpected = model.load_state_dict(ckpt_r["model"], strict=False)
+        if missing:
+            print(f"  ⚠  {len(missing)} clé(s) manquante(s) dans le checkpoint")
+        if unexpected:
+            print(f"  ⚠  {len(unexpected)} clé(s) inattendue(s) dans le checkpoint")
+
+        # État de l'optimiseur
+        if "optimizer" in ckpt_r:
+            try:
+                opt.load_state_dict(ckpt_r["optimizer"])
+            except Exception as e:
+                print(f"  ⚠  Optimiseur non restauré (incompatibilité) : {e}")
+
+        # État de l'AMP scaler
+        if "scaler" in ckpt_r:
+            try:
+                scaler.load_state_dict(ckpt_r["scaler"])
+            except Exception as e:
+                print(f"  ⚠  Scaler non restauré : {e}")
+
+        # État de l'entraînement
+        step = int(ckpt_r.get("step", 0))
+        best_recon_loss = float(ckpt_r.get("best_recon_loss", float("inf")))
+        print(
+            f"  ✓ Reprise à partir du step {step}  (best_recon={best_recon_loss:.4f})"
+        )
+    elif args.resume:
+        print(f"  ⚠  Checkpoint introuvable ({args.resume}) — démarrage à zéro.")
+
     def _linear_ramp(
         step_id: int, start: int, ramp_steps: int, max_val: float
     ) -> float:
@@ -1241,14 +1276,27 @@ def train(args: argparse.Namespace) -> None:
                     "step": step,
                     "model": model.state_dict(),
                     "optimizer": opt.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "best_recon_loss": best_recon_loss,
                     "args": vars(args),
                 }
-                # model_best : basé sur la perte de reconstruction courante
+                # Checkpoint périodique nommé (pour reprise auto-requeue)
+                step_ckpt = weights_dir / f"vqvae_step_{step:06d}.pth"
+                torch.save(ckpt, step_ckpt)
+                print(f"  -> {step_ckpt.name}")
+
+                # model_best : meilleure reconstruction
                 if float(recon_loss.item()) < best_recon_loss:
                     best_recon_loss = float(recon_loss.item())
+                    ckpt["best_recon_loss"] = best_recon_loss
                     torch.save(ckpt, weights_dir / "model_best.pth")
                     print(f"  -> model_best.pth (recon={best_recon_loss:.4f})")
-                # Clean up after checkpoint save
+
+                # Nettoyage : ne garder que les 3 derniers checkpoints périodiques
+                step_ckpts = sorted(weights_dir.glob("vqvae_step_*.pth"))
+                for old in step_ckpts[:-3]:
+                    old.unlink(missing_ok=True)
+
                 gc.collect()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
@@ -1331,6 +1379,12 @@ def parse_args() -> argparse.Namespace:
         "--gradient-checkpointing",
         action="store_true",
         help="Activé seulement si AMP=off. Par défaut: désactivé (cause de NaN avec AMP).",
+    )
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Chemin vers un checkpoint .pth pour reprendre l'entraînement.",
     )
 
     return p.parse_args()
