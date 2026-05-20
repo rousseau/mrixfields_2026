@@ -49,6 +49,9 @@ set -e
 RUN_NAME="${1:-vqvae3d_hybrid}"
 MODALITIES="${2:-T1W T2W T2FLAIR}"
 FIELDS="${3:-0.1T 1.5T 3T 5T 7T}"
+# FORCE_RESTART=1 : ignore les checkpoints existants et repart de zéro.
+# Usage : sbatch train_vqvae_jeanzay.slurm vqvae_full "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T" 1
+FORCE_RESTART="${4:-0}"
 
 CODE_DIR="$WORK/MRIX/mrixfields_2026"
 DATA_ROOT="$WORK/MRIX/data"
@@ -106,7 +109,9 @@ trap '_requeue_handler' USR1
 WEIGHTS_DIR="${OUTPUT_DIR}/weights"
 RESUME_FLAG=""
 
-if [ -d "$WEIGHTS_DIR" ]; then
+if [ "$FORCE_RESTART" = "1" ]; then
+    echo "FORCE_RESTART=1 : démarrage à zéro (checkpoints ignorés)"
+elif [ -d "$WEIGHTS_DIR" ]; then
     # Priorité 1 : dernier checkpoint périodique vqvae_step_*.pth (le plus récent)
     LAST_STEP_CKPT=$(ls -t "${WEIGHTS_DIR}"/vqvae_step_*.pth 2>/dev/null | head -1)
     # Priorité 2 : model_final.pth

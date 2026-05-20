@@ -1089,7 +1089,7 @@ def train(args: argparse.Namespace) -> None:
     t0 = time.time()
     best_recon_loss = float("inf")
 
-    # ── Reprise depuis un checkpoint (─resume) ────────────────────────────────────
+    # ── Reprise depuis un checkpoint (--resume) ───────────────────────────────────
     if args.resume and Path(args.resume).exists():
         print(f"Chargement du checkpoint : {args.resume}")
         ckpt_r = torch.load(args.resume, map_location=device, weights_only=False)
@@ -1101,26 +1101,56 @@ def train(args: argparse.Namespace) -> None:
         if unexpected:
             print(f"  ⚠  {len(unexpected)} clé(s) inattendue(s) dans le checkpoint")
 
-        # État de l'optimiseur
-        if "optimizer" in ckpt_r:
-            try:
-                opt.load_state_dict(ckpt_r["optimizer"])
-            except Exception as e:
-                print(f"  ⚠  Optimiseur non restauré (incompatibilité) : {e}")
+        # Vérification que les poids ne sont pas NaN/Inf (checkpoint corrompu)
+        n_bad = sum(1 for p in model.parameters() if not torch.isfinite(p.data).all())
+        if n_bad > 0:
+            print(
+                f"  ✗ Checkpoint corrompu : {n_bad} paramètre(s) non-finis (NaN/Inf) détectés."
+            )
+            print(f"    Le checkpoint est inutilisable — démarrage à zéro.")
+            model.apply(
+                lambda m: (
+                    m.reset_parameters() if hasattr(m, "reset_parameters") else None
+                )
+            )
+            # Ne pas restaurer step ni best_recon_loss
+        else:
+            # État de l'optimiseur
+            if "optimizer" in ckpt_r:
+                try:
+                    opt.load_state_dict(ckpt_r["optimizer"])
+                except Exception as e:
+                    print(f"  ⚠  Optimiseur non restauré (incompatibilité) : {e}")
 
-        # État de l'AMP scaler
-        if "scaler" in ckpt_r:
-            try:
-                scaler.load_state_dict(ckpt_r["scaler"])
-            except Exception as e:
-                print(f"  ⚠  Scaler non restauré : {e}")
+            # État de l'AMP scaler
+            if "scaler" in ckpt_r:
+                try:
+                    scaler.load_state_dict(ckpt_r["scaler"])
+                except Exception as e:
+                    print(f"  ⚠  Scaler non restauré : {e}")
 
-        # État de l'entraînement
-        step = int(ckpt_r.get("step", 0))
-        best_recon_loss = float(ckpt_r.get("best_recon_loss", float("inf")))
-        print(
-            f"  ✓ Reprise à partir du step {step}  (best_recon={best_recon_loss:.4f})"
-        )
+            # État de l'entraînement
+            ckpt_step = int(ckpt_r.get("step", 0))
+            best_recon_loss = float(ckpt_r.get("best_recon_loss", float("inf")))
+
+            # Sécurité : si le checkpoint a déjà atteint le nombre de steps cible
+            # (ex : run NaN qui a loopé jusqu'à steps=20000 sans rien apprendre),
+            # on repart de zéro avec les poids tels quels.
+            if ckpt_step >= args.steps:
+                print(
+                    f"  ⚠  Le checkpoint indique step={ckpt_step} >= steps={args.steps}."
+                )
+                print(
+                    f"    Le training était peut-être corrompu. Démarrage à zéro (poids conservés)."
+                )
+                step = 0
+                best_recon_loss = float("inf")
+            else:
+                step = ckpt_step
+                print(
+                    f"  ✓ Reprise à partir du step {step}  (best_recon={best_recon_loss:.4f})"
+                )
+
     elif args.resume:
         print(f"  ⚠  Checkpoint introuvable ({args.resume}) — démarrage à zéro.")
 
