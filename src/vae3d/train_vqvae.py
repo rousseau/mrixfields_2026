@@ -1259,23 +1259,25 @@ def train(args: argparse.Namespace) -> None:
                 opt.zero_grad(set_to_none=True)
                 continue
 
+            # IMPORTANT (AMP): do not manually skip on NaN/Inf gradients before scaler.step(),
+            # otherwise GradScaler can never downscale and training gets stuck forever.
+            prev_scale = scaler.get_scale() if use_amp else 1.0
             scaler.scale(total).backward()
-            # Check gradients for NaN before clipping (critical with AMP)
-            has_nan = False
-            for p in model.parameters():
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    has_nan = True
-                    break
-            if has_nan:
-                print(f"  [WARN] step={step} NaN gradient detected — skipping step")
-                opt.zero_grad(set_to_none=True)
-                continue
 
             if args.grad_clip > 0:
                 scaler.unscale_(opt)
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(opt)
-            scaler.update()
+
+            scaler.step(opt)  # skipped automatically by GradScaler on overflow
+            scaler.update()  # scale is reduced on overflow
+
+            if use_amp:
+                new_scale = scaler.get_scale()
+                if new_scale < prev_scale:
+                    print(
+                        f"  [AMP] step={step} overflow détecté (scale {prev_scale:.0f} -> {new_scale:.0f}), "
+                        "optimizer step ignoré automatiquement."
+                    )
 
             # Periodic memory cleanup to prevent CUDA OOM during long training runs
             if step % 50 == 0:
