@@ -1301,16 +1301,16 @@ def train(args: argparse.Namespace) -> None:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
+    final_ckpt = {
+        "step": step,
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "scaler": scaler.state_dict(),
+        "best_recon_loss": best_recon_loss,
+        "args": vars(args),
+    }
     final_path = weights_dir / "model_final.pth"
-    torch.save(
-        {
-            "step": step,
-            "model": model.state_dict(),
-            "optimizer": opt.state_dict(),
-            "args": vars(args),
-        },
-        final_path,
-    )
+    torch.save(final_ckpt, final_path)
     print(f"Training terminé. Modèle final: {final_path}")
 
 
