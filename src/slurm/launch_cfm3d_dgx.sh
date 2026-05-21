@@ -6,7 +6,7 @@
 #   bash src/launch_cfm3d_dgx.sh <PHASE> <MODALITY> [N_GPUS] [CONFIG_OVERRIDE]
 #
 # Arguments :
-#   PHASE    : vae | cfm
+#   PHASE    : vae | cfm | mmfm
 #   MODALITY : T1W  (pour l'instant)
 #   N_GPUS   : nombre de GPUs à utiliser (défaut : auto-détecté)
 #   CONFIG   : chemin alternatif vers un config YAML (optionnel)
@@ -17,6 +17,7 @@
 #   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4                                            # medvae finetuned (défaut)
 #   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4 configs/cfm3d_T1W_medvae_0p1T_7T.yaml     # bidomaine 0.1T↔7T
 #   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4 configs/cfm3d_T1W_medvae_finetuned.yaml   # 5 domaines (défaut)
+#   bash src/slurm/launch_cfm3d_dgx.sh mmfm T1W 4 configs/mmfm3d_medvae_multimodal.yaml     # MMFM v1 vectorisé
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -44,8 +45,11 @@ if [[ "$PHASE" == "vae" ]]; then
 elif [[ "$PHASE" == "cfm" ]]; then
     CONFIG="${CONFIG_OVERRIDE:-configs/cfm3d_T1W_medvae_finetuned.yaml}"
     SCRIPT="src/cfm/train_cfm_3d.py"
+elif [[ "$PHASE" == "mmfm" ]]; then
+    CONFIG="${CONFIG_OVERRIDE:-configs/mmfm3d_medvae_multimodal.yaml}"
+    SCRIPT="src/cfm/train_mmfm_3d.py"
 else
-    echo "ERREUR : PHASE doit être 'vae' ou 'cfm' (reçu : '$PHASE')" >&2
+    echo "ERREUR : PHASE doit être 'vae', 'cfm' ou 'mmfm' (reçu : '$PHASE')" >&2
     exit 1
 fi
 

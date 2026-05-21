@@ -1,6 +1,6 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Script SLURM — Entraînement VAE 3D + OT-CFM 3D sur Jean Zay (H100 SXM5 80GB)
+# Script SLURM — Entraînement VAE 3D + CFM/MMFM sur Jean Zay (H100 SXM5 80GB)
 #
 # Partition gpu_p6 : H100 SXM5 80GB, 4 GPUs/nœud
 # QOS : qos_gpu_h100-t4 (100h max)
@@ -13,6 +13,9 @@
 #   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae_finetuned.yaml
 #   # Variante bidomaine 0.1T↔7T uniquement :
 #   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae_0p1T_7T.yaml
+#
+#   # Baseline MMFM v1 vectorisée sur latent MedVAE aplati
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm T1W configs/mmfm3d_medvae_multimodal.yaml
 #
 # Prérequis (via setup_jeanzay.sh) :
 #   $WORK/MRIX/mrixfields_2026/   ← ce repo
@@ -149,8 +152,15 @@ elif [ "$PHASE" = "cfm" ]; then
     else
         CONFIG="configs/cfm3d_T1W_medvae_finetuned.yaml"
     fi
+elif [ "$PHASE" = "mmfm" ]; then
+    SCRIPT="src/cfm/train_mmfm_3d.py"
+    if [ -n "$CONFIG_ARG" ]; then
+        CONFIG="$CONFIG_ARG"
+    else
+        CONFIG="configs/mmfm3d_medvae_multimodal.yaml"
+    fi
 else
-    echo "[ERREUR] Phase inconnue : '$PHASE'. Utiliser 'vae' ou 'cfm'."
+    echo "[ERREUR] Phase inconnue : '$PHASE'. Utiliser 'vae', 'cfm' ou 'mmfm'."
     exit 1
 fi
 
@@ -189,7 +199,7 @@ fi
 
 echo "Output dir     : $WEIGHTS_DIR"
 echo "Env            : jeanzay"
-echo "Config CFM     : $CONFIG"
+echo "Config CFM/MMFM: $CONFIG"
 
 # Optimisation DataLoader : 16 workers/GPU × 4 GPUs = 64 CPUs utilisés
 export DATALOADER_NUM_WORKERS=16
