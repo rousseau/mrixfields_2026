@@ -1025,7 +1025,11 @@ def train(args: argparse.Namespace) -> None:
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     use_amp = args.use_amp and device.type == "cuda"
-    amp_dtype = torch.float16
+    if args.amp_dtype == "bf16":
+        amp_dtype = torch.bfloat16
+    else:
+        amp_dtype = torch.float16
+    use_scaler = use_amp and amp_dtype == torch.float16
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1078,9 +1082,10 @@ def train(args: argparse.Namespace) -> None:
     opt = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     print(f"Device: {device} | AMP: {use_amp}")
+    print(f"AMP dtype: {str(amp_dtype).replace('torch.', '')}")
     print(f"Grad checkpointing: {args.gradient_checkpointing}")
     print(f"Batch size: {args.batch_size} | Steps: {args.steps}")
     print(f"Output: {out_dir}")
@@ -1259,25 +1264,29 @@ def train(args: argparse.Namespace) -> None:
                 opt.zero_grad(set_to_none=True)
                 continue
 
-            # IMPORTANT (AMP): do not manually skip on NaN/Inf gradients before scaler.step(),
-            # otherwise GradScaler can never downscale and training gets stuck forever.
-            prev_scale = scaler.get_scale() if use_amp else 1.0
-            scaler.scale(total).backward()
+            # GradScaler is required for fp16, but not for bf16.
+            if use_scaler:
+                prev_scale = scaler.get_scale()
+                scaler.scale(total).backward()
 
-            if args.grad_clip > 0:
-                scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if args.grad_clip > 0:
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-            scaler.step(opt)  # skipped automatically by GradScaler on overflow
-            scaler.update()  # scale is reduced on overflow
+                scaler.step(opt)  # skipped automatically by GradScaler on overflow
+                scaler.update()
 
-            if use_amp:
                 new_scale = scaler.get_scale()
                 if new_scale < prev_scale:
                     print(
-                        f"  [AMP] step={step} overflow détecté (scale {prev_scale:.0f} -> {new_scale:.0f}), "
-                        "optimizer step ignoré automatiquement."
+                        f"  [AMP-fp16] step={step} overflow détecté "
+                        f"(scale {prev_scale:.1f} -> {new_scale:.1f}), optimizer step ignoré automatiquement."
                     )
+            else:
+                total.backward()
+                if args.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                opt.step()
 
             # Periodic memory cleanup to prevent CUDA OOM during long training runs
             if step % 50 == 0:
@@ -1406,6 +1415,13 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--use-amp", action="store_true")
+    p.add_argument(
+        "--amp-dtype",
+        type=str,
+        choices=["fp16", "bf16"],
+        default="bf16",
+        help="AMP dtype. Sur H100, bf16 est recommandé pour la stabilité.",
+    )
     # gradient_checkpointing désactivé par défaut : incompatible avec AMP → NaN
     p.add_argument(
         "--gradient-checkpointing",

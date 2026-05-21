@@ -52,6 +52,8 @@ FIELDS="${3:-0.1T 1.5T 3T 5T 7T}"
 # FORCE_RESTART=1 : ignore les checkpoints existants et repart de zéro.
 # Usage : sbatch train_vqvae_jeanzay.slurm vqvae_full "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T" 1
 FORCE_RESTART="${4:-0}"
+AMP_DTYPE="${AMP_DTYPE:-bf16}"
+GRAD_CHECKPOINTING="${GRAD_CHECKPOINTING:-1}"
 
 CODE_DIR="$WORK/MRIX/mrixfields_2026"
 DATA_ROOT="$WORK/MRIX/data"
@@ -67,6 +69,8 @@ echo " Modalités : $MODALITIES"
 echo " Champs    : $FIELDS"
 echo " Data      : $DATA_ROOT"
 echo " Output    : $OUTPUT_DIR"
+echo " AMP dtype : $AMP_DTYPE"
+echo " Grad ckpt : $GRAD_CHECKPOINTING"
 echo "======================================================================="
 
 # ─── Modules Jean Zay ────────────────────────────────────────────────────────
@@ -143,6 +147,11 @@ echo "======================================================================="
 echo " Démarrage python (1 GPU H100)"
 echo "======================================================================="
 
+GC_FLAG=""
+if [ "$GRAD_CHECKPOINTING" = "1" ]; then
+    GC_FLAG="--gradient-checkpointing"
+fi
+
 python3 src/vae3d/train_vqvae.py \
     --data-root  "$DATA_ROOT" \
     --splits     retro_train \
@@ -152,8 +161,9 @@ python3 src/vae3d/train_vqvae.py \
     --num-workers 16 \
     --steps      20000 \
     --channel-multipliers 1 2 4 4 \
-    --gradient-checkpointing \
+    $GC_FLAG \
     --use-amp \
+    --amp-dtype "$AMP_DTYPE" \
     --output-dir "$OUTPUT_DIR" \
     $RESUME_FLAG
 
