@@ -72,7 +72,7 @@ Les fichiers `configs/env/*.yaml` définissent les chemins spécifiques à chaqu
 
 ## Étapes de développement
 
-Le projet est structuré en **3 étapes séquentielles**. Chaque étape produit des résultats évalués avec le **même script d'évaluation unifié**, permettant une comparaison directe entre méthodes.
+Le projet est structuré en **4 étapes séquentielles**. Chaque étape produit des résultats évalués avec le **même script d'évaluation unifié**, permettant une comparaison directe entre méthodes.
 
 ### Étape 1 — Baseline StarGAN 2D *(référence)*
 
@@ -142,7 +142,7 @@ python src/vae3d/benchmark_vae.py --modality T1W --field 0.1T
 
 # Jean Zay
 sbatch src/slurm/train_vae_jeanzay.slurm aekl vae3d_T1W
-sbatch src/slurm/train_vqvae_jeanzay.slurm vqvae3d_T1W
+sbatch src/slurm/train_vqvae_jeanzay.slurm vqvae3d_hybrid "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T" 0 4
 sbatch src/slurm/benchmark_vae_jeanzay.slurm T1W 0.1T
 ```
 
@@ -150,14 +150,14 @@ sbatch src/slurm/benchmark_vae_jeanzay.slurm T1W 0.1T
 
 ---
 
-### Étape 3 — Comparaison CFM dans l’espace latent *(translation)*
+### Étape 3 — OT-CFM dans l’espace latent *(translation, meilleur VAE)*
 
-**Objectif** : Comparer différentes approches de Conditional Flow Matching (CFM) dans l’espace latent du VAE sélectionné à l’étape 2.
+**Objectif** : Comparer différentes approches de Conditional Flow Matching (OT-CFM / CFM) dans l’espace latent du meilleur VAE sélectionné à l’étape 2. **À ce stade, le meilleur VAE est MedVAE**.
 
 | Approche | Config | VAE latent |
 |----------|--------|-----------|
 | **OT-CFM 3D + AEKL** | `cfm3d_T1W_aekl.yaml` | 4 canaux (MONAI AutoencoderKL) |
-| **OT-CFM 3D + MedVAE** | `cfm3d_T1W_medvae.yaml` | 4 canaux (StanfordMIMI, frozen ou fine-tuné) |
+| **OT-CFM 3D + MedVAE** | `cfm3d_T1W_medvae.yaml` | VAE retenu à ce stade (frozen ou fine-tuné) |
 | **OT-CFM 3D + VQ-VAE** | `cfm3d_T1W_vqvae.yaml` | 64 canaux anatomiques z_q (NeuroQuant) |
 | **Variants** | options YAML | `exact` vs `sinkhorn` OT, Euler vs DoPri5 |
 
@@ -182,7 +182,39 @@ sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae.yaml
 sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_vqvae.yaml
 ```
 
-**État** : CFM 3D ⏳ — les 3 variantes VAE sont prêtes à lancer.
+**État** : CFM 3D ⏳ — la baseline cible est MedVAE, les autres variantes restent comparatives.
+
+---
+
+### Étape 4 — MedVAE vectorisé + MMFM *(baseline)*
+
+**Objectif** : Construire une baseline MMFM fidèle au papier / code original, en gardant MedVAE inchangé comme encodeur/décodeur et en vectorisant son latent avant le modèle de flow.
+
+**Principe** :
+- volume 3D -> latent MedVAE
+- flatten du latent en vecteur
+- MMFM vectoriel sur le latent aplati
+- unflatten avant décodage MedVAE
+
+| Fichier | Rôle |
+|---------|------|
+| `src/cfm/mmfm_vectorized.py` | Briques vectorielles: flatten/unflatten, embeddings temps/classe, MLP résiduel |
+| `src/cfm/train_mmfm_3d.py` | Entraînement MMFM v1 vectorisé sur latent MedVAE |
+| `src/cfm/test_mmfm_v1_smoke.py` | Smoke test de la vectorisation et du champ vectoriel |
+| `configs/mmfm3d_medvae_multimodal.yaml` | Config baseline MMFM v1 |
+| `docs/MMFM_V1_VECTORIZED.md` | Documentation détaillée de la baseline et des shapes |
+| `src/slurm/cfm_3d_jeanzay.slurm` | Job SLURM Jean Zay (phase `mmfm`) |
+| `src/slurm/launch_cfm3d_dgx.sh` | Lancement multi-GPU local (phase `mmfm`) |
+
+```bash
+# Local
+PYTHONPATH=src python src/cfm/train_mmfm_3d.py --config configs/mmfm3d_medvae_multimodal.yaml --env local
+
+# Jean Zay
+sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm T1W configs/mmfm3d_medvae_multimodal.yaml
+```
+
+**État** : ✅ Baseline v1 implémentée, documentée et smoke-testée.
 ---
 
 ## Évaluation unifiée
@@ -386,9 +418,10 @@ mrixfields_2026/
 | 2 | MedVAE frozen | ⏳ À évaluer | poids HuggingFace |
 | 2 | MedVAE fine-tuné | ⏳ À lancer | — |
 | 2 | Benchmark VAE | ✅ Partiel | `results/benchmark_comparison/` (3T max) |
-| 3 | OT-CFM 3D + AEKL (T1W) | ⏳ À lancer | `cfm3d_T1W_aekl/weights/` |
 | 3 | OT-CFM 3D + MedVAE (T1W) | ⏳ À lancer | `cfm3d_T1W_medvae/weights/` |
-| 3 | OT-CFM 3D + VQ-VAE (T1W) | ⏳ À lancer | `cfm3d_T1W_vqvae/weights/` |
+| 3 | OT-CFM 3D + AEKL (T1W) | ⏳ Comparatif | `cfm3d_T1W_aekl/weights/` |
+| 3 | OT-CFM 3D + VQ-VAE (T1W) | ⏳ Comparatif | `cfm3d_T1W_vqvae/weights/` |
+| 4 | MedVAE vectorisé + MMFM | ✅ Baseline v1 | `cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1/weights/` |
 | — | Script évaluation unifié | ⏳ À créer | `src/evaluation/evaluate.py` |
 | — | Tableau métriques | ⏳ À initialiser | `results/evaluation_table.csv` |
 | — | Paper | ⬜ Vide | `paper/` |

@@ -19,6 +19,7 @@ Ce script est volontairement autonome pour tester l'approche avant intégration 
 
 import argparse
 import gc
+import os
 import random
 import re
 import time
@@ -29,12 +30,15 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import nibabel as nib
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from scipy.ndimage import zoom as scipy_zoom
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 MODALITIES = ["T1W", "T2W", "T2FLAIR"]
 FIELDS = ["0.1T", "1.5T", "3T", "5T", "7T"]
@@ -986,6 +990,7 @@ class NeuroQuantHybrid(nn.Module):
         x_src: torch.Tensor,
         src_mod: torch.Tensor,
         src_field: torch.Tensor,
+        adv_alpha: Optional[float] = None,
         depth_mode: str = "3d",
     ) -> Dict[str, torch.Tensor]:
         z_anat, z_mod = self.encoder(x_src, depth_mode)
@@ -995,7 +1000,8 @@ class NeuroQuantHybrid(nn.Module):
         recon = self.decoder(z_anat_q, film_params, depth_mode)
 
         mod_logits = None
-        mod_logits = self.adversary(z_anat, alpha=self.adv_alpha)
+        alpha = self.adv_alpha if adv_alpha is None else float(adv_alpha)
+        mod_logits = self.adversary(z_anat, alpha=alpha)
 
         return {
             "z_anat": z_anat,
@@ -1016,14 +1022,52 @@ def _to_device(
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
-def train(args: argparse.Namespace) -> None:
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+def _setup_distributed() -> Tuple[bool, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    use_dist = world_size > 1
+    if use_dist and not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+    return use_dist, world_size, rank, local_rank
 
-    device = torch.device(
-        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+
+def _sync_quantizer_buffers(model: NeuroQuantHybrid, world_size: int) -> None:
+    """Average EMA codebook buffers across ranks to keep VQ state consistent."""
+    q = model.quantizer
+    for name in ["embedding", "ema_cluster_size", "ema_w"]:
+        buf = getattr(q, name)
+        if not torch.is_floating_point(buf):
+            continue
+        dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+        buf.div_(float(world_size))
+
+    # initialized is a scalar bool tensor; use max to propagate True to all ranks.
+    init_i32 = q.initialized.to(dtype=torch.int32)
+    dist.all_reduce(init_i32, op=dist.ReduceOp.MAX)
+    q.initialized.copy_(init_i32.bool())
+
+
+def train(args: argparse.Namespace) -> None:
+    use_dist, world_size, rank, local_rank = _setup_distributed()
+
+    seed = args.seed + rank
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}" if use_dist else "cuda")
+    else:
+        device = torch.device("cpu")
+
+    if use_dist and device.type != "cuda":
+        raise RuntimeError("DDP requires CUDA devices on Jean Zay.")
+    if use_dist:
+        torch.cuda.set_device(local_rank)
+
     use_amp = args.use_amp and device.type == "cuda"
     if args.amp_dtype == "bf16":
         amp_dtype = torch.bfloat16
@@ -1049,10 +1093,17 @@ def train(args: argparse.Namespace) -> None:
         max_samples=args.max_samples,
     )
 
+    sampler = (
+        DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True)
+        if use_dist
+        else None
+    )
+
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         drop_last=True,
@@ -1075,45 +1126,65 @@ def train(args: argparse.Namespace) -> None:
         num_heads=8,
         adv_alpha=1.0,
     ).to(device)
+    raw_model = model
+
+    if use_dist:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+            broadcast_buffers=False,
+        )
 
     if args.gradient_checkpointing:
-        model.enable_gradient_checkpointing()
+        raw_model.enable_gradient_checkpointing()
 
     opt = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
-    print(f"Device: {device} | AMP: {use_amp}")
-    print(f"AMP dtype: {str(amp_dtype).replace('torch.', '')}")
-    print(f"Grad checkpointing: {args.gradient_checkpointing}")
-    print(f"Batch size: {args.batch_size} | Steps: {args.steps}")
-    print(f"Output: {out_dir}")
+    is_main = rank == 0
+    if is_main:
+        print(
+            f"Device: {device} | AMP: {use_amp} | DDP: {use_dist} "
+            f"(world_size={world_size})"
+        )
+        print(f"AMP dtype: {str(amp_dtype).replace('torch.', '')}")
+        print(f"Grad checkpointing: {args.gradient_checkpointing}")
+        print(f"Batch size/GPU: {args.batch_size} | Global: {args.batch_size * world_size}")
+        print(f"Steps: {args.steps}")
+        print(f"Output: {out_dir}")
 
     step = 0
     t0 = time.time()
     best_recon_loss = float("inf")
+    consecutive_nonfinite = 0
 
     # ── Reprise depuis un checkpoint (--resume) ───────────────────────────────────
     if args.resume and Path(args.resume).exists():
-        print(f"Chargement du checkpoint : {args.resume}")
+        if is_main:
+            print(f"Chargement du checkpoint : {args.resume}")
         ckpt_r = torch.load(args.resume, map_location=device, weights_only=False)
 
         # Poids du modèle
-        missing, unexpected = model.load_state_dict(ckpt_r["model"], strict=False)
-        if missing:
-            print(f"  ⚠  {len(missing)} clé(s) manquante(s) dans le checkpoint")
-        if unexpected:
-            print(f"  ⚠  {len(unexpected)} clé(s) inattendue(s) dans le checkpoint")
+        missing, unexpected = raw_model.load_state_dict(ckpt_r["model"], strict=False)
+        if is_main:
+            if missing:
+                print(f"  ⚠  {len(missing)} clé(s) manquante(s) dans le checkpoint")
+            if unexpected:
+                print(f"  ⚠  {len(unexpected)} clé(s) inattendue(s) dans le checkpoint")
 
         # Vérification que les poids ne sont pas NaN/Inf (checkpoint corrompu)
         n_bad = sum(1 for p in model.parameters() if not torch.isfinite(p.data).all())
         if n_bad > 0:
-            print(
-                f"  ✗ Checkpoint corrompu : {n_bad} paramètre(s) non-finis (NaN/Inf) détectés."
-            )
-            print(f"    Le checkpoint est inutilisable — démarrage à zéro.")
-            model.apply(
+            if is_main:
+                print(
+                    f"  ✗ Checkpoint corrompu : {n_bad} paramètre(s) non-finis (NaN/Inf) détectés."
+                )
+                print("    Le checkpoint est inutilisable — démarrage à zéro.")
+            raw_model.apply(
                 lambda m: (
                     m.reset_parameters() if hasattr(m, "reset_parameters") else None
                 )
@@ -1125,14 +1196,16 @@ def train(args: argparse.Namespace) -> None:
                 try:
                     opt.load_state_dict(ckpt_r["optimizer"])
                 except Exception as e:
-                    print(f"  ⚠  Optimiseur non restauré (incompatibilité) : {e}")
+                    if is_main:
+                        print(f"  ⚠  Optimiseur non restauré (incompatibilité) : {e}")
 
             # État de l'AMP scaler
             if "scaler" in ckpt_r:
                 try:
                     scaler.load_state_dict(ckpt_r["scaler"])
                 except Exception as e:
-                    print(f"  ⚠  Scaler non restauré : {e}")
+                    if is_main:
+                        print(f"  ⚠  Scaler non restauré : {e}")
 
             # État de l'entraînement
             ckpt_step = int(ckpt_r.get("step", 0))
@@ -1142,22 +1215,28 @@ def train(args: argparse.Namespace) -> None:
             # (ex : run NaN qui a loopé jusqu'à steps=20000 sans rien apprendre),
             # on repart de zéro avec les poids tels quels.
             if ckpt_step >= args.steps:
-                print(
-                    f"  ⚠  Le checkpoint indique step={ckpt_step} >= steps={args.steps}."
-                )
-                print(
-                    f"    Le training était peut-être corrompu. Démarrage à zéro (poids conservés)."
-                )
+                if is_main:
+                    print(
+                        f"  ⚠  Le checkpoint indique step={ckpt_step} >= steps={args.steps}."
+                    )
+                    print(
+                        "    Le training était peut-être corrompu. Démarrage à zéro (poids conservés)."
+                    )
                 step = 0
                 best_recon_loss = float("inf")
             else:
                 step = ckpt_step
-                print(
-                    f"  ✓ Reprise à partir du step {step}  (best_recon={best_recon_loss:.4f})"
-                )
+                if is_main:
+                    print(
+                        f"  ✓ Reprise à partir du step {step}  (best_recon={best_recon_loss:.4f})"
+                    )
 
     elif args.resume:
-        print(f"  ⚠  Checkpoint introuvable ({args.resume}) — démarrage à zéro.")
+        if is_main:
+            print(f"  ⚠  Checkpoint introuvable ({args.resume}) — démarrage à zéro.")
+
+    if use_dist:
+        dist.barrier()
 
     def _linear_ramp(
         step_id: int, start: int, ramp_steps: int, max_val: float
@@ -1177,7 +1256,12 @@ def train(args: argparse.Namespace) -> None:
         p = min(1.0, (step_id - start) / max(1, total_steps - start))
         return float(max_alpha * (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0))
 
+    epoch = 0
     while step < args.steps:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+            epoch += 1
+
         for batch in loader:
             if step >= args.steps:
                 break
@@ -1206,7 +1290,12 @@ def train(args: argparse.Namespace) -> None:
             )
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                out_src = model.forward_src(x_src, src_mod, src_field)
+                out_src = raw_model.forward_src(
+                    x_src,
+                    src_mod,
+                    src_field,
+                    adv_alpha=grl_lambda,
+                )
                 x_rec = out_src["x_rec"]
 
                 # SSIM3D + foreground weighting (NeuroQuant)
@@ -1229,15 +1318,15 @@ def train(args: argparse.Namespace) -> None:
                 if paired_mask.any():
                     # Get z_mod for target modality
                     with torch.no_grad():
-                        _, z_mod_all_tgt = model.encoder(x_tgt[paired_mask])
+                        _, z_mod_all_tgt = raw_model.encoder(x_tgt[paired_mask])
 
                     # Compute FiLM params for target modality
-                    film_params_tgt = model.compute_film(
+                    film_params_tgt = raw_model.compute_film(
                         z_mod_all_tgt, tgt_mod[paired_mask]
                     )
 
                     # Reconstruct with z_q_src + film_params_tgt
-                    x_cross = model.decoder(
+                    x_cross = raw_model.decoder(
                         out_src["z_q"][paired_mask], film_params_tgt
                     )
                     cross_loss = F.l1_loss(x_cross, x_tgt[paired_mask])
@@ -1251,18 +1340,28 @@ def train(args: argparse.Namespace) -> None:
                     + cross_w * cross_loss
                 )
 
-            if not torch.isfinite(total):
-                print(
-                    f"[WARN] step={step} non-finite loss detected "
-                    f"(total={float(total.detach().cpu().item())}, "
-                    f"recon={float(recon_loss.detach().cpu().item())}, "
-                    f"vq={float(vq_loss.detach().cpu().item())}, "
-                    f"adv={float(adv_loss.detach().cpu().item())}, "
-                    f"cross={float(cross_loss.detach().cpu().item())}). "
-                    "Skipping optimizer step."
-                )
+            finite_tensor = torch.isfinite(total).to(dtype=torch.int32)
+            if use_dist:
+                dist.all_reduce(finite_tensor, op=dist.ReduceOp.MIN)
+            all_finite = bool(finite_tensor.item())
+
+            if not all_finite:
+                consecutive_nonfinite += 1
+                if is_main:
+                    print(
+                        f"[WARN] step={step} non-finite loss detected "
+                        "on at least one rank. Skipping optimizer step."
+                    )
+                if consecutive_nonfinite >= args.max_consecutive_nonfinite:
+                    raise RuntimeError(
+                        "Too many consecutive non-finite steps "
+                        f"({consecutive_nonfinite} >= {args.max_consecutive_nonfinite}). "
+                        "Stopping early to avoid wasting compute; resume from last healthy checkpoint."
+                    )
                 opt.zero_grad(set_to_none=True)
                 continue
+
+            consecutive_nonfinite = 0
 
             # GradScaler is required for fp16, but not for bf16.
             if use_scaler:
@@ -1271,7 +1370,7 @@ def train(args: argparse.Namespace) -> None:
 
                 if args.grad_clip > 0:
                     scaler.unscale_(opt)
-                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
 
                 scaler.step(opt)  # skipped automatically by GradScaler on overflow
                 scaler.update()
@@ -1285,8 +1384,11 @@ def train(args: argparse.Namespace) -> None:
             else:
                 total.backward()
                 if args.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
                 opt.step()
+
+            if use_dist:
+                _sync_quantizer_buffers(raw_model, world_size)
 
             # Periodic memory cleanup to prevent CUDA OOM during long training runs
             if step % 50 == 0:
@@ -1294,28 +1396,46 @@ def train(args: argparse.Namespace) -> None:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
-            if step % args.print_every == 0 or step == 1:
+            metric_tensor = torch.stack(
+                [
+                    total.detach(),
+                    recon_loss.detach(),
+                    vq_loss.detach(),
+                    adv_loss.detach(),
+                    cross_loss.detach(),
+                    is_paired.mean().detach(),
+                    out_src["perplexity"].detach(),
+                ]
+            ).float()
+            if use_dist:
+                dist.all_reduce(metric_tensor, op=dist.ReduceOp.SUM)
+                metric_tensor /= float(world_size)
+
+            total_m, recon_m, vq_m, adv_m, cross_m, paired_ratio_m, ppl_m = (
+                metric_tensor.tolist()
+            )
+
+            if (step % args.print_every == 0 or step == 1) and is_main:
                 elapsed = time.time() - t0
-                paired_ratio = float(is_paired.mean().item())
                 print(
                     f"[{step:5d}/{args.steps}] "
-                    f"loss={float(total.item()):.4f} "
-                    f"recon={float(recon_loss.item()):.4f} "
-                    f"vq={float(vq_loss.item()):.4f} "
-                    f"adv={float(adv_loss.item()):.4f} "
-                    f"cross={float(cross_loss.item()):.4f} "
+                    f"loss={total_m:.4f} "
+                    f"recon={recon_m:.4f} "
+                    f"vq={vq_m:.4f} "
+                    f"adv={adv_m:.4f} "
+                    f"cross={cross_m:.4f} "
                     f"w_adv={adv_w:.4f} "
                     f"w_cross={cross_w:.4f} "
                     f"grl={grl_lambda:.3f} "
-                    f"paired={paired_ratio:.2f} "
-                    f"ppl={float(out_src['perplexity'].item()):.1f} "
+                    f"paired={paired_ratio_m:.2f} "
+                    f"ppl={ppl_m:.1f} "
                     f"t={elapsed / 60:.1f}min"
                 )
 
-            if step % args.save_every == 0 or step == args.steps:
+            if (step % args.save_every == 0 or step == args.steps) and is_main:
                 ckpt = {
                     "step": step,
-                    "model": model.state_dict(),
+                    "model": raw_model.state_dict(),
                     "optimizer": opt.state_dict(),
                     "scaler": scaler.state_dict(),
                     "best_recon_loss": best_recon_loss,
@@ -1327,8 +1447,8 @@ def train(args: argparse.Namespace) -> None:
                 print(f"  -> {step_ckpt.name}")
 
                 # model_best : meilleure reconstruction
-                if float(recon_loss.item()) < best_recon_loss:
-                    best_recon_loss = float(recon_loss.item())
+                if recon_m < best_recon_loss:
+                    best_recon_loss = recon_m
                     ckpt["best_recon_loss"] = best_recon_loss
                     torch.save(ckpt, weights_dir / "model_best.pth")
                     print(f"  -> model_best.pth (recon={best_recon_loss:.4f})")
@@ -1342,17 +1462,22 @@ def train(args: argparse.Namespace) -> None:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
-    final_ckpt = {
-        "step": step,
-        "model": model.state_dict(),
-        "optimizer": opt.state_dict(),
-        "scaler": scaler.state_dict(),
-        "best_recon_loss": best_recon_loss,
-        "args": vars(args),
-    }
-    final_path = weights_dir / "model_final.pth"
-    torch.save(final_ckpt, final_path)
-    print(f"Training terminé. Modèle final: {final_path}")
+    if is_main:
+        final_ckpt = {
+            "step": step,
+            "model": raw_model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "scaler": scaler.state_dict(),
+            "best_recon_loss": best_recon_loss,
+            "args": vars(args),
+        }
+        final_path = weights_dir / "model_final.pth"
+        torch.save(final_ckpt, final_path)
+        print(f"Training terminé. Modèle final: {final_path}")
+
+    if use_dist and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def parse_args() -> argparse.Namespace:
@@ -1408,6 +1533,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cross-ramp-steps", type=int, default=1000)
     p.add_argument("--adv-start-step", type=int, default=1500)
     p.add_argument("--adv-ramp-steps", type=int, default=1000)
+    p.add_argument(
+        "--max-consecutive-nonfinite",
+        type=int,
+        default=50,
+        help="Stop training early after this many consecutive non-finite steps.",
+    )
 
     p.add_argument("--print-every", type=int, default=20)
     p.add_argument("--save-every", type=int, default=200)

@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Script SLURM — Entraînement VQ-VAE 3D multimodal sur Jean Zay (H100 SXM5 80GB)
 #
-# Partition gpu_p6 : H100 SXM5 80GB — 1 GPU (train_vqvae.py ne supporte pas DDP)
+# Partition gpu_p6 : H100 SXM5 80GB — 4 GPUs (DDP via torchrun)
 # QOS : qos_gpu_h100-t4 (100h max)
 #
 # Lancement :
@@ -12,10 +12,15 @@
 #   # Override du run name / modalités
 #   sbatch src/slurm/train_vqvae_jeanzay.slurm vqvae3d_t1w_only "T1W" "0.1T 1.5T 3T"
 #
+#   # Override du nombre de GPUs (défaut 4)
+#   sbatch src/slurm/train_vqvae_jeanzay.slurm vqvae3d_full "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T" 0 4
+#
 # Arguments positionnels :
 #   $1 : RUN_NAME  (défaut : vqvae3d_hybrid)
 #   $2 : MODALITIES espace-séparées entre guillemets  (défaut : "T1W T2W T2FLAIR")
 #   $3 : FIELDS     espace-séparées entre guillemets  (défaut : "0.1T 1.5T 3T 5T 7T")
+#   $4 : FORCE_RESTART (0|1, défaut 0)
+#   $5 : NPROC_PER_NODE (défaut 4)
 #
 # Prérequis (via setup_jeanzay.sh) :
 #   $WORK/MRIX/mrixfields_2026/   ← ce repo
@@ -30,9 +35,9 @@
 #SBATCH -C h100
 
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16       # 16 CPUs pour DataLoader workers
+#SBATCH --cpus-per-task=64       # 16 CPUs par GPU (4 GPUs)
 
 #SBATCH --partition=gpu_p6
 #SBATCH --qos=qos_gpu_h100-t4
@@ -52,8 +57,10 @@ FIELDS="${3:-0.1T 1.5T 3T 5T 7T}"
 # FORCE_RESTART=1 : ignore les checkpoints existants et repart de zéro.
 # Usage : sbatch train_vqvae_jeanzay.slurm vqvae_full "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T" 1
 FORCE_RESTART="${4:-0}"
+NPROC_PER_NODE="${5:-4}"
 AMP_DTYPE="${AMP_DTYPE:-bf16}"
 GRAD_CHECKPOINTING="${GRAD_CHECKPOINTING:-1}"
+USE_AMP="${USE_AMP:-0}"
 
 CODE_DIR="$WORK/MRIX/mrixfields_2026"
 DATA_ROOT="$WORK/MRIX/data"
@@ -69,6 +76,8 @@ echo " Modalités : $MODALITIES"
 echo " Champs    : $FIELDS"
 echo " Data      : $DATA_ROOT"
 echo " Output    : $OUTPUT_DIR"
+echo " NPROC     : $NPROC_PER_NODE"
+echo " Use AMP   : $USE_AMP"
 echo " AMP dtype : $AMP_DTYPE"
 echo " Grad ckpt : $GRAD_CHECKPOINTING"
 echo "======================================================================="
@@ -82,6 +91,7 @@ module load pytorch-gpu/py3/2.5.0
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK / NPROC_PER_NODE))
 
 _install_if_missing() {
     python3 -c "import $1" 2>/dev/null || pip install --user --quiet "$2"
@@ -99,7 +109,8 @@ if [ ! -d "$DATA_ROOT" ]; then
 fi
 N_NIFTI=$(find "$DATA_ROOT" -name "R_*.nii.gz" | wc -l)
 echo "Données NIfTI  : OK ($N_NIFTI volumes dans $DATA_ROOT)"
-echo "GPU            : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
+echo "GPU(s)         :"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
 # ─── Gestion auto-requeue ─────────────────────────────────────────────────────
 _requeue_handler() {
@@ -140,11 +151,11 @@ else
     echo "Aucun répertoire weights — démarrage à zéro."
 fi
 
-# ─── Lancement (1 GPU H100) ──────────────────────────────────────────────────
+# ─── Lancement DDP (4xH100 par défaut) ───────────────────────────────────────
 cd "$CODE_DIR"
 
 echo "======================================================================="
-echo " Démarrage python (1 GPU H100)"
+echo " Démarrage torchrun ($NPROC_PER_NODE GPU(s))"
 echo "======================================================================="
 
 GC_FLAG=""
@@ -152,7 +163,12 @@ if [ "$GRAD_CHECKPOINTING" = "1" ]; then
     GC_FLAG="--gradient-checkpointing"
 fi
 
-python3 src/vae3d/train_vqvae.py \
+AMP_FLAG=""
+if [ "$USE_AMP" = "1" ]; then
+    AMP_FLAG="--use-amp --amp-dtype $AMP_DTYPE"
+fi
+
+torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" src/vae3d/train_vqvae.py \
     --data-root  "$DATA_ROOT" \
     --splits     retro_train \
     --modalities $MODALITIES \
@@ -162,8 +178,7 @@ python3 src/vae3d/train_vqvae.py \
     --steps      20000 \
     --channel-multipliers 1 2 4 4 \
     $GC_FLAG \
-    --use-amp \
-    --amp-dtype "$AMP_DTYPE" \
+    $AMP_FLAG \
     --output-dir "$OUTPUT_DIR" \
     $RESUME_FLAG
 
