@@ -1,0 +1,53 @@
+# MedVAE disentanglement v1.2 (anatomie/modalite)
+method: medvae_disentangle_v1
+task_name: medvae_disentangle_v1
+
+data:
+  split: retro_train
+  modalities: [T1W, T2W, T2FLAIR]
+  fields: [0.1T, 1.5T, 3T, 5T, 7T]
+  output_subdir: medvae_disentangle_v1/runs/medvae_disentangle_v1
+
+  volume_size: [112, 128, 80]
+  target_spacing: [1.0, 1.0, 1.0]
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  paired_prob: 0.5
+
+model:
+  medvae_model_name: medvae_4_1_3d
+  anat_channels: 8
+  style_dim: 32
+  film_hidden: 128
+
+train:
+  batch_size: 1
+  num_workers: 8
+  steps: 20000
+
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+
+  lambda_rec: 1.0
+  lambda_ssim: 0.5
+  lambda_mod: 1.0
+  lambda_tgt_mod: 0.2
+  lambda_adv: 0.002
+  lambda_cross: 0.4
+  lambda_anat: 0.35
+  lambda_latent: 0.25
+  lambda_decor: 0.01
+  adv_start_step: 800
+  adv_ramp_steps: 2500
+  cross_start_step: 300
+  cross_ramp_steps: 1200
+  paired_start_step: 900
+  paired_ramp_steps: 2200
+
+  use_amp: false
+  amp_dtype: bf16
+
+  print_every: 20
+  save_every: 200
+  seed: 42
