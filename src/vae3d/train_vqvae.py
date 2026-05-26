@@ -23,22 +23,27 @@ import os
 import random
 import re
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import nibabel as nib
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from scipy.ndimage import zoom as scipy_zoom
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+
+from common.dataset import MRIxFieldsPairedDataset
+from common.distributed import setup_distributed, to_device, is_main_process
+from common.metrics import compute_ssim3d_torch as ssim3d, weighted_pixel_loss as weighted_recon_loss
+from common.utils import grad_reverse, GradReverse
+
+# Rétrocompatibilité : alias pour les imports externes
+MRIxFieldsHybridDataset = MRIxFieldsPairedDataset
 
 MODALITIES = ["T1W", "T2W", "T2FLAIR"]
 FIELDS = ["0.1T", "1.5T", "3T", "5T", "7T"]

@@ -68,6 +68,28 @@ def cleanup_distributed():
 
 
 # --------------------------------------------------------------------------- #
+# Device helpers                                                              #
+# --------------------------------------------------------------------------- #
+
+
+def to_device(batch, device, non_blocking=True):
+    """Move all tensors in a dict to the given device."""
+    return {
+        k: v.to(device, non_blocking=non_blocking) if isinstance(v, torch.Tensor) else v
+        for k, v in batch.items()
+    }
+
+
+def sync_scalar(val: float, device, op=dist.ReduceOp.AVG):
+    """Synchronize a scalar value across DDP processes."""
+    if not dist.is_available() or not dist.is_initialized():
+        return val
+    t = torch.tensor(val, device=device)
+    dist.all_reduce(t, op=op)
+    return float(t.item())
+
+
+# --------------------------------------------------------------------------- #
 # EMA                                                                         #
 # --------------------------------------------------------------------------- #
 

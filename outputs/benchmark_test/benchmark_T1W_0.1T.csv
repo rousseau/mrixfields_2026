@@ -1,0 +1,3 @@
+VAE,MAE,MSE,SSIM,Time(s),N_Samples,Status
+AEKL,—,—,—,—,—,'NoneType' object is not subscriptable
+VQ-VAE,—,—,—,—,—,all_failed

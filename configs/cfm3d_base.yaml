@@ -1,0 +1,68 @@
+# CFM3D base configuration
+# Base template for all CFM configurations.
+# Override vae.vae_type and vae source parameters for different architectures.
+
+method: cfm3d
+
+# ─── VAE utilisé pour l'encodage latent ───────────────────────────────────────
+# Options: vae_type = aekl | medvae | vqvae
+#          source   = local | frozen | maisi | random
+vae:
+  vae_type: aekl              # Change this to select VAE architecture
+  source: local               # local | frozen | maisi | random
+  checkpoint: "outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth"
+  vae_config: "configs/vae3d_T1W.yaml"
+  model_name: medvae_4_1_3d   # Only for vae_type=medvae
+  # maisi_cache_dir: ~/.cache/monai/bundles  # Optional if source=maisi
+
+# ─── UNet 3D pour le flow matching ────────────────────────────────────────────
+# in_channels et out_channels sont calculés automatiquement depuis vae.latent_channels
+model:
+  spatial_dims: 3
+  model_channels: 128         # Reduce to 64 if using VQ-VAE (latent 64ch)
+  num_res_blocks: 2
+  channel_mult: [1, 2, 4]
+  attention_levels: [false, true, true]
+  num_head_channels: 64
+  use_gradient_checkpointing: true
+  use_flash_attention: false
+  norm_num_groups: 32
+
+# ─── Données ──────────────────────────────────────────────────────────────────
+data:
+  modality: T1W               # T1W | T2W | T2FLAIR
+  split: retro_train          # retro_train | pro_train | pro_val
+  output_subdir: cfm3d/runs/cfm3d_{{TASK_NAME}}  # Will be replaced with task_name
+  domains:
+    - 0.1T
+    - 1.5T
+    - 3T
+    - 5T
+    - 7T
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  target_spacing: [1.0, 1.0, 1.0]   # mm, null pour conserver le spacing original
+  volume_size: [112, 128, 80]       # [512, 512, 192] pour volumes complets
+  max_volumes_per_domain: null      # null = tous les volumes disponibles
+
+# ─── Entraînement ─────────────────────────────────────────────────────────────
+train:
+  batch_size: 2               # Reduce to 1 for VQ-VAE (latent 64ch)
+  num_workers: 4
+  total_iters: 150000
+  lr: 1.0e-4
+  sigma: 0.0                  # OT-CFM déterministe
+  ot_method: exact            # "exact" ou "sinkhorn"
+  save_every: 5000
+  print_every: 200
+  use_amp: true
+  grad_clip: 1.0
+  ema_decay: 0.9999           # Moyenne mobile exponentielle du modèle
+
+# ─── Inférence ─────────────────────────────────────────────────────────────────
+inference:
+  n_steps: 50                 # Euler steps (50 = bon compromis qualité/vitesse)
+  ode_solver: euler           # "euler" ou "dopri5" (adaptatif)
+  source_domain: 0.1T         # Domaine source par défaut
+  vae_decode_patch_size: [64, 64, 64]   # Pour volumes complets
+  vae_decode_overlap: 0.25

@@ -1,8 +1,8 @@
 method: cfm3d
 vae:
   vae_type: medvae
-  source: local
-  checkpoint: outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth
+  source: frozen
+  checkpoint: outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth
   vae_config: configs/vae3d_T1W.yaml
   model_name: medvae_4_1_3d
 model:
@@ -63,4 +63,4 @@ inference:
   - 64
   - 64
   vae_decode_overlap: 0.25
-task_name: cfm3d_T1W_medvae_finetuned
+task_name: cfm3d_T1W_medvae_frozen

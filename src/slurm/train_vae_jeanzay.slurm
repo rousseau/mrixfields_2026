@@ -16,9 +16,6 @@
 #   --export=ALL,STEPS=20000,BATCH_SIZE=2,LR=1e-4,TIME_LIMIT=48:00:00
 
 #SBATCH --job-name=vae_train
-# SBATCH_ACCOUNT doit être défini dans l'environnement avant sbatch :
-#   export SBATCH_ACCOUNT=<projet>@h100   (ex: crp@h100)
-# SLURM lit automatiquement cette variable — ne pas hardcoder ici.
 #SBATCH -A crp@h100
 #SBATCH -C h100
 #SBATCH --nodes=1
@@ -124,8 +121,8 @@ echo " LR        : $LR"
 echo "======================================================================="
 
 if [[ "$VAE_TYPE" == "vqvae" ]]; then
-  OUTPUT_DIR="$WORK/MRIX/mrixfields_2026/outputs/vqvae3d/runs/$RUN_NAME"
-  python3 src/vae3d/train_vqvae.py \
+  OUTPUT_DIR="$OUT_ROOT/vqvae3d/runs/$RUN_NAME"
+  python3 src/train_vqvae.py \
     --data-root "$DATA_ROOT" \
     --splits retro_train \
     --modalities $MODALITIES \
@@ -135,17 +132,18 @@ if [[ "$VAE_TYPE" == "vqvae" ]]; then
     --steps "$STEPS" \
     --lr "$LR" \
     --use-amp \
-    --gradient-checkpointing \
     --output-dir "$OUTPUT_DIR"
 else
-  # Sélection de la config selon le type VAE
-  case "$VAE_TYPE" in
-    aekl)   CONFIG="configs/vae3d_T1W.yaml" ;;
-    medvae) CONFIG="configs/cfm3d_T1W_medvae.yaml" ;;
-  esac
-  python3 src/vae3d/train_vae_3d.py \
-    --config "$CONFIG" \
-    --env jeanzay
+  OUTPUT_DIR="$OUT_ROOT/train_${VAE_TYPE}/$RUN_NAME"
+  python3 src/train_vae.py \
+    --vae "$VAE_TYPE" \
+    --data-root "$DATA_ROOT" \
+    --batch-size "$BATCH_SIZE" \
+    --steps "$STEPS" \
+    --lr "$LR" \
+    --device cuda \
+    --output-dir "$OUTPUT_DIR" \
+    --use-amp
 fi
 
 echo "======================================================================="

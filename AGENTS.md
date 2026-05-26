@@ -107,13 +107,14 @@ sbatch src/slurm/stargan_jeanzay.slurm T1W retro_scratch
 
 **Objectif** : Identifier la meilleure architecture VAE 3D pour encoder les volumes IRM dans un espace latent adapté à la translation de champs.
 
-Trois architectures sont comparées :
+Quatre architectures sont comparées :
 
 | VAE | Référence | Particularité |
 |-----|-----------|---------------|
 | **MedVAE** | https://github.com/StanfordMIMI/MedVAE | Pré-entraîné sur 1M images médicales — testé en version *frozen* (poids originaux) et *fine-tuné* sur MRIxFields |
 | **AEKL (MONAI)** | https://github.com/Project-MONAI/GenerativeModels | AutoencoderKL 3D — 4 canaux latents, 200 epochs entraînés |
 | **NeuroQuant (adapté)** | https://arxiv.org/html/2604.05171v1 | Adapté pour utiliser donn ées **paired et unpaired** — FiLM conditioning multi-champ, adversary d'invariance de modalité |
+| **MedVAE Disentanglement v1.2** | interne (ce repo) | MedVAE encodeur/décodeur **figés**, décomposition latent **anatomie/modalité** avec warmup progressif des pertes pairées (v1.2) |
 
 **Critères de sélection du VAE final** :
 - Qualité de reconstruction (MAE, MSE, SSIM sur volumes 3D complets)
@@ -124,11 +125,14 @@ Trois architectures sont comparées :
 |---------|------|
 | `src/vae3d/train_vae_3d.py` | Entraînement AEKL 3D |
 | `src/vae3d/train_vqvae.py` | Entraînement NeuroQuant adapté (VQ-VAE 3D) |
-| `src/vae3d/benchmark_vae.py` | **Script de benchmark unifié** — compare les 3 VAE |
+| `src/vae3d/train_medvae_disentangle_v1.py` | Entraînement MedVAE Disentanglement v1 (anatomie/modalité, MedVAE figé) |
+| `src/vae3d/benchmark_vae.py` | **Script de benchmark unifié** — compare les VAE étape 2 (inclut v1) |
+| `src/vae3d/benchmark_disentanglement_v1.py` | Benchmark disentanglement v1 (`Acc(mod|z_m)` vs `Acc(mod|z_a)`, rec/cross L1) |
 | `src/vae3d/qc_vae_3d.py` | QC visuel des reconstructions |
 | `src/utils/patched_vae.py` | Wrapper patch-based pour volumes full-res |
 | `src/slurm/train_vae_jeanzay.slurm` | Job SLURM unifié (aekl / vqvae / medvae) |
 | `src/slurm/train_vqvae_jeanzay.slurm` | Job SLURM VQ-VAE 3D (4×H100) |
+| `src/slurm/train_medvae_disentangle_jeanzay.slurm` | Job SLURM MedVAE Disentanglement v1 |
 
 ```bash
 # AEKL
@@ -137,16 +141,29 @@ python src/vae3d/train_vae_3d.py --config configs/vae3d_T1W.yaml --env local
 # NeuroQuant (VQ-VAE)
 python src/vae3d/train_vqvae.py --config configs/vqvae3d_T1W.yaml --env local
 
-# Benchmark des 3 architectures
+# MedVAE Disentanglement v1 (anatomie/modalité)
+python src/vae3d/train_medvae_disentangle_v1.py \
+    --data-root /home/rousseau/Data/MRIxFields_20260414 \
+    --output-dir outputs/medvae_disentangle_v1/runs/dev_run \
+    --splits retro_train \
+    --modalities T1W T2W T2FLAIR \
+    --fields 0.1T 1.5T 3T 5T 7T
+
+# Benchmark automatique des architectures (étape 2)
 python src/vae3d/benchmark_vae.py --modality T1W --field 0.1T
+
+# Benchmark spécifique du disentanglement v1
+python src/vae3d/benchmark_disentanglement_v1.py \
+    --ckpt outputs/medvae_disentangle_v1/runs/dev_run/weights/model_best.pth
 
 # Jean Zay
 sbatch src/slurm/train_vae_jeanzay.slurm aekl vae3d_T1W
 sbatch src/slurm/train_vqvae_jeanzay.slurm vqvae3d_hybrid "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T" 0 4
+sbatch src/slurm/train_medvae_disentangle_jeanzay.slurm medvae_disentangle_v1 "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T"
 sbatch src/slurm/benchmark_vae_jeanzay.slurm T1W 0.1T
 ```
 
-**État** : AEKL ✅ (200 epochs), VQ-VAE ✅ (smoke tests), MedVAE ⏳ (fine-tuning à lancer).
+**État** : AEKL ✅ (200 epochs), VQ-VAE ✅ (smoke tests), MedVAE ⏳ (fine-tuning à lancer), MedVAE Disentanglement v1 ✅ (premier run local).
 
 ---
 
@@ -217,28 +234,31 @@ sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm T1W configs/mmfm3d_medvae_multimodal.
 **État** : ✅ Baseline v1 implémentée, documentée et smoke-testée.
 ---
 
-## Évaluation unifiée
+### Évaluation unifiée
 
 **Toutes les méthodes sont évaluées avec le même script**, garantissant la cohérence des comparaisons.
 
-### Évaluation visuelle
-
-Réalisée sur les **3 sujets prospectifs** acquis avec les 5 champs magnétiques (0.1T, 1.5T, 3T, 5T, 7T) :
+#### Usage
 
 ```bash
-# QC visuel — sujets 5 champs (1 figure par méthode et par sujet)
-python src/evaluation/evaluate.py \
-    --method stargan2d \
-    --checkpoint outputs/stargan2d/runs/task3_any_to_any_T1W/weights/model_final.pth \
-    --subjects prospective_5fields \
-    --output results/qc/
-
-python src/evaluation/evaluate.py \
-    --method aekl_cfm3d \
+# Évaluation quantitative (nRMSE, SSIM, LPIPS)
+python src/evaluation/evaluate.py --method aekl_cfm3d \
     --vae-checkpoint outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth \
     --cfm-checkpoint outputs/cfm3d/runs/cfm3d_T1W/weights/model_final.pth \
     --subjects prospective_5fields \
-    --output results/qc/
+    --output-csv results/evaluation_table.csv
+
+# Évaluation complète avec Dice/Volume (nécessite SynthSeg)
+python src/evaluation/evaluate.py --method stargan2d \
+    --checkpoint outputs/stargan2d/runs/task3_any_to_any_T1W/weights/model_final.pth \
+    --pred-dir outputs/predictions/ \
+    --target-dir ~/Data/MRIxFields_20260414/Training_prospective/ \
+    --pred-seg-dir outputs/predictions_seg/ \
+    --target-seg-dir ~/Data/MRIxFields_20260414/target_seg/ \
+    --metrics nrmse,ssim,lpips,dice,volume
+
+# Aide
+python src/evaluation/evaluate.py --help
 ```
 
 Les figures sont sauvegardées dans `results/qc/<methode>_<sujet>_<modalite>.png` et montrent la traduction entre les 5 champs pour les 3 vues (axiale, coronale, sagittale).

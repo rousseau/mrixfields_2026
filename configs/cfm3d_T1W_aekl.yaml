@@ -1,58 +1,66 @@
 method: cfm3d
-task_name: cfm3d_T1W_aekl
-
-# ─── VAE utilisé pour l'encodage latent ───────────────────────────────────────
-# Étape 2 : AEKL (AutoencoderKL MONAI) — 4 canaux latents, 8× compression
 vae:
-  vae_type: aekl                # aekl | medvae | vqvae
-  source: local                 # local | maisi | random
-  checkpoint: "outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth"
-  vae_config: "configs/vae3d_T1W.yaml"
-  # maisi_cache_dir: ~/.cache/monai/bundles  # si source=maisi
-
-# ─── UNet 3D pour le flow matching ────────────────────────────────────────────
-# in_channels et out_channels sont calculés automatiquement depuis vae.latent_channels
+  vae_type: aekl
+  source: local
+  checkpoint: outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth
+  vae_config: configs/vae3d_T1W.yaml
+  model_name: medvae_4_1_3d
 model:
   spatial_dims: 3
   model_channels: 128
   num_res_blocks: 2
-  channel_mult: [1, 2, 4]
-  attention_levels: [false, true, true]
+  channel_mult:
+  - 1
+  - 2
+  - 4
+  attention_levels:
+  - false
+  - true
+  - true
   num_head_channels: 64
   use_gradient_checkpointing: true
   use_flash_attention: false
   norm_num_groups: 32
-
 data:
   modality: T1W
   split: retro_train
-  output_subdir: cfm3d/runs/cfm3d_T1W_aekl
+  output_subdir: cfm3d/runs/cfm3d_{{TASK_NAME}}
   domains:
-    - 0.1T
-    - 1.5T
-    - 3T
-    - 5T
-    - 7T
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
   percentile_lower: 0.5
   percentile_upper: 99.5
-  target_spacing: [1.0, 1.0, 1.0]
-  volume_size: [112, 128, 80]
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  volume_size:
+  - 112
+  - 128
+  - 80
   max_volumes_per_domain: null
-
 train:
   batch_size: 2
   num_workers: 4
   total_iters: 150000
-  lr: 1.0e-4
+  lr: 0.0001
   sigma: 0.0
-  ot_method: exact              # exact | sinkhorn
+  ot_method: exact
   save_every: 5000
   print_every: 200
   use_amp: true
   grad_clip: 1.0
   ema_decay: 0.9999
-
 inference:
   n_steps: 50
   ode_solver: euler
   source_domain: 0.1T
+  vae_decode_patch_size:
+  - 64
+  - 64
+  - 64
+  vae_decode_overlap: 0.25
+task_name: cfm3d_T1W_aekl

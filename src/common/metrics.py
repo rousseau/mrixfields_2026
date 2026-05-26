@@ -213,6 +213,41 @@ def compute_lpips(
 
 
 # --------------------------------------------------------------------------- #
+# Differentiable losses (NeuroQuant-style)                                    #
+# --------------------------------------------------------------------------- #
+
+
+def weighted_pixel_loss(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    mode: str = "l1",
+    fg_weight: float = 5.0,
+    bg_threshold: float = -0.9,
+) -> torch.Tensor:
+    """Pixel reconstruction loss with brain-foreground weighting.
+
+    Args:
+        recon, target: Tensors in [-1, 1].
+        mode: "l1" or "mse".
+        fg_weight: Multiplicative weight for foreground voxels.
+        bg_threshold: Threshold below which a voxel is considered background.
+    """
+    if mode == "l1":
+        pixel_loss = (recon - target).abs()
+    elif mode == "mse":
+        pixel_loss = (recon - target) ** 2
+    else:
+        raise ValueError(f"Unknown loss mode: {mode}")
+
+    with torch.no_grad():
+        fg_mask = (target > bg_threshold).float()
+        weight = 1.0 + (fg_weight - 1.0) * fg_mask
+        weight = weight / weight.mean()
+
+    return (pixel_loss * weight).mean()
+
+
+# --------------------------------------------------------------------------- #
 # Segmentation-based metrics                                                  #
 # --------------------------------------------------------------------------- #
 

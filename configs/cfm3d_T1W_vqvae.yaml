@@ -1,53 +1,52 @@
 method: cfm3d
-task_name: cfm3d_T1W_vqvae
-
-# ─── VAE utilisé pour l'encodage latent ───────────────────────────────────────
-# Étape 2 : VQ-VAE NeuroQuant adapté — données paired et unpaired
-# Architecture : DualStreamEncoder → EMAVectorQuantizer + FiLMDecoder
-# Le CFM opère dans l'espace latent anatomique quantifié z_q (anat_channels=64)
 vae:
-  vae_type: vqvae               # aekl | medvae | vqvae
+  vae_type: vqvae
   source: local
-  checkpoint: "outputs/vqvae3d/runs/vqvae3d_T1W/weights/model_best.pth"
-  vae_config: "configs/vqvae3d_T1W.yaml"  # architecture du VQ-VAE
-
-# ─── UNet 3D pour le flow matching ────────────────────────────────────────────
-# in_channels et out_channels sont calculés automatiquement depuis vae.latent_channels
-# Note : latent_channels = anat_channels du VQ-VAE (64 par défaut)
-#        → in_channels du UNet = 2 * 64 = 128 (plus lourd que AEKL)
-#        Réduire model_channels si mémoire insuffisante.
+  checkpoint: outputs/vqvae3d/runs/vqvae3d_T1W/weights/model_best.pth
+  vae_config: configs/vqvae3d_T1W.yaml
+  model_name: medvae_4_1_3d
 model:
   spatial_dims: 3
-  model_channels: 64            # Réduit vs AEKL (latent 64ch plus large)
+  model_channels: 64
   num_res_blocks: 2
-  channel_mult: [1, 2, 4]
-  attention_levels: [false, true, true]
+  channel_mult:
+  - 1
+  - 2
+  - 4
+  attention_levels:
+  - false
+  - true
+  - true
   num_head_channels: 32
   use_gradient_checkpointing: true
   use_flash_attention: false
   norm_num_groups: 32
-
 data:
   modality: T1W
   split: retro_train
-  output_subdir: cfm3d/runs/cfm3d_T1W_vqvae
+  output_subdir: cfm3d/runs/cfm3d_{{TASK_NAME}}
   domains:
-    - 0.1T
-    - 1.5T
-    - 3T
-    - 5T
-    - 7T
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
   percentile_lower: 0.5
   percentile_upper: 99.5
-  target_spacing: [1.0, 1.0, 1.0]
-  volume_size: [112, 128, 80]
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  volume_size:
+  - 112
+  - 128
+  - 80
   max_volumes_per_domain: null
-
 train:
-  batch_size: 1                 # Batch réduit (latent 64ch plus lourd en mémoire)
+  batch_size: 1
   num_workers: 4
   total_iters: 150000
-  lr: 1.0e-4
+  lr: 0.0001
   sigma: 0.0
   ot_method: exact
   save_every: 5000
@@ -55,8 +54,13 @@ train:
   use_amp: true
   grad_clip: 1.0
   ema_decay: 0.9999
-
 inference:
   n_steps: 50
   ode_solver: euler
   source_domain: 0.1T
+  vae_decode_patch_size:
+  - 64
+  - 64
+  - 64
+  vae_decode_overlap: 0.25
+task_name: cfm3d_T1W_vqvae

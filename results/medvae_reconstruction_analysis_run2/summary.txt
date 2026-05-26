@@ -1,0 +1,9 @@
+Analyse reconstruction MedVAE
+n_samples: 12
+mode_full: 12
+mode_patch: 0
+mean_mae: 0.062473
+mean_ssim: 0.882039
+mean_ssim_clean: 0.869012
+mean_ssim_with_artifact: 0.886381
+orientation_ssim: sagittal=0.885556, coronal=0.881845, axial=0.885621
