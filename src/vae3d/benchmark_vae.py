@@ -1,99 +1,40 @@
 #!/usr/bin/env python3
-"""
-Benchmark script for 4 VAE architectures on MRIxFields full-resolution volumes.
+"""Benchmark script for VAE architectures on MRIxFields full-resolution volumes.
 
-Compares:
-1. AutoencoderKL (MONAI) — AEKL
-2. VQ-VAE (NeuroQuant-inspired, hybrid)
-3. MedVAE 3D frozen (pre-trained on 1M medical images, poids HuggingFace originaux)
-4. MedVAE 3D fine-tuné (poids adaptés sur MRIxFields via train_vae.py)
-
-Metrics: MAE, SSIM, LPIPS, memory usage, inference time per domain (field strength).
-
-Usage:
-  # Benchmark complet (4 VAE)
-  python src/vae3d/benchmark_vae.py --modality T1W --field 3T
-
-  # Avec chemins explicites
-  python src/vae3d/benchmark_vae.py \\
-      --aekl-ckpt outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth \\
-      --vqvae-ckpt outputs/vqvae3d/runs/vqvae_full/weights/vqvae_final.pth \\
-      --medvae-finetuned-ckpt outputs/medvae/runs/medvae_T1W/weights/model_final.pth
-
-  # Sauter un VAE
-  python src/vae3d/benchmark_vae.py --skip-vqvae --skip-medvae-finetuned
+Refactored to use common infrastructure (common.io, common.metrics, models.vae_loader).
 """
 
 import argparse
 import csv
-import re
 import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 warnings.filterwarnings("ignore")
 
-# Ajout des chemins src/ et src/utils/ pour les imports locaux
-_SRC = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_SRC))
-sys.path.insert(0, str(_SRC / "vae3d"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import nibabel as nib
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from scipy import ndimage
-from scipy.ndimage import zoom as scipy_zoom
 from torch.utils.data import DataLoader, Dataset
 
+from common.io import (
+    DOMAINS,
+    MODALITIES,
+    center_crop_or_pad_np,
+    load_nifti_volume,
+    normalize_volume,
+)
+from common.metrics import compute_nrmse, compute_ssim
+from models.vae_loader import load_vae
 from utils.patched_vae import PatchedVAE
-
-# Import VAE architectures
-from vae3d.train_vae_3d import build_vae as build_aekl
-from vae3d.train_vqvae import NeuroQuantHybrid
-
-FILE_RE = re.compile(r"^[A-Z]_([A-Z0-9]+)_([0-9.]+T)_(\d+)\.nii\.gz$")
 
 # Index mappings pour le VQ-VAE (FiLM conditioning)
 MODALITIES_IDX = {"T1W": 0, "T2W": 1, "T2FLAIR": 2}
 FIELDS_IDX = {"0.1T": 0, "1.5T": 1, "3T": 2, "5T": 3, "7T": 4}
-
-
-def _normalize(
-    vol: np.ndarray, lo_pct: float = 0.5, hi_pct: float = 99.5
-) -> np.ndarray:
-    """Normalize volume to [-1, 1]."""
-    lo = np.percentile(vol, lo_pct)
-    hi = np.percentile(vol, hi_pct)
-    if hi <= lo:
-        return np.zeros_like(vol, dtype=np.float32)
-    vol = np.clip((vol - lo) / (hi - lo), 0.0, 1.0)
-    return (vol * 2.0 - 1.0).astype(np.float32)
-
-
-def _crop_or_pad(vol: np.ndarray, target_size: Tuple[int, int, int]) -> np.ndarray:
-    """Center crop or pad to target size."""
-    th, tw, td = target_size
-    h, w, d = vol.shape
-
-    ph = max(0, th - h)
-    pw = max(0, tw - w)
-    pd = max(0, td - d)
-    if ph > 0 or pw > 0 or pd > 0:
-        vol = np.pad(
-            vol,
-            [(ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (pd // 2, pd - pd // 2)],
-            mode="reflect",
-        )
-        h, w, d = vol.shape
-
-    sh = max((h - th) // 2, 0)
-    sw = max((w - tw) // 2, 0)
-    sd = max((d - td) // 2, 0)
-    return vol[sh : sh + th, sw : sw + tw, sd : sd + td]
 
 
 class BenchmarkDataset(Dataset):
@@ -110,12 +51,12 @@ class BenchmarkDataset(Dataset):
         self.data_root = Path(data_root)
         self.samples = []
 
-        split_dir = "Training_retrospective" if split == "retro_train" else split
+        from common.io import SPLIT_MAP
+        split_dir = SPLIT_MAP.get(split, split)
         d = self.data_root / split_dir / modality / field
 
         for p in sorted(d.glob("*.nii.gz"))[:max_samples]:
-            m = FILE_RE.match(p.name)
-            if m:
+            if p.name.startswith(("R_", "P_")):
                 self.samples.append(p)
 
         print(f"BenchmarkDataset: {len(self.samples)} volumes ({modality}/{field})")
@@ -125,274 +66,18 @@ class BenchmarkDataset(Dataset):
 
     def __getitem__(self, idx):
         path = self.samples[idx]
-        img = nib.load(str(path))
-        vol = img.get_fdata(dtype=np.float32)
-        vol = _normalize(vol)
-        return torch.from_numpy(vol).unsqueeze(0), path.stem  # (1, H, W, D), name
-
-
-def load_aekl(checkpoint_path: Path, device: torch.device) -> nn.Module:
-    """Load AutoencoderKL from checkpoint."""
-    print("[AEKL] Loading checkpoint...")
-
-    # Config par défaut correspondant à vae3d_T1W.yaml
-    _DEFAULT_AEKL_CFG = {
-        "model": {
-            "spatial_dims": 3,
-            "in_channels": 1,
-            "out_channels": 1,
-            "latent_channels": 4,
-            "channels": [64, 128, 256],
-            "num_res_blocks": 2,
-            "norm_num_groups": 32,
-            "attention_levels": [False, False, False],
-            "with_encoder_nonlocal_attn": False,
-            "with_decoder_nonlocal_attn": False,
-        }
-    }
-    model = build_aekl(_DEFAULT_AEKL_CFG).to(device)
-
-    if checkpoint_path is None or not Path(checkpoint_path).exists():
-        return None
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
-
-    # Key remapping : dans le checkpoint Jean Zay, les blocs de downsampling du
-    # décodeur utilisent ".conv.conv." alors que la version actuelle de MONAI
-    # les nomme ".postconv.conv.". L'encodeur utilise ".conv.conv." dans les deux.
-    state_fixed = {}
-    for k, v in state.items():
-        if k.startswith("decoder."):
-            k_new = k.replace(".conv.conv.", ".postconv.conv.")
-        else:
-            k_new = k
-        state_fixed[k_new] = v
-
-    missing, unexpected = model.load_state_dict(state_fixed, strict=False)
-    if missing:
-        print(f"  ⚠  AEKL {len(missing)} clé(s) manquante(s)")
-    if unexpected:
-        print(f"  ⚠  AEKL {len(unexpected)} clé(s) inattendue(s)")
-    model.eval()
-    print(f"  → AEKL loaded from {Path(checkpoint_path).name}")
-    return model
-
-
-class VQVAECompatWrapper(nn.Module):
-    """
-    Wraps NeuroQuantHybrid (nouvelle architecture) pour être compatible
-    avec PatchedVAE (interface encode/decode).
-
-    Stratégie : encode() concatène [z_q | z_mod] sur l'axe canal (64+32=96 ch).
-                decode() découpe les deux parties, calcule les FiLM params
-                via compute_film() et appelle le décodeur FiLMDecoder3D.
-    """
-
-    MOD_CHANNELS = 32  # mod_channels du NeuroQuantHybrid
-    ANAT_CHANNELS = 64  # anat_channels (= dim de z_q)
-
-    def __init__(self, vqvae: nn.Module, mod_idx: int = 0, field_idx: int = 0):
-        super().__init__()
-        self.vqvae = vqvae
-        self.mod_idx = mod_idx
-        self.field_idx = (
-            field_idx  # conservé pour compatibilité, non utilisé par FiLMDecoder3D
-        )
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode : retourne torch.cat([z_q, z_mod], dim=1)."""
-        z_anat, z_mod = self.vqvae.encoder(x, depth_mode="3d")
-        # quantizer retourne maintenant 4 valeurs : z_q, vq_loss, indices, perplexity
-        z_q, _vq_loss, _indices, _perplexity = self.vqvae.quantizer(z_anat)
-        return torch.cat([z_q, z_mod], dim=1)  # (B, 96, H', W', D')
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode : découpe z_q/z_mod, calcule les FiLM params et décode."""
-        z_q = z[:, : self.ANAT_CHANNELS]
-        z_mod = z[:, self.ANAT_CHANNELS :]
-        b, device = z_q.shape[0], z_q.device
-        # L'embedding de modalité doit être un index valide pour nn.Embedding
-        modality = torch.full((b,), self.mod_idx, dtype=torch.long, device=device)
-        # compute_film : concat(GAP(z_mod), s_m) → MLP → [(γ_l, β_l)]
-        film_params = self.vqvae.compute_film(z_mod, modality)
-        return self.vqvae.decoder(z_q, film_params, depth_mode="3d")
-
-
-def load_vqvae(
-    checkpoint_path: Path,
-    device: torch.device,
-    n_modalities: int = 3,
-    n_fields: int = 5,
-) -> nn.Module:
-    """Load VQ-VAE from checkpoint.
-
-    Les hyperparamètres du modèle (base_channels, codebook_size, etc.) sont lus
-    directement depuis le checkpoint si disponibles, sinon les defaults NeuroQuant
-    sont utilisés (base_channels=64, codebook_size=4096).
-    """
-    print("[VQ-VAE] Loading checkpoint...")
-
-    if checkpoint_path is None or not Path(checkpoint_path).exists():
-        # Construit un modèle vide (pour smoke tests)
-        model = NeuroQuantHybrid(
-            n_modalities=n_modalities,
-            n_fields=n_fields,
-        ).to(device)
-        return model
-
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
-    args_d = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
-    if hasattr(args_d, "__dict__"):
-        args_d = vars(args_d)  # Namespace → dict
-
-    # Lecture des hyper-params depuis le checkpoint (ou defaults NeuroQuant)
-    base_channels = int(args_d.get("base_channels", 64))
-    anat_channels = int(args_d.get("anat_channels", 64))
-    mod_channels = int(args_d.get("mod_channels", 32))
-    codebook_size = int(args_d.get("codebook_size", 4096))
-    vq_decay = float(args_d.get("vq_decay", 0.99))
-    vq_beta = float(args_d.get("vq_beta", 0.25))
-    mods_saved = args_d.get("modalities", None)
-    fields_saved = args_d.get("fields", None)
-    n_mods_ckpt = len(mods_saved) if mods_saved else n_modalities
-    n_fields_ckpt = len(fields_saved) if fields_saved else n_fields
-
-    print(
-        f"  Checkpoint config : base_ch={base_channels}  codebook={codebook_size}  "
-        f"n_mod={n_mods_ckpt}  n_fields={n_fields_ckpt}  step={ckpt.get('step', '?')}"
-    )
-
-    model = NeuroQuantHybrid(
-        n_modalities=n_mods_ckpt,
-        n_fields=n_fields_ckpt,
-        base_channels=base_channels,
-        anat_channels=anat_channels,
-        mod_channels=mod_channels,
-        codebook_size=codebook_size,
-        vq_decay=vq_decay,
-        vq_beta=vq_beta,
-    ).to(device)
-
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print(f"  ⚠  VQ-VAE {len(missing)} clé(s) manquante(s)")
-    if unexpected:
-        print(f"  ⚠  VQ-VAE {len(unexpected)} clé(s) inattendue(s)")
-    if not missing and not unexpected:
-        print(f"  ✓ Chargement parfait (0 missing, 0 unexpected)")
-    model.eval()
-    print(f"  → VQ-VAE loaded from {Path(checkpoint_path).name}")
-    return model
-
-
-def load_medvae(
-    model_name: str = "medvae_4_1_3d",
-    device: torch.device = None,
-    checkpoint_path: Optional[Path] = None,
-) -> Optional[nn.Module]:
-    """
-    Load MedVAE (frozen depuis HuggingFace, ou fine-tuné depuis un checkpoint local).
-
-    Args:
-        model_name:       Nom du modèle HuggingFace (ex : "medvae_4_1_3d").
-        device:           Device cible.
-        checkpoint_path:  Si fourni, charge les poids depuis ce .pth local
-                          (fine-tuning) en lieu et place des poids HuggingFace.
-                          Le fichier doit contenir le state_dict complet de
-                          l'objet MVAE (clés "model.encoder…", "model.decoder…").
-                          Si None → poids HuggingFace originaux (mode frozen).
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    label = "(fine-tuné)" if checkpoint_path is not None else "(frozen)"
-    print(f"[MedVAE {label}] Loading {model_name}...")
-
-    try:
-        from medvae import MVAE
-    except ImportError:
-        print("  ✗ medvae non installé — pip install medvae")
-        return None
-
-    # Instanciation de l'architecture avec les poids HuggingFace
-    try:
-        model = MVAE(model_name=model_name, modality="mri").to(device)
-    except Exception as e:
-        print(f"  ✗ Impossible d'instancier MVAE : {e}")
-        return None
-
-    if checkpoint_path is not None:
-        # --- Mode fine-tuné : écrase les poids HF par le checkpoint local ---
-        cp = Path(checkpoint_path)
-        if not cp.exists():
-            print(f"  ✗ Checkpoint introuvable : {cp}")
-            return None
-
-        raw = torch.load(cp, map_location=device, weights_only=False)
-
-        # Accepte plusieurs formats de sauvegarde :
-        #   1. state_dict direct de MVAE  (clés "model.encoder…") — train_vae.py
-        #   2. dict avec clé "model_state" ou "model"
-        if isinstance(raw, dict):
-            if "model_state" in raw:
-                state = raw["model_state"]
-            elif "model" in raw and isinstance(raw["model"], dict):
-                state = raw["model"]
-            else:
-                # Suppose que c'est directement le state_dict
-                state = raw
-        else:
-            print(f"  ✗ Format de checkpoint inattendu : {type(raw)}")
-            return None
-
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing:
-            print(f"  ⚠  {len(missing)} clé(s) manquante(s) dans le checkpoint")
-        if unexpected:
-            print(f"  ⚠  {len(unexpected)} clé(s) inattendues dans le checkpoint")
-        if not missing and not unexpected:
-            print(f"  ✓ Chargement parfait (0 missing, 0 unexpected)")
-        print(f"  → MedVAE fine-tuné chargé depuis {cp.name}")
-    else:
-        # --- Mode frozen : poids HuggingFace déjà chargés par MVAE() ---
-        print(f"  → MedVAE frozen chargé depuis HuggingFace ({model_name})")
-
-    model.eval()
-    return model
+        vol, _ = load_nifti_volume(path, normalize=True)
+        return torch.from_numpy(vol).unsqueeze(0), path.stem
 
 
 def compute_metrics(x_orig: torch.Tensor, x_rec: torch.Tensor) -> Dict[str, float]:
     """Compute MAE, MSE, SSIM."""
-    x_orig = x_orig.cpu().numpy()
-    x_rec = x_rec.cpu().numpy()
+    x_orig_n = x_orig.cpu().numpy()
+    x_rec_n = x_rec.cpu().numpy()
 
-    mae = np.mean(np.abs(x_orig - x_rec))
-    mse = np.mean((x_orig - x_rec) ** 2)
-
-    # SSIM (per slice, then average)
-    ssim_vals = []
-    for z in range(x_orig.shape[-1]):
-        s1 = x_orig[..., z]
-        s2 = x_rec[..., z]
-
-        c1, c2 = 0.01, 0.03
-        mu1 = ndimage.gaussian_filter(s1, sigma=1.5)
-        mu2 = ndimage.gaussian_filter(s2, sigma=1.5)
-        mu1_sq = mu1**2
-        mu2_sq = mu2**2
-        mu1_mu2 = mu1 * mu2
-
-        sigma1_sq = ndimage.gaussian_filter(s1**2, sigma=1.5) - mu1_sq
-        sigma2_sq = ndimage.gaussian_filter(s2**2, sigma=1.5) - mu2_sq
-        sigma12 = ndimage.gaussian_filter(s1 * s2, sigma=1.5) - mu1_mu2
-
-        ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
-            (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2) + 1e-8
-        )
-        ssim_vals.append(np.mean(ssim_map))
-
-    ssim = np.mean(ssim_vals)
+    mae = float(np.mean(np.abs(x_orig_n - x_rec_n)))
+    mse = float(np.mean((x_orig_n - x_rec_n) ** 2))
+    ssim = compute_ssim(x_rec_n, x_orig_n)
 
     return {"mae": mae, "mse": mse, "ssim": ssim}
 
@@ -413,13 +98,6 @@ def benchmark_vae(
 
     vae.eval()
 
-    # Pour VQ-VAE : wrapper encode/decode avec z_mod correct
-    if isinstance(vae, NeuroQuantHybrid):
-        vae = VQVAECompatWrapper(vae, mod_idx=mod_idx, field_idx=field_idx)
-        vae = vae.to(device)
-        print(f"  → VQ-VAE wrappé (mod_idx={mod_idx}, field_idx={field_idx})")
-
-    # Wrap in PatchedVAE if needed
     if patched:
         vae_wrapped = PatchedVAE(vae, patch_size=(112, 128, 80), overlap=0.25)
         vae_wrapped = vae_wrapped.to(device)
@@ -435,19 +113,16 @@ def benchmark_vae(
     with torch.no_grad():
         for idx, (x, name) in enumerate(dataset):
             x = x.to(device)
-            # PatchedVAE attend (B, C, H, W, D) — on ajoute la dim batch si besoin
-            if x.dim() == 4:  # (1, H, W, D) → (1, 1, H, W, D)
+            if x.dim() == 4:
                 x = x.unsqueeze(0)
 
-            # Benchmark forward pass
             t0 = time.time()
 
             try:
-                if patched:
+                if patched and hasattr(vae_wrapped, "forward"):
                     result = vae_wrapped.forward(x, encode_only=False, batch_size=2)
                     x_rec = result["reconstruction"].to(device)
                 else:
-                    # Direct forward (may OOM on full res)
                     if hasattr(vae, "encode"):
                         z = vae.encode(x)
                         if isinstance(z, tuple):
@@ -459,14 +134,12 @@ def benchmark_vae(
                     if hasattr(vae, "decode"):
                         x_rec = vae.decode(z)
                     else:
-                        # VQ-VAE needs z_mod and indices
-                        print(f"  ✗ {name}: VQ-VAE decode requires z_mod")
+                        print(f"  ✗ {name}: decode not available")
                         continue
 
                 elapsed = time.time() - t0
                 times.append(elapsed)
 
-                # Compute metrics
                 metrics = compute_metrics(x.squeeze(), x_rec.squeeze())
                 metrics_list.append(metrics)
 
@@ -484,7 +157,6 @@ def benchmark_vae(
                 print(f"  ✗ {name}: {str(e)[:60]}")
                 continue
 
-    # Aggregate stats
     if not metrics_list:
         return {
             "mae": np.nan,
@@ -512,77 +184,101 @@ def benchmark_vae(
     return avg_metrics
 
 
+def _build_vae_from_args(vae_type: str, args) -> Optional[nn.Module]:
+    """Build a VAE config dict and load via unified loader."""
+    if vae_type == "aekl":
+        cfg = {
+            "vae": {
+                "vae_type": "aekl",
+                "source": "local" if args.aekl_ckpt else "random",
+                "checkpoint": args.aekl_ckpt,
+                "vae_config": args.vae_config,
+            }
+        }
+    elif vae_type == "vqvae":
+        cfg = {
+            "vae": {
+                "vae_type": "vqvae",
+                "source": "local",
+                "checkpoint": args.vqvae_ckpt,
+                "vae_config": args.vqvae_config,
+            }
+        }
+    elif vae_type == "medvae_frozen":
+        cfg = {
+            "vae": {
+                "vae_type": "medvae",
+                "source": "frozen",
+                "model_name": args.medvae_model_name,
+            }
+        }
+    elif vae_type == "medvae_finetuned":
+        cfg = {
+            "vae": {
+                "vae_type": "medvae",
+                "source": "local",
+                "model_name": args.medvae_model_name,
+                "checkpoint": args.medvae_finetuned_ckpt,
+            }
+        }
+    elif vae_type == "medvae_disentangle_v1":
+        cfg = {
+            "vae": {
+                "vae_type": "medvae_disentangle",
+                "source": "local",
+                "model_name": args.medvae_model_name,
+                "checkpoint": args.medvae_disentangle_v1_ckpt,
+            }
+        }
+    else:
+        return None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return load_vae(cfg, device)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark 4 VAE architectures (AEKL, VQ-VAE, MedVAE frozen, MedVAE fine-tuné)",
+        description="Benchmark VAE architectures",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Données ──────────────────────────────────────────────────────────────
-    parser.add_argument(
-        "--data-root", type=str, default="/home/rousseau/Data/MRIxFields_20260414"
-    )
-    parser.add_argument(
-        "--modality", type=str, default="T1W", choices=["T1W", "T2W", "T2FLAIR"]
-    )
-    parser.add_argument(
-        "--field", type=str, default="0.1T", choices=["0.1T", "1.5T", "3T", "5T", "7T"]
-    )
-    parser.add_argument(
-        "--max-samples", type=int, default=2, help="Nombre de volumes de test par VAE"
-    )
+    parser.add_argument("--data-root", type=str, default="/home/rousseau/Data/MRIxFields_20260414")
+    parser.add_argument("--modality", type=str, default="T1W", choices=list(MODALITIES))
+    parser.add_argument("--field", type=str, default="0.1T", choices=list(DOMAINS))
+    parser.add_argument("--max-samples", type=int, default=2)
 
-    # ── Checkpoints ──────────────────────────────────────────────────────────
+    parser.add_argument("--aekl-ckpt", type=str, default="outputs/vae3d/runs/vae3d_T1W/weights/model_final.pth")
+    parser.add_argument("--vae-config", type=str, default="configs/vae3d_T1W.yaml")
+    parser.add_argument("--vqvae-ckpt", type=str, default="outputs/vqvae3d/runs/vqvae_final/weights/model_best.pth")
+    parser.add_argument("--vqvae-config", type=str, default="configs/vqvae3d_T1W.yaml")
+    parser.add_argument("--medvae-model-name", type=str, default="medvae_4_1_3d")
     parser.add_argument(
-        "--aekl-ckpt",
-        type=str,
-        default="outputs/vae3d/runs/vae3d_T1W_jeanzay/weights/model_final.pth",
-        help="Checkpoint AEKL (.pth) — Jean Zay 200 epochs (meilleur)",
-    )
-    parser.add_argument(
-        "--vqvae-ckpt",
-        type=str,
-        default="outputs/vqvae3d/runs/vqvae_final/weights/model_best.pth",
-        help="Checkpoint VQ-VAE (.pth)",
-    )
-    parser.add_argument(
-        "--medvae-model-name",
-        type=str,
-        default="medvae_4_1_3d",
-        help="Nom du modèle MedVAE HuggingFace (frozen et fine-tuné)",
-    )
-    parser.add_argument(
-        "--medvae-finetuned-ckpt",
-        type=str,
+        "--medvae-finetuned-ckpt", type=str,
         default="outputs/medvae/runs/medvae_finetune_all/weights/model_final.pth",
-        help="Checkpoint MedVAE fine-tuné (.pth) — 20 000 steps, toutes modalités.",
-    )
-
-    # ── Flags skip ───────────────────────────────────────────────────────────
-    parser.add_argument("--skip-aekl", action="store_true", help="Ignorer AEKL")
-    parser.add_argument("--skip-vqvae", action="store_true", help="Ignorer VQ-VAE")
-    parser.add_argument(
-        "--skip-medvae", action="store_true", help="Ignorer MedVAE frozen"
     )
     parser.add_argument(
-        "--skip-medvae-finetuned", action="store_true", help="Ignorer MedVAE fine-tuné"
+        "--medvae-disentangle-v1-ckpt", type=str,
+        default="outputs/medvae_disentangle_v1/runs/medvae_disentangle_v1/weights/model_best.pth",
     )
 
-    # ── Misc ─────────────────────────────────────────────────────────────────
+    parser.add_argument("--skip-aekl", action="store_true")
+    parser.add_argument("--skip-vqvae", action="store_true")
+    parser.add_argument("--skip-medvae", action="store_true")
+    parser.add_argument("--skip-medvae-finetuned", action="store_true")
+    parser.add_argument("--skip-medvae-disentangle-v1", action="store_true")
+
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="results/benchmark")
 
     args = parser.parse_args()
 
-    device = torch.device(
-        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Device: {device}")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Dataset ──────────────────────────────────────────────────────────────
     dataset = BenchmarkDataset(
         Path(args.data_root),
         modality=args.modality,
@@ -591,146 +287,56 @@ def main():
     )
 
     results = {}
-
-    # Indices de modalité/champ pour VQ-VAE (FiLM conditioning)
     mod_idx = MODALITIES_IDX.get(args.modality, 0)
     field_idx = FIELDS_IDX.get(args.field, 0)
-    print(
-        f"VQ-VAE conditioning: modality={args.modality} (idx={mod_idx}), field={args.field} (idx={field_idx})"
-    )
+    print(f"VQ-VAE conditioning: modality={args.modality} (idx={mod_idx}), field={args.field} (idx={field_idx})")
 
-    # ── 1. AEKL ──────────────────────────────────────────────────────────────
-    if not args.skip_aekl:
+    vae_configs = [
+        ("AEKL", "aekl", args.skip_aekl),
+        ("VQ-VAE", "vqvae", args.skip_vqvae),
+        ("MedVAE (frozen)", "medvae_frozen", args.skip_medvae),
+        ("MedVAE (fine-tuné)", "medvae_finetuned", args.skip_medvae_finetuned),
+        ("MedVAE disentanglement v1", "medvae_disentangle_v1", args.skip_medvae_disentangle_v1),
+    ]
+
+    for name, vae_type, skip in vae_configs:
+        if skip:
+            continue
         try:
-            vae = load_aekl(Path(args.aekl_ckpt), device)
-            results["AEKL"] = benchmark_vae(vae, "AEKL", dataset, device, patched=True)
+            vae = _build_vae_from_args(vae_type, args)
+            if vae is None:
+                continue
+            results[name] = benchmark_vae(vae, name, dataset, device, patched=True, mod_idx=mod_idx, field_idx=field_idx)
             del vae
             torch.cuda.empty_cache()
         except Exception as e:
-            print(f"✗ AEKL failed: {e}")
+            print(f"✗ {name} failed: {e}")
             import traceback
-
             traceback.print_exc()
-            results["AEKL"] = {"error": str(e)}
+            results[name] = {"error": str(e)}
 
-    # ── 2. VQ-VAE ────────────────────────────────────────────────────────────
-    if not args.skip_vqvae:
-        try:
-            vae = load_vqvae(Path(args.vqvae_ckpt), device)
-            results["VQ-VAE"] = benchmark_vae(
-                vae,
-                "VQ-VAE",
-                dataset,
-                device,
-                patched=True,
-                mod_idx=mod_idx,
-                field_idx=field_idx,
-            )
-            del vae
-            torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"✗ VQ-VAE failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            results["VQ-VAE"] = {"error": str(e)}
-
-    # ── 3. MedVAE frozen ─────────────────────────────────────────────────────
-    if not args.skip_medvae:
-        try:
-            vae = load_medvae(
-                model_name=args.medvae_model_name,
-                device=device,
-                checkpoint_path=None,  # poids HuggingFace originaux
-            )
-            if vae is not None:
-                results["MedVAE (frozen)"] = benchmark_vae(
-                    vae, "MedVAE (frozen)", dataset, device, patched=True
-                )
-                del vae
-                torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"✗ MedVAE frozen failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            results["MedVAE (frozen)"] = {"error": str(e)}
-
-    # ── 4. MedVAE fine-tuné ──────────────────────────────────────────────────
-    if not args.skip_medvae_finetuned:
-        ckpt = Path(args.medvae_finetuned_ckpt)
-        if not ckpt.exists():
-            print(f"⚠  MedVAE fine-tuné : checkpoint introuvable ({ckpt})")
-            print(
-                "   Entraîner d'abord : sbatch src/slurm/finetune_medvae_jeanzay.slurm"
-            )
-            results["MedVAE (fine-tuné)"] = {"error": "checkpoint_not_found"}
-        else:
-            try:
-                vae = load_medvae(
-                    model_name=args.medvae_model_name,
-                    device=device,
-                    checkpoint_path=ckpt,  # poids fine-tunés locaux
-                )
-                if vae is not None:
-                    results["MedVAE (fine-tuné)"] = benchmark_vae(
-                        vae, "MedVAE (fine-tuné)", dataset, device, patched=True
-                    )
-                    del vae
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"✗ MedVAE fine-tuné failed: {e}")
-                import traceback
-
-                traceback.print_exc()
-                results["MedVAE (fine-tuné)"] = {"error": str(e)}
-
-    # ── Sauvegarde CSV ───────────────────────────────────────────────────────
+    # Sauvegarde CSV
     csv_path = out_dir / f"benchmark_{args.modality}_{args.field}.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["VAE", "MAE", "MSE", "SSIM", "Time(s)", "N_Samples", "Status"])
         for vae_name, metrics in results.items():
             if "error" in metrics:
-                writer.writerow(
-                    [vae_name, "—", "—", "—", "—", "—", metrics.get("error", "failed")]
-                )
+                writer.writerow([vae_name, "-", "-", "-", "-", "-", metrics.get("error", "failed")])
             else:
-                writer.writerow(
-                    [
-                        vae_name,
-                        f"{metrics.get('mae', np.nan):.4f}",
-                        f"{metrics.get('mse', np.nan):.4f}",
-                        f"{metrics.get('ssim', np.nan):.4f}",
-                        f"{metrics.get('time', np.nan):.2f}",
-                        metrics.get("n_samples", "—"),
-                        "OK",
-                    ]
-                )
+                writer.writerow([
+                    vae_name,
+                    f"{metrics.get('mae', np.nan):.4f}",
+                    f"{metrics.get('mse', np.nan):.4f}",
+                    f"{metrics.get('ssim', np.nan):.4f}",
+                    f"{metrics.get('time', np.nan):.2f}",
+                    metrics.get("n_samples", "-"),
+                    "OK",
+                ])
 
     print(f"\n{'=' * 70}")
-    print(f" Benchmark complet — résultats sauvegardés :")
-    print(f" {csv_path}")
+    print(f" Benchmark complet — résultats sauvegardés : {csv_path}")
     print(f"{'=' * 70}\n")
-
-    # ── Tableau récapitulatif ────────────────────────────────────────────────
-    col_w = 24
-    print(f"{'VAE':<{col_w}} {'MAE':<12} {'SSIM':<12} {'Time (s)':<12} {'Status'}")
-    print("-" * 72)
-    for vae_name, metrics in results.items():
-        if "error" in metrics:
-            print(
-                f"{vae_name:<{col_w}} {'—':<12} {'—':<12} {'—':<12} "
-                f"{metrics.get('error', 'failed')}"
-            )
-        else:
-            print(
-                f"{vae_name:<{col_w}} "
-                f"{metrics.get('mae', np.nan):<12.4f} "
-                f"{metrics.get('ssim', np.nan):<12.4f} "
-                f"{metrics.get('time', np.nan):<12.2f} OK"
-            )
-    print("-" * 72)
 
 
 if __name__ == "__main__":

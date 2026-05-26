@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""
-VAE 3D — Pré-entraînement d'un autoencodeur variationnel 3D pour IRM.
+"""VAE 3D — Pré-entraînement d'un autoencodeur variationnel 3D pour IRM.
 
 Architecture : AutoencoderKL 3D (MONAI) — 3 niveaux de compression → 8× spatiale.
 Pour un volume 512×512×192 → latent 64×64×24 (en latent_channels=4).
 
 Usage :
-  # Entraînement single-GPU
+  # Single-GPU
   python src/train_vae_3d.py --config configs/vae3d_T1W.yaml --env local
 
   # Multi-GPU (torchrun, DDP)
@@ -24,116 +23,41 @@ import os
 import time
 from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import nibabel as nib
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
-from scipy.ndimage import zoom as scipy_zoom
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
 
 # MONAI generative models
 try:
-    # MONAI récent (intégration generative dans monai.networks)
     from monai.networks.nets import AutoencoderKL
 except ImportError:
     try:
-        # MONAI avec sous-module generative
         from monai.generative.networks.nets import AutoencoderKL
     except ImportError:
-        try:
-            # MONAI Generative package (namespace séparé)
-            from generative.networks.nets import AutoencoderKL
-        except ImportError as e:
-            raise ImportError(
-                "AutoencoderKL introuvable. Essayez l'un des paquets : "
-                "monai>=1.3, monai[generation], ou monai-generative"
-            ) from e
+        from generative.networks.nets import AutoencoderKL
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-DOMAINS: List[str] = ["0.1T", "1.5T", "3T", "5T", "7T"]
+from common.config import load_env, resolve_paths
+from common.distributed import is_main_process
+from common.io import DOMAINS, normalize_volume, resample_volume, list_nifti_files
+from pathlib import Path
+import nibabel as nib
 
 
-# ===========================================================================
-# Utilitaire : rééchantillonnage isotrope
-# ===========================================================================
+# --------------------------------------------------------------------------- #
+# Dataset with patch extraction                                               #
+# --------------------------------------------------------------------------- #
 
 
-def _resample_volume(
-    vol: np.ndarray,
-    original_spacing,
-    target_spacing: Tuple[float, float, float],
-) -> np.ndarray:
-    """Rééchantillonne un volume 3D vers target_spacing (mm).
+class PatchedNIfTIVolumeDataset(Dataset):
+    """Dataset with random/center patch extraction for VAE pre-training.
 
-    Exemple : 364×436×364 @ 0.5mm → 182×218×182 @ 1mm (8× moins de voxels).
-    """
-    orig = np.asarray(original_spacing[:3], dtype=float)
-    tgt = np.asarray(target_spacing, dtype=float)
-    factors = orig / tgt  # < 1 si on agrandit les voxels (downsample)
-    if np.allclose(factors, 1.0, atol=0.02):
-        return vol  # déjà au bon spacing
-    return scipy_zoom(vol, factors, order=1).astype(np.float32)
-
-
-_SPLIT_ABBR_TO_DIR = {
-    "retro_train": "Training_retrospective",
-    "pro_train": "Training_prospective",
-    "pro_val": "Validating_prospective",
-    "pro_test": "Testing_prospective",
-}
-
-
-# ===========================================================================
-# Env / Path resolution
-# ===========================================================================
-
-
-def _load_env(env_arg: Optional[str]) -> Optional[dict]:
-    if env_arg is None:
-        return None
-    env_path = env_arg if env_arg.endswith(".yaml") else f"configs/env/{env_arg}.yaml"
-    if not os.path.isabs(env_path):
-        if os.path.exists(env_path):
-            env_path = os.path.abspath(env_path)
-        else:
-            project_root = Path(__file__).parent.parent
-            candidate = project_root / env_path
-            if candidate.exists():
-                env_path = str(candidate)
-    with open(env_path) as f:
-        raw = yaml.safe_load(f)
-    return {k: os.path.expandvars(str(v)) for k, v in raw.items()}
-
-
-def _resolve_paths(cfg: dict, env: Optional[dict]) -> dict:
-    if env is None:
-        return cfg
-    output_root = Path(env["output_root"])
-    data = cfg.setdefault("data", {})
-    if "output_subdir" in data:
-        data["output_dir"] = str(output_root / data["output_subdir"])
-    if "data_root" in env:
-        data.setdefault("data_root", env["data_root"])
-    return cfg
-
-
-# ===========================================================================
-# Dataset 3D — lecture NIfTI avec normalisation par volume
-# ===========================================================================
-
-
-class NIfTIVolumeDataset(Dataset):
-    """Charge des volumes NIfTI 3D et retourne des patches aléatoires.
-
-    Normalisation : percentile [lower, upper] → [0, 1] puis → [-1, 1].
-    Si patch_size est None, retourne le volume entier (redimensionné ou cropé).
+    Uses common.io preprocessing functions for resampling and normalization.
     """
 
     def __init__(
@@ -154,40 +78,38 @@ class NIfTIVolumeDataset(Dataset):
         self.is_training = is_training
         self.target_spacing = target_spacing
 
-        split_dir = _SPLIT_ABBR_TO_DIR.get(split, split)
         self.volumes: List[Path] = []
         for domain in domains:
-            domain_dir = Path(data_root) / split_dir / modality / domain
-            found = sorted(domain_dir.glob("*.nii.gz"))
-            if not found:
-                print(f"  [WARN] Aucun volume dans {domain_dir}")
-            self.volumes.extend(found)
+            files = list_nifti_files(data_root, split, modality, domain)
+            if not files:
+                print(f"  [WARN] Aucun volume dans {split}/{modality}/{domain}")
+            self.volumes.extend(files)
 
         if not self.volumes:
             raise FileNotFoundError(
-                f"Aucun volume NIfTI trouvé dans {data_root}/{split_dir}/{modality}/"
+                f"Aucun volume NIfTI trouvé dans {data_root}/{split}/{modality}/"
             )
         print(
-            f"  NIfTIVolumeDataset: {len(self.volumes)} volumes ({modality}, {split})"
+            f"  PatchedNIfTIVolumeDataset: {len(self.volumes)} volumes ({modality}, {split})"
         )
 
     def __len__(self) -> int:
         return len(self.volumes)
 
-    def _normalize(self, vol: np.ndarray) -> np.ndarray:
-        """Percentile normalization → [0, 1] → [-1, 1]."""
-        lo = np.percentile(vol, self.percentile_lower)
-        hi = np.percentile(vol, self.percentile_upper)
-        if hi > lo:
-            vol = (vol - lo) / (hi - lo)
-        vol = np.clip(vol, 0.0, 1.0)
-        return vol * 2.0 - 1.0  # [0,1] → [-1, 1]
+    def _load_and_preprocess(self, idx: int) -> np.ndarray:
+        img_nib = nib.load(str(self.volumes[idx]))
+        if self.target_spacing is not None:
+            spacing = np.abs(np.diag(img_nib.affine)[:3])
+            vol = img_nib.get_fdata(dtype=np.float32)
+            vol = resample_volume(vol, spacing, self.target_spacing)
+        else:
+            vol = img_nib.get_fdata(dtype=np.float32)
+        vol = normalize_volume(vol, self.percentile_lower, self.percentile_upper)
+        return vol
 
     def _random_crop(self, vol: np.ndarray) -> np.ndarray:
-        """Crop aléatoire de taille patch_size depuis un volume 3D."""
         ph, pw, pd = self.patch_size
         h, w, d = vol.shape
-        # Padding si volume plus petit que le patch
         ph_pad = max(0, ph - h)
         pw_pad = max(0, pw - w)
         pd_pad = max(0, pd - d)
@@ -198,14 +120,12 @@ class NIfTIVolumeDataset(Dataset):
                 mode="reflect",
             )
             h, w, d = vol.shape
-        # Crop aléatoire
         sh = np.random.randint(0, h - ph + 1)
         sw = np.random.randint(0, w - pw + 1)
         sd = np.random.randint(0, d - pd + 1)
         return vol[sh : sh + ph, sw : sw + pw, sd : sd + pd]
 
     def _center_crop(self, vol: np.ndarray) -> np.ndarray:
-        """Crop au centre de taille patch_size."""
         ph, pw, pd = self.patch_size
         h, w, d = vol.shape
         ph_pad = max(0, ph - h)
@@ -220,29 +140,18 @@ class NIfTIVolumeDataset(Dataset):
         return vol[sh : sh + ph, sw : sw + pw, sd : sd + pd]
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        img_nib = nib.load(str(self.volumes[idx]))
-        if self.target_spacing is not None:
-            spacing = np.abs(np.diag(img_nib.affine)[:3])  # voxel size (mm)
-            vol = img_nib.get_fdata(dtype=np.float32)
-            vol = _resample_volume(vol, spacing, self.target_spacing)
-        else:
-            vol = img_nib.get_fdata(dtype=np.float32)
-        vol = self._normalize(vol)
-
+        vol = self._load_and_preprocess(idx)
         if self.patch_size is not None:
             if self.is_training:
                 vol = self._random_crop(vol)
             else:
                 vol = self._center_crop(vol)
-
-        # (H, W, D) → (1, H, W, D)
-        tensor = torch.from_numpy(vol).unsqueeze(0)
-        return tensor
+        return torch.from_numpy(vol).unsqueeze(0)  # (1, H, W, D)
 
 
-# ===========================================================================
-# Build VAE 3D
-# ===========================================================================
+# --------------------------------------------------------------------------- #
+# Build VAE 3D                                                                #
+# --------------------------------------------------------------------------- #
 
 
 def build_vae(cfg: dict) -> AutoencoderKL:
@@ -271,22 +180,17 @@ def build_vae(cfg: dict) -> AutoencoderKL:
     return AutoencoderKL(**filtered_kwargs)
 
 
-# ===========================================================================
-# Training
-# ===========================================================================
-
-
-def is_main_process() -> bool:
-    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+# --------------------------------------------------------------------------- #
+# Training                                                                    #
+# --------------------------------------------------------------------------- #
 
 
 def train(
     cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] = None
 ) -> None:
-    # ── Config ──────────────────────────────────────────────────────────────
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
-    cfg = _resolve_paths(cfg, _load_env(env_path))
+    cfg = resolve_paths(cfg, load_env(env_path))
     if resume is not None:
         cfg["resume"] = resume
 
@@ -335,7 +239,7 @@ def train(
         print(f"Device     : {device}")
 
     # ── Dataset ─────────────────────────────────────────────────────────────
-    train_ds = NIfTIVolumeDataset(
+    train_ds = PatchedNIfTIVolumeDataset(
         data_root=Path(data_root),
         split=split,
         modality=modality,
@@ -347,11 +251,10 @@ def train(
         target_spacing=target_spacing,
     )
 
-    # Essayer de charger un dataset de validation spécifique;
-    # si inexistant, faire un split simple du training set.
+    # Validation split
     val_split_fraction = cfg["data"].get("val_split_fraction", 0.2)
     try:
-        val_ds = NIfTIVolumeDataset(
+        val_ds = PatchedNIfTIVolumeDataset(
             data_root=Path(data_root),
             split="pro_val",
             modality=modality,
@@ -364,20 +267,17 @@ def train(
         )
         if is_main_process():
             print(f"  → Validation dataset chargé depuis Validating_prospective")
-    except FileNotFoundError as e:
+    except FileNotFoundError:
         if is_main_process():
             print(f"  [INFO] Validation dataset non trouvé")
             print(
-                f"  → Création d'un split train/val depuis {split} ({int((1 - val_split_fraction) * 100)}% train, {int(val_split_fraction * 100)}% val)"
+                f"  → Création d'un split train/val depuis {split} "
+                f"({int((1 - val_split_fraction) * 100)}% train, {int(val_split_fraction * 100)}% val)"
             )
-        # Split simple du training set
-        from torch.utils.data import Subset
-
         full_ds = train_ds
         n_total = len(full_ds)
         n_val = max(1, int(n_total * val_split_fraction))
         indices = list(range(n_total))
-        # Utiliser un seed fixe pour reproductibilité sur tous les processus
         rng = np.random.RandomState(42)
         rng.shuffle(indices)
         train_indices = indices[n_val:]
@@ -450,7 +350,6 @@ def train(
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # KL warmup : annulation progressive pour stabiliser la reconstruction
         kl_factor = min(1.0, (epoch + 1) / max(kl_warmup, 1))
         effective_kl = kl_weight * kl_factor
 
@@ -467,7 +366,6 @@ def train(
             images = batch.to(device)  # (B, 1, H, W, D)
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                # AutoencoderKL retourne (reconstruction, z_mu, z_sigma)
                 recon, z_mu, z_sigma = raw_model(images)
                 recon_loss = F.l1_loss(recon, images)
                 kl_loss = 0.5 * torch.mean(z_mu.pow(2) + z_sigma.exp() - z_sigma - 1.0)
@@ -559,12 +457,12 @@ def train(
 @torch.no_grad()
 def _validate(
     model,
-    val_loader: DataLoader,
-    device: torch.device,
-    use_amp: bool,
+    val_loader,
+    device,
+    use_amp,
     amp_dtype,
-    effective_kl: float,
-) -> float:
+    effective_kl,
+):
     model.eval()
     total_loss = 0.0
     n = 0
@@ -581,9 +479,9 @@ def _validate(
     return total_loss / max(n, 1)
 
 
-# ===========================================================================
-# Inference helper : encode / decode un volume complet
-# ===========================================================================
+# --------------------------------------------------------------------------- #
+# Inference helpers                                                           #
+# --------------------------------------------------------------------------- #
 
 
 @torch.no_grad()
@@ -596,15 +494,11 @@ def encode_volume(
     use_amp: bool = False,
 ) -> torch.Tensor:
     """Encode un volume NIfTI numpy → latent tensor (1, C, H', W', D')."""
-    lo = np.percentile(volume, percentile_lower)
-    hi = np.percentile(volume, percentile_upper)
-    vol = np.clip((volume - lo) / max(hi - lo, 1e-8), 0.0, 1.0) * 2.0 - 1.0
-    t = (
-        torch.from_numpy(vol).float().unsqueeze(0).unsqueeze(0).to(device)
-    )  # (1,1,H,W,D)
+    vol = normalize_volume(volume, percentile_lower, percentile_upper)
+    t = torch.from_numpy(vol).float().unsqueeze(0).unsqueeze(0).to(device)
     with torch.amp.autocast("cuda", enabled=use_amp):
         z_mu, _ = model.encode(t)
-    return z_mu  # Utilise la moyenne (pas d'échantillonnage en inférence)
+    return z_mu
 
 
 @torch.no_grad()
@@ -617,13 +511,12 @@ def decode_volume(
     """Decode un latent tensor → volume numpy dans [-1, 1]."""
     with torch.amp.autocast("cuda", enabled=use_amp):
         recon = model.decode(latent)
-    vol = recon.squeeze().cpu().numpy()  # (H, W, D)
-    return np.clip(vol, -1.0, 1.0)
+    return np.clip(recon.squeeze().cpu().numpy(), -1.0, 1.0)
 
 
-# ===========================================================================
-# CLI
-# ===========================================================================
+# --------------------------------------------------------------------------- #
+# CLI                                                                         #
+# --------------------------------------------------------------------------- #
 
 
 def _parse() -> argparse.Namespace:

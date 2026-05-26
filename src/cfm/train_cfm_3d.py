@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-OT-CFM 3D en espace latent — Traduction de contraste IRM 3D volumétrique.
+"""OT-CFM 3D en espace latent — Traduction de contraste IRM 3D volumétrique.
 
 Architecture :
   - VAE 3D pré-entraîné (AEKL / MedVAE / VQ-VAE) → espace latent
@@ -38,9 +37,7 @@ import os
 import random
 import sys
 import time
-from abc import ABC, abstractmethod
 from collections import deque
-from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -48,658 +45,41 @@ import nibabel as nib
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 import torch.nn.functional as F
-import yaml
-from scipy.ndimage import zoom as scipy_zoom
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler
 
-# Ajouter src/ au path pour les imports locaux (vae3d/)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from common.config import load_yaml_with_include, load_env, resolve_paths
+from common.dataset import NIfTILatentDataset
+from common.distributed import is_main_process, EMAModel
+from common.io import (
+    DOMAINS,
+    DOMAIN_TO_IDX,
+    center_crop_or_pad_np,
+    load_nifti_volume,
+    normalize_volume,
+    resample_volume,
+    adjust_affine_for_crop_pad,
+)
+from models.vae_loader import load_vae
+
 try:
-    # MONAI récent (intégration generative dans monai.networks)
-    from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
+    from monai.networks.nets import DiffusionModelUNet
 except ImportError:
     try:
-        from monai.generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+        from monai.generative.networks.nets import DiffusionModelUNet
     except ImportError:
-        try:
-            from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
-        except ImportError as e:
-            raise ImportError(
-                "AutoencoderKL/DiffusionModelUNet introuvables. "
-                "Essayez : monai>=1.3, monai[generation], ou monai-generative"
-            ) from e
+        from generative.networks.nets import DiffusionModelUNet
 
 from torchcfm.conditional_flow_matching import (
     ConditionalFlowMatcher,
     ExactOptimalTransportConditionalFlowMatcher,
 )
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-DOMAINS: List[str] = ["0.1T", "1.5T", "3T", "5T", "7T"]
-DOMAIN_TO_IDX: Dict[str, int] = {d: i for i, d in enumerate(DOMAINS)}
+
 NUM_DOMAINS = len(DOMAINS)
-
-
-# ===========================================================================
-# Utilitaire : rééchantillonnage isotrope
-# ===========================================================================
-
-
-def _resample_volume(
-    vol: np.ndarray,
-    original_spacing,
-    target_spacing: Tuple[float, float, float],
-) -> np.ndarray:
-    """Rééchantillonne un volume 3D vers target_spacing (mm).
-
-    Exemple : 364×436×364 @ 0.5mm → 182×218×182 @ 1mm (8× moins de voxels).
-    """
-    orig = np.asarray(original_spacing[:3], dtype=float)
-    tgt = np.asarray(target_spacing, dtype=float)
-    factors = orig / tgt
-    if np.allclose(factors, 1.0, atol=0.02):
-        return vol
-    return scipy_zoom(vol, factors, order=1).astype(np.float32)
-
-
-def _center_crop_or_pad_np(
-    vol: np.ndarray, volume_size: Tuple[int, int, int]
-) -> np.ndarray:
-    """Centre-crop ou pad un volume 3D NumPy vers volume_size (H, W, D)."""
-    th, tw, td = volume_size
-    h, w, d = vol.shape
-
-    # Pad si le volume est trop petit
-    ph = max(0, th - h)
-    pw = max(0, tw - w)
-    pd = max(0, td - d)
-    if ph > 0 or pw > 0 or pd > 0:
-        vol = np.pad(
-            vol,
-            [(ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (pd // 2, pd - pd // 2)],
-            mode="reflect",
-        )
-        h, w, d = vol.shape
-
-    # Crop centré
-    sh = max((h - th) // 2, 0)
-    sw = max((w - tw) // 2, 0)
-    sd = max((d - td) // 2, 0)
-    return vol[sh : sh + th, sw : sw + tw, sd : sd + td]
-
-
-_SPLIT_ABBR_TO_DIR = {
-    "retro_train": "Training_retrospective",
-    "pro_train": "Training_prospective",
-    "pro_val": "Validating_prospective",
-    "pro_test": "Testing_prospective",
-}
-
-
-# ===========================================================================
-# Env / Path resolution
-# ===========================================================================
-
-
-def _load_env(env_arg: Optional[str]) -> Optional[dict]:
-    if env_arg is None:
-        return None
-    env_path = env_arg if env_arg.endswith(".yaml") else f"configs/env/{env_arg}.yaml"
-    if not os.path.isabs(env_path):
-        if os.path.exists(env_path):
-            env_path = os.path.abspath(env_path)
-        else:
-            project_root = Path(__file__).parent.parent
-            candidate = project_root / env_path
-            if candidate.exists():
-                env_path = str(candidate)
-    with open(env_path) as f:
-        raw = yaml.safe_load(f)
-    return {k: os.path.expandvars(str(v)) for k, v in raw.items()}
-
-
-def _resolve_paths(cfg: dict, env: Optional[dict]) -> dict:
-    if env is None:
-        return cfg
-    output_root = Path(env["output_root"])
-    data = cfg.setdefault("data", {})
-    if "output_subdir" in data:
-        data["output_dir"] = str(output_root / data["output_subdir"])
-    if "data_root" in env:
-        data.setdefault("data_root", env["data_root"])
-    # VAE checkpoint depuis env si non spécifié dans config
-    vae_cfg = cfg.setdefault("vae", {})
-    if "vae_root" in env and not vae_cfg.get("checkpoint"):
-        subdir = cfg["data"].get("output_subdir", "").replace("cfm3d", "vae3d")
-        vae_cfg["checkpoint"] = str(
-            Path(env["output_root"])
-            / subdir.replace("cfm3d_latent", "vae3d")
-            / "weights"
-            / "model_best.pth"
-        )
-    return cfg
-
-
-# ===========================================================================
-# Dataset
-# ===========================================================================
-
-
-class NIfTILatentDataset(Dataset):
-    """Charge des volumes NIfTI, les normalise et les retourne entiers pour
-    l'encodage VAE on-the-fly.
-
-    Retourne : (volume_tensor, domain_idx)
-    où volume_tensor est (1, H, W, D) dans [-1, 1].
-
-    Note : L'encodage VAE est fait dans la boucle d'entraînement (sur GPU),
-    pas ici (pour bénéficier du cache de gradient checkpointing).
-    """
-
-    def __init__(
-        self,
-        data_root: Path,
-        split: str,
-        modality: str,
-        domains: List[str],
-        percentile_lower: float = 0.5,
-        percentile_upper: float = 99.5,
-        max_per_domain: Optional[int] = None,
-        target_spacing: Optional[Tuple[float, float, float]] = None,
-        volume_size: Optional[Tuple[int, int, int]] = None,
-    ):
-        self.percentile_lower = percentile_lower
-        self.percentile_upper = percentile_upper
-        self.target_spacing = target_spacing
-        self.volume_size = volume_size
-
-        split_dir = _SPLIT_ABBR_TO_DIR.get(split, split)
-        self.samples: List[Tuple[Path, int]] = []
-        for domain in domains:
-            domain_dir = Path(data_root) / split_dir / modality / domain
-            files = sorted(domain_dir.glob("*.nii.gz"))
-            if max_per_domain is not None:
-                files = files[:max_per_domain]
-            if not files:
-                print(f"  [WARN] Aucun volume dans {domain_dir}")
-            for f in files:
-                self.samples.append((f, DOMAIN_TO_IDX[domain]))
-
-        if not self.samples:
-            raise FileNotFoundError(
-                f"Aucun volume NIfTI dans {data_root}/{split_dir}/{modality}/"
-            )
-        print(
-            f"  NIfTILatentDataset: {len(self.samples)} volumes ({modality}, {split})"
-        )
-
-    def _normalize(self, vol: np.ndarray) -> np.ndarray:
-        lo = np.percentile(vol, self.percentile_lower)
-        hi = np.percentile(vol, self.percentile_upper)
-        vol = np.clip((vol - lo) / max(hi - lo, 1e-8), 0.0, 1.0)
-        return vol * 2.0 - 1.0  # → [-1, 1]
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def _center_crop_or_pad(self, vol: np.ndarray) -> np.ndarray:
-        if self.volume_size is None:
-            return vol
-
-        th, tw, td = self.volume_size
-        h, w, d = vol.shape
-
-        # Pad si le volume est trop petit sur un axe.
-        ph = max(0, th - h)
-        pw = max(0, tw - w)
-        pd = max(0, td - d)
-        if ph > 0 or pw > 0 or pd > 0:
-            vol = np.pad(
-                vol,
-                [
-                    (ph // 2, ph - ph // 2),
-                    (pw // 2, pw - pw // 2),
-                    (pd // 2, pd - pd // 2),
-                ],
-                mode="reflect",
-            )
-            h, w, d = vol.shape
-
-        sh = max((h - th) // 2, 0)
-        sw = max((w - tw) // 2, 0)
-        sd = max((d - td) // 2, 0)
-        return vol[sh : sh + th, sw : sw + tw, sd : sd + td]
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        path, domain_idx = self.samples[idx]
-        img_nib = nib.load(str(path))
-        if self.target_spacing is not None:
-            spacing = np.abs(np.diag(img_nib.affine)[:3])
-            vol = img_nib.get_fdata(dtype=np.float32)
-            vol = _resample_volume(vol, spacing, self.target_spacing)
-        else:
-            vol = img_nib.get_fdata(dtype=np.float32)
-        vol = self._normalize(vol)
-        vol = self._center_crop_or_pad(vol)
-        tensor = torch.from_numpy(vol).unsqueeze(0)  # (1, H, W, D)
-        return tensor, domain_idx
-
-
-def _make_infinite(loader: DataLoader):
-    while True:
-        yield from loader
-
-
-# ===========================================================================
-# VAE Wrappers — interface unifiée encode / decode
-# ===========================================================================
-
-
-class VAEWrapper(nn.Module, ABC):
-    """
-    Interface unifiée pour tous les VAE de l'étape 2.
-    Expose encode(x) → z et decode(z) → x.
-    L'attribut `latent_channels` indique le nombre de canaux du latent.
-    """
-
-    latent_channels: int
-
-    @abstractmethod
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode x en latent z. (B,1,H,W,D) → (B,C_lat,H',W',D')"""
-
-    @abstractmethod
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Décode z en image. (B,C_lat,H',W',D') → (B,1,H,W,D)"""
-
-
-class AEKLWrapper(VAEWrapper):
-    """
-    Wrapper pour AutoencoderKL (MONAI).
-    vae.encode(x) retourne (z_mu, z_logvar) ; on utilise z_mu pour le CFM.
-    """
-
-    def __init__(self, model: AutoencoderKL):
-        super().__init__()
-        self.model = model
-        # Déduire latent_channels depuis les poids du modèle
-        self.latent_channels: int = _infer_aekl_latent_channels(model)
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        z_mu, _ = self.model.encode(x)
-        return z_mu
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        return self.model.decode(z)
-
-
-def _infer_aekl_latent_channels(model: AutoencoderKL) -> int:
-    """Déduit dynamiquement le nombre de canaux latents depuis le modèle."""
-    # Cherche dans les attributs connus
-    for attr in ("latent_channels", "z_channels", "latent_dim"):
-        v = getattr(model, attr, None)
-        if isinstance(v, int):
-            return v
-    # Fallback : forward pass dummy
-    try:
-        with torch.no_grad():
-            dummy = torch.zeros(
-                1, 1, 32, 32, 32, device=next(model.parameters()).device
-            )
-            z_mu, _ = model.encode(dummy)
-            return z_mu.shape[1]
-    except Exception:
-        return 4  # valeur MONAI par défaut
-
-
-class MedVAEWrapper(VAEWrapper):
-    """
-    Wrapper pour MedVAE (StanfordMIMI).
-    Supporte les versions frozen (poids HuggingFace) et fine-tunée (checkpoint local).
-
-    API MedVAE : model.encode(x) → (z,) ou z  |  model.decode(z) → x
-    """
-
-    def __init__(self, model, latent_ch: int):
-        super().__init__()
-        self.model = model
-        self.latent_channels: int = latent_ch
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode x → z (déterministe : prend la mean si MVAE retourne (mean, logvar)).
-        Le modèle doit être en .eval() — garanti par load_vae()."""
-        z = self.model.encode(x)
-        # MVAE peut retourner (mean, logvar) ou directement z.
-        # On prend z[0] = mean pour garantir l'encodage déterministe.
-        if isinstance(z, (tuple, list)):
-            z = z[0]
-        return z
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        out = self.model.decode(z)
-        if isinstance(out, (tuple, list)):
-            out = out[0]
-        return out
-
-
-class VQVAEWrapper(VAEWrapper):
-    """
-    Wrapper pour NeuroQuantHybrid (VQ-VAE adapté, src/vae3d/train_vqvae.py).
-
-    Le CFM opère dans l'espace latent anatomique quantifié z_q :
-      - encode : x → DualStreamEncoder → (z_anat, z_mod) → quantizer → z_q
-      - decode : z_q + z_mod (caché de l'encode) → FiLMDecoder → x
-
-    Lors de l'inférence (decode sans encode préalable), z_mod = 0.
-    """
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        self._cached_z_mod: Optional[torch.Tensor] = None
-        # latent_channels = anat_channels du quantizer
-        self.latent_channels: int = self.model.quantizer.embedding_dim
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        z_anat, z_mod = self.model.encoder(x)
-        z_q, _, _ = self.model.quantizer(z_anat)
-        # Cache z_mod pour le décodage suivant
-        self._cached_z_mod = z_mod.detach()
-        return z_q
-
-    def decode(self, z_q: torch.Tensor) -> torch.Tensor:
-        b, device = z_q.shape[0], z_q.device
-        # Récupérer z_mod depuis le cache, ou utiliser zéros
-        z_mod = self._cached_z_mod
-        if z_mod is None or z_mod.shape[0] != b:
-            # Taille de z_mod : (B, mod_channels, H', W', D')
-            mod_ch = self.model.encoder.mod_head.out_channels
-            z_mod = torch.zeros(b, mod_ch, *z_q.shape[2:], device=device)
-        else:
-            z_mod = z_mod.to(device)
-        # Indices modalité / champ = 0 par défaut (neutre)
-        mod_idx = torch.zeros(b, dtype=torch.long, device=device)
-        field_idx = torch.zeros(b, dtype=torch.long, device=device)
-        return self.model.decoder(z_q, z_mod, mod_idx, field_idx)
-
-
-# ===========================================================================
-# Chargement des VAE
-# ===========================================================================
-
-
-def _build_vae_from_config(vae_cfg: dict) -> AutoencoderKL:
-    """Instancie l'AutoencoderKL 3D depuis une config YAML."""
-    m = vae_cfg["model"]
-    sig = inspect.signature(AutoencoderKL.__init__).parameters
-    kwargs = {
-        "spatial_dims": m["spatial_dims"],
-        "in_channels": m["in_channels"],
-        "out_channels": m["out_channels"],
-        "latent_channels": m["latent_channels"],
-        "num_res_blocks": m["num_res_blocks"],
-        "norm_num_groups": m["norm_num_groups"],
-        "attention_levels": tuple(m["attention_levels"]),
-        "with_encoder_nonlocal_attn": m["with_encoder_nonlocal_attn"],
-        "with_decoder_nonlocal_attn": m["with_decoder_nonlocal_attn"],
-    }
-
-    channels = tuple(m["channels"])
-    if "channels" in sig:
-        kwargs["channels"] = channels
-    elif "num_channels" in sig:
-        kwargs["num_channels"] = channels
-
-    filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig}
-    return AutoencoderKL(**filtered_kwargs)
-
-
-def _load_maisi_autoencoder(cache_dir: Optional[str] = None) -> AutoencoderKL:
-    """Télécharge et charge le VAE MAISI depuis le Model Zoo MONAI.
-
-    Le bundle 'maisi_ct_generative' inclut un AutoencoderKL 3D pré-entraîné
-    sur ~40k volumes CT (compression 8×, latent_channels=4). Les poids peuvent
-    être utilisés comme initialisation pour l'IRM.
-
-    Référence MAISI : https://arxiv.org/abs/2409.11169
-
-    Note : si le téléchargement échoue (pas d'internet, etc.), utilisez
-    'vae.source: local' avec un checkpoint pré-entraîné local.
-    """
-    try:
-        from monai.bundle import download
-    except ImportError:
-        raise ImportError(
-            "MONAI bundle API non disponible. Mettez à jour MONAI >= 1.3."
-        )
-
-    bundle_dir = Path(cache_dir or os.path.expanduser("~/.cache/monai/bundles"))
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-    bundle_name = "maisi_ct_generative"
-
-    print(f"  Téléchargement du bundle MAISI '{bundle_name}' dans {bundle_dir} ...")
-    download(name=bundle_name, source="monai", bundle_dir=str(bundle_dir))
-
-    # Chemin des poids de l'autoencoder dans le bundle MAISI
-    autoencoder_ckpt = bundle_dir / bundle_name / "models" / "autoencoder.pt"
-    if not autoencoder_ckpt.exists():
-        # Chercher dans les fichiers disponibles
-        models_dir = bundle_dir / bundle_name / "models"
-        candidates = (
-            sorted(models_dir.glob("*autoencoder*")) if models_dir.exists() else []
-        )
-        if not candidates:
-            raise FileNotFoundError(
-                f"Autoencoder MAISI introuvable dans {models_dir}.\n"
-                f"Fichiers disponibles : {list(models_dir.iterdir()) if models_dir.exists() else 'dir absent'}"
-            )
-        autoencoder_ckpt = candidates[0]
-
-    # Config MAISI pour AutoencoderKL 3D
-    # Architecture standard MAISI : latent_channels=4, compression 8×
-    maisi_model_cfg = {
-        "model": {
-            "spatial_dims": 3,
-            "in_channels": 1,
-            "out_channels": 1,
-            "latent_channels": 4,
-            "channels": [64, 128, 256, 512],
-            "num_res_blocks": 2,
-            "norm_num_groups": 32,
-            "attention_levels": [False, False, False, False],
-            "with_encoder_nonlocal_attn": False,
-            "with_decoder_nonlocal_attn": False,
-        }
-    }
-    vae = _build_vae_from_config(maisi_model_cfg)
-    state = torch.load(str(autoencoder_ckpt), map_location="cpu", weights_only=False)
-    # Le checkpoint MAISI peut avoir différentes clés
-    if "state_dict" in state:
-        state = state["state_dict"]
-    elif "model" in state:
-        state = state["model"]
-    vae.load_state_dict(state, strict=True)
-    print(f"  VAE MAISI chargé depuis : {autoencoder_ckpt}")
-    return vae
-
-
-def load_vae(cfg: dict, device: torch.device) -> VAEWrapper:
-    """
-    Charge le VAE de l'étape 2 et le retourne wrappé dans un VAEWrapper.
-
-    Sélecteur : cfg['vae']['vae_type']
-      'aekl'   (défaut) : AutoencoderKL MONAI
-                          source: 'local' | 'maisi' | 'random'
-      'medvae'           : MedVAE (StanfordMIMI/MedVAE)
-                          source: 'frozen' (HuggingFace) | 'local' (fine-tuné)
-      'vqvae'            : NeuroQuantHybrid (src/vae3d/train_vqvae.py)
-                          source: 'local'
-    """
-    vae_type = cfg["vae"].get("vae_type", "aekl").lower()
-    vae_source = cfg["vae"].get("source", "local")
-
-    print(f"  [load_vae] type={vae_type}  source={vae_source}")
-
-    if vae_type == "medvae":
-        wrapper = _load_medvae(cfg, device, vae_source)
-
-    elif vae_type == "vqvae":
-        wrapper = _load_vqvae(cfg, device)
-
-    else:  # aekl (défaut)
-        wrapper = _load_aekl(cfg, device, vae_source)
-
-    wrapper = wrapper.to(device)
-    wrapper.eval()
-    for p in wrapper.parameters():
-        p.requires_grad_(False)
-    print(f"  [load_vae] latent_channels={wrapper.latent_channels}")
-    return wrapper
-
-
-def _load_aekl(cfg: dict, device: torch.device, source: str) -> AEKLWrapper:
-    """Charge AutoencoderKL MONAI (source: local | maisi | random)."""
-    if source == "maisi":
-        cache_dir = cfg["vae"].get("maisi_cache_dir", None)
-        model = _load_maisi_autoencoder(cache_dir)
-    else:
-        vae_config_path = cfg["vae"].get("vae_config", "configs/vae3d_T1W.yaml")
-        if not os.path.isabs(vae_config_path):
-            project_root = Path(__file__).parent.parent
-            vae_config_path = str(project_root / vae_config_path)
-        with open(vae_config_path) as f:
-            vae_cfg = yaml.safe_load(f)
-        model = _build_vae_from_config(vae_cfg)
-        if source != "random":
-            ckpt_path = cfg["vae"].get("checkpoint", "")
-            if ckpt_path and Path(ckpt_path).exists():
-                state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-                model.load_state_dict(state["model"] if "model" in state else state)
-                print(f"  AEKL chargé depuis : {ckpt_path}")
-            else:
-                print(
-                    f"  [WARN] AEKL checkpoint introuvable : '{ckpt_path}' — poids aléatoires."
-                )
-    return AEKLWrapper(model)
-
-
-def _load_medvae(cfg: dict, device: torch.device, source: str) -> MedVAEWrapper:
-    """
-    Charge MedVAE (https://github.com/StanfordMIMI/MedVAE).
-
-    source='frozen'  → poids originaux depuis HuggingFace (pip install medvae)
-    source='local'   → checkpoint fine-tuné sur MRIxFields (cfg['vae']['checkpoint'])
-    """
-    model_name = cfg["vae"].get("model_name", "medvae_4_1_3d")
-    try:
-        from medvae import MVAE
-    except ImportError:
-        raise ImportError("medvae non installé. Installez avec : pip install medvae")
-    model = MVAE(model_name=model_name, modality="mri")
-
-    if source == "local":
-        ckpt_path = cfg["vae"].get("checkpoint", "")
-        if ckpt_path and Path(ckpt_path).exists():
-            state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            model.load_state_dict(state["model"] if "model" in state else state)
-            print(f"  MedVAE fine-tuné chargé depuis : {ckpt_path}")
-        else:
-            print(f"  [WARN] MedVAE checkpoint introuvable : '{ckpt_path}'.")
-    else:
-        print(f"  MedVAE frozen chargé depuis HuggingFace ({model_name}).")
-
-    # ── Déduire latent_channels via forward pass dummy ─────────────────────────
-    # Le nom 'medvae_4_1_3d' signifie : 4× compression spatiale, 1 canal latent.
-    # split("_")[1] = "4" (facteur spatial), split("_")[2] = "1" (canaux latents).
-    # On préfère un forward pass pour être robuste à tout format de nom.
-    try:
-        model.eval()
-        with torch.no_grad():
-            _dummy = torch.zeros(1, 1, 32, 32, 32)
-            _z = model.encode(_dummy)
-            if isinstance(_z, (tuple, list)):
-                _z = _z[0]
-            latent_ch = int(_z.shape[1])
-        print(f"  MedVAE latent_channels={latent_ch} (déduit via forward pass dummy)")
-    except Exception:
-        # Fallback : parser le nom (format: medvae_<spatial>_<channels>_3d)
-        try:
-            latent_ch = int(model_name.split("_")[2])
-        except Exception:
-            latent_ch = 1  # valeur par défaut pour medvae_4_1_3d
-        print(f"  MedVAE latent_channels={latent_ch} (déduit depuis le nom)")
-
-    return MedVAEWrapper(model, latent_ch)
-
-
-def _load_vqvae(cfg: dict, device: torch.device) -> VQVAEWrapper:
-    """
-    Charge NeuroQuantHybrid (VQ-VAE adapté).
-    Lit la config vae_config pour reconstruire l'architecture.
-    """
-    # Import local depuis src/vae3d/
-    try:
-        from vae3d.train_vqvae import NeuroQuantHybrid
-    except ImportError:
-        from train_vqvae import NeuroQuantHybrid  # fallback si CWD = src/
-
-    # Lire l'architecture depuis la config du VQ-VAE
-    vae_config_path = cfg["vae"].get("vae_config", "configs/vqvae3d_T1W.yaml")
-    if not os.path.isabs(vae_config_path):
-        project_root = Path(__file__).parent.parent
-        vae_config_path = str(project_root / vae_config_path)
-
-    if Path(vae_config_path).exists():
-        with open(vae_config_path) as f:
-            vqvae_cfg = yaml.safe_load(f)
-        m = vqvae_cfg.get("model", {})
-        model = NeuroQuantHybrid(
-            n_modalities=m.get("n_modalities", 3),
-            n_fields=m.get("n_fields", 5),
-            base_channels=m.get("base_channels", 32),
-            anat_channels=m.get("anat_channels", 64),
-            mod_channels=m.get("mod_channels", 32),
-            codebook_size=m.get("codebook_size", 1024),
-        )
-    else:
-        print(
-            f"  [WARN] Config VQ-VAE introuvable : {vae_config_path} — architecture par défaut."
-        )
-        model = NeuroQuantHybrid(
-            n_modalities=3,
-            n_fields=5,
-            base_channels=32,
-            anat_channels=64,
-            mod_channels=32,
-            codebook_size=1024,
-        )
-
-    ckpt_path = cfg["vae"].get("checkpoint", "")
-    if ckpt_path and Path(ckpt_path).exists():
-        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        state = state.get("model", state)
-        # Ignorer les clés incompatibles (field_emb si n_fields différent)
-        current = model.state_dict()
-        compatible = {
-            k: v
-            for k, v in state.items()
-            if k in current and current[k].shape == v.shape
-        }
-        skipped = len(state) - len(compatible)
-        model.load_state_dict(compatible, strict=False)
-        print(f"  VQ-VAE chargé depuis : {ckpt_path}  ({skipped} clé(s) ignorée(s))")
-    else:
-        print(
-            f"  [WARN] VQ-VAE checkpoint introuvable : '{ckpt_path}' — poids aléatoires."
-        )
-
-    return VQVAEWrapper(model)
 
 
 # ===========================================================================
@@ -708,12 +88,7 @@ def _load_vqvae(cfg: dict, device: torch.device) -> VQVAEWrapper:
 
 
 def build_unet_3d(cfg: dict, latent_channels: int) -> DiffusionModelUNet:
-    """UNet 3D conditionné sur le temps et le domaine cible.
-
-    in_channels = 2 * latent_channels  (cat z_t + z_src)
-    out_channels = latent_channels      (champ de vitesse)
-    num_class_embeds = NUM_DOMAINS      (label du domaine cible)
-    """
+    """UNet 3D conditionné sur le temps et le domaine cible."""
     m = cfg["model"]
     channel_mult = tuple(m.get("channel_mult", [1, 2, 4]))
     base_channels = m.get("model_channels", 128)
@@ -724,7 +99,7 @@ def build_unet_3d(cfg: dict, latent_channels: int) -> DiffusionModelUNet:
 
     return DiffusionModelUNet(
         spatial_dims=3,
-        in_channels=2 * latent_channels,  # cat(z_t, z_src)
+        in_channels=2 * latent_channels,
         out_channels=latent_channels,
         **{_ch_kwarg: channels},
         attention_levels=tuple(m.get("attention_levels", [False, True, True])),
@@ -732,37 +107,20 @@ def build_unet_3d(cfg: dict, latent_channels: int) -> DiffusionModelUNet:
         num_head_channels=m.get("num_head_channels", 64),
         norm_num_groups=m.get("norm_num_groups", 32),
         use_flash_attention=m.get("use_flash_attention", False),
-        num_class_embeds=NUM_DOMAINS,  # conditioning sur domaine cible
-        with_conditioning=False,  # pas de cross-attention texte
+        num_class_embeds=NUM_DOMAINS,
+        with_conditioning=False,
         resblock_updown=True,
     )
 
 
 # ===========================================================================
-# EMA (Exponential Moving Average)
+# Infinite data loader helper
 # ===========================================================================
 
 
-class EMAModel:
-    """Copie EMA des poids du modèle pour une meilleure généralisation."""
-
-    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
-        self.decay = decay
-        self.shadow = deepcopy(model).eval()
-        for p in self.shadow.parameters():
-            p.requires_grad_(False)
-
-    @torch.no_grad()
-    def update(self, model: torch.nn.Module):
-        src = model.module if hasattr(model, "module") else model
-        for s_param, param in zip(self.shadow.parameters(), src.parameters()):
-            s_param.copy_(s_param * self.decay + param.data * (1.0 - self.decay))
-
-    def state_dict(self) -> dict:
-        return self.shadow.state_dict()
-
-    def load_state_dict(self, state: dict):
-        self.shadow.load_state_dict(state)
+def _make_infinite(loader: DataLoader):
+    while True:
+        yield from loader
 
 
 # ===========================================================================
@@ -770,19 +128,13 @@ class EMAModel:
 # ===========================================================================
 
 
-def is_main_process() -> bool:
-    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
-
-
 def train(
     cfg_path: str,
     env_path: Optional[str] = None,
     resume: Optional[str] = None,
 ) -> None:
-    # ── Config ──────────────────────────────────────────────────────────────
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
-    cfg = _resolve_paths(cfg, _load_env(env_path))
+    cfg = load_yaml_with_include(cfg_path)
+    cfg = resolve_paths(cfg, load_env(env_path))
     if resume is not None:
         cfg["resume"] = resume
 
@@ -834,7 +186,6 @@ def train(
 
     # ── VAE (figé) ───────────────────────────────────────────────────────────
     vae = load_vae(cfg, device)
-    # latent_channels deduit du wrapper — pas besoin de le specifier dans la config
     latent_channels = vae.latent_channels
 
     # ── Dataset ─────────────────────────────────────────────────────────────
@@ -850,10 +201,9 @@ def train(
         volume_size=volume_size,
     )
 
-    # Pour chaque domaine, un loader infini séparé (comme en 2D)
+    # Pour chaque domaine, un loader infini séparé
     domain_loaders: Dict[str, any] = {}
     for d in domains:
-        # Sous-ensemble par domaine
         domain_indices = [
             i for i, (_, di) in enumerate(train_ds.samples) if di == DOMAIN_TO_IDX[d]
         ]
@@ -949,35 +299,29 @@ def train(
     raw_unet = unet.module if is_distributed else unet
 
     for step in range(start_iter, total_iters):
-        # ── Tirer deux domaines distincts ────────────────────────────────────
         src_domain, tgt_domain = random.sample(available_domains, 2)
         tgt_idx = DOMAIN_TO_IDX[tgt_domain]
 
-        # ── Batches volumétriques ─────────────────────────────────────────────
-        src_vol, _ = next(domain_loaders[src_domain])  # (B, 1, H, W, D) in [-1,1]
+        src_vol, _ = next(domain_loaders[src_domain])
         tgt_vol, _ = next(domain_loaders[tgt_domain])
         src_vol = src_vol.to(device)
         tgt_vol = tgt_vol.to(device)
 
-        # ── Encoder VAE (sans gradient, VAE est figé) ─────────────────────────
         with (
             torch.no_grad(),
             torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp),
         ):
-            z_src = vae.encode(src_vol)  # (B, C_lat, H', W', D')
+            z_src = vae.encode(src_vol)
             z_tgt = vae.encode(tgt_vol)
 
-        # ── OT-CFM matching ───────────────────────────────────────────────────
         t_batch, z_t, ut = FM.sample_location_and_conditional_flow(z_src, z_tgt)
-        # t_batch : (B,)  z_t : (B, C_lat, H', W', D')  ut = z_tgt - z_src : cible
 
-        # ── Forward UNet 3D ───────────────────────────────────────────────────
-        z_in = torch.cat([z_t, z_src], dim=1)  # (B, 2*C_lat, H', W', D')
+        z_in = torch.cat([z_t, z_src], dim=1)
         t_vec = t_batch.to(device).float()
         y = torch.full((z_src.shape[0],), tgt_idx, dtype=torch.long, device=device)
 
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-            vt = raw_unet(x=z_in, timesteps=t_vec, class_labels=y)  # (B, C_lat, ...)
+            vt = raw_unet(x=z_in, timesteps=t_vec, class_labels=y)
             loss = F.mse_loss(vt, ut)
 
         scaler.scale(loss).backward()
@@ -993,7 +337,6 @@ def train(
         recent_losses.append(loss_val)
         ema_loss = loss_val if ema_loss is None else (0.98 * ema_loss + 0.02 * loss_val)
 
-        # ── Logging ───────────────────────────────────────────────────────────
         if is_main_process() and (step + 1) % print_every == 0:
             avg_recent = sum(recent_losses) / len(recent_losses)
             elapsed = time.time() - t0
@@ -1016,7 +359,6 @@ def train(
             )
             last_log_t = time.time()
 
-        # ── Checkpoint ────────────────────────────────────────────────────────
         if is_main_process() and (step + 1) % save_every == 0:
             ckpt_path = weights_dir / f"checkpoint_{step + 1}.pth"
             torch.save(
@@ -1050,7 +392,7 @@ def train(
 
 
 # ===========================================================================
-# Inference : T1W volume → T2W volume via ODE integration
+# Inference
 # ===========================================================================
 
 
@@ -1072,7 +414,7 @@ def _euler_integrate(
     for step_i in range(n_steps):
         t_val = step_i * dt
         t_vec = torch.tensor([t_val], dtype=torch.float32, device=device)
-        z_in = torch.cat([z, z_src], dim=1)  # (1, 2*C_lat, H', W', D')
+        z_in = torch.cat([z, z_src], dim=1)
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             vt = unet(x=z_in, timesteps=t_vec, class_labels=y)
         z = z + dt * vt
@@ -1091,17 +433,13 @@ def infer(
     n_steps: Optional[int] = None,
     use_ema: bool = True,
 ) -> None:
-    """Inférence complète : encode (T1W volumes) → intégration ODE → decode (T2W volumes)."""
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
-    cfg = _resolve_paths(cfg, _load_env(env_path))
+    """Inférence complète : encode → intégration ODE → decode."""
+    cfg = load_yaml_with_include(cfg_path)
+    cfg = resolve_paths(cfg, load_env(env_path))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = cfg["train"].get("use_amp", False)
     amp_dtype = torch.float16 if use_amp else torch.float32
-    latent_channels = cfg["model"].get(
-        "latent_channels", None
-    )  # sera recalculé depuis le VAE
     n_steps = n_steps or cfg["inference"].get("n_steps", 50)
     tgt_idx = DOMAIN_TO_IDX[target_domain]
     p_lo = cfg["data"].get("percentile_lower", 0.5)
@@ -1136,51 +474,51 @@ def infer(
 
     for nii_path in input_files:
         t_start = time.time()
+        vol, out_affine = load_nifti_volume(
+            nii_path,
+            target_spacing=target_spacing_inf,
+            volume_size=volume_size_inf,
+            normalize=True,
+            lo_pct=p_lo,
+            hi_pct=p_hi,
+        )
+
         img_nib = nib.load(str(nii_path))
         orig_spacing = np.abs(np.diag(img_nib.affine)[:3])
-        vol = img_nib.get_fdata(dtype=np.float32)
+        orig_shape = img_nib.shape[:3]
 
-        # ── Rééchantillonnage (même preprocessing qu'à l'entraînement) ─────────
+        # Adjust affine for resampling + crop/pad
         if target_spacing_inf is not None:
-            vol = _resample_volume(vol, orig_spacing, target_spacing_inf)
+            resampled_shape = np.array(nib.load(str(nii_path)).get_fdata(dtype=np.float32).shape[:3])
+            # Need to compute actual resampled shape
+            resampled_float = resample_volume(
+                np.zeros(orig_shape, dtype=np.float32),
+                orig_spacing,
+                target_spacing_inf,
+            )
+            resampled_shape = resampled_float.shape
+        else:
+            resampled_shape = orig_shape
 
-        # ── Normalisation percentile → [-1, 1] ───────────────────────────────
-        lo = np.percentile(vol, p_lo)
-        hi = np.percentile(vol, p_hi)
-        vol_norm = np.clip((vol - lo) / max(hi - lo, 1e-8), 0.0, 1.0) * 2.0 - 1.0
-
-        # ── Center crop / pad vers volume_size ────────────────────────────────
-        if volume_size_inf is not None:
-            vol_norm = _center_crop_or_pad_np(vol_norm, volume_size_inf)
+        out_affine = adjust_affine_for_crop_pad(
+            img_nib.affine.copy().astype(float),
+            orig_shape,
+            volume_size_inf,
+            resampled_shape if target_spacing_inf else None,
+            target_spacing_inf,
+            orig_spacing,
+        )
 
         vol_tensor = (
-            torch.from_numpy(vol_norm).unsqueeze(0).unsqueeze(0).to(device)
+            torch.from_numpy(vol).unsqueeze(0).unsqueeze(0).to(device)
         )  # (1, 1, H, W, D)
-
-        # ── Affine ajusté (espace rééchantillonné + croppé) ──────────────────
-        # Utilisé pour la sauvegarde NIfTI du volume prédit
-        out_affine = img_nib.affine.copy().astype(float)
-        if target_spacing_inf is not None:
-            for i in range(3):
-                scale_i = target_spacing_inf[i] / max(float(orig_spacing[i]), 1e-8)
-                out_affine[:3, i] *= scale_i
-            resampled_shape = np.array(vol.shape[:3])
-        else:
-            resampled_shape = np.array(img_nib.shape[:3])
-
-        if volume_size_inf is not None:
-            th, tw, td = volume_size_inf
-            sh_off = int(max((resampled_shape[0] - th) // 2, 0))
-            sw_off = int(max((resampled_shape[1] - tw) // 2, 0))
-            sd_off = int(max((resampled_shape[2] - td) // 2, 0))
-            out_affine[:3, 3] += out_affine[:3, :3] @ np.array([sh_off, sw_off, sd_off])
 
         # Encode
         with (
             torch.no_grad(),
             torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp),
         ):
-            z_src = vae.encode(vol_tensor)  # (1, C_lat, H', W', D')
+            z_src = vae.encode(vol_tensor)
 
         # ODE integration
         z_pred = _euler_integrate(
@@ -1192,13 +530,11 @@ def infer(
             torch.no_grad(),
             torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp),
         ):
-            recon = vae.decode(z_pred)  # (1, 1, H, W, D)
+            recon = vae.decode(z_pred)
 
         pred_vol = recon.squeeze().cpu().numpy()
-        # Dénormalisation vers [0, 1] (espace de données d'origine)
         pred_vol = (np.clip(pred_vol, -1.0, 1.0) + 1.0) / 2.0
 
-        # Sauvegarde dans l'espace d'inférence (rééchantillonné + croppé)
         out_nii = nib.Nifti1Image(pred_vol, out_affine)
         out_path = out_dir / nii_path.name
         nib.save(out_nii, str(out_path))
@@ -1222,7 +558,6 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--config", required=True)
     p.add_argument("--env", default=None)
     p.add_argument("--resume", default=None)
-    # Inférence
     p.add_argument("--checkpoint", default=None)
     p.add_argument("--input_dir", default=None)
     p.add_argument("--output_dir", default=None)

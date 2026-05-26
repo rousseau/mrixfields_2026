@@ -3,8 +3,7 @@
 
 This script keeps MedVAE unchanged and vectorizes the MedVAE latent before the
 flow model. The core flow model is a small residual MLP operating on flattened
-latents, which makes the implementation faithful to the original MMFM idea
-without introducing a convolutional latent backbone.
+latents.
 
 Pipeline:
   1. 3D NIfTI volume
@@ -14,10 +13,6 @@ Pipeline:
   5. Predict vector field
   6. Unflatten the predicted vector back to latent tensor shape
   7. Decode with MedVAE
-
-The training setup keeps the existing 15 domain classes (3 modalities x 5
-fields) as discrete target conditions so the baseline remains comparable to the
-previous multimodal prototype.
 """
 
 from __future__ import annotations
@@ -25,155 +20,36 @@ from __future__ import annotations
 import argparse
 import os
 import random
-import re
 import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import nibabel as nib
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from common.config import load_yaml_with_include, load_env, resolve_paths
+from common.dataset import MultiModalNIfTILatentDataset
+from common.distributed import is_main_process, EMAModel
+from common.io import DOMAINS, MODALITIES
+from models.vae_loader import load_vae
 
 from torchcfm.conditional_flow_matching import (
     ConditionalFlowMatcher,
     ExactOptimalTransportConditionalFlowMatcher,
 )
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from cfm.mmfm_vectorized import LatentVectorizer, VectorMMFM  # noqa: E402
-from cfm.train_cfm_3d import (  # noqa: E402
-    EMAModel,
-    _load_env,
-    _make_infinite,
-    _resolve_paths,
-    _resample_volume,
-    is_main_process,
-    load_vae,
-)
-
-
-MODALITIES: List[str] = ["T1W", "T2W", "T2FLAIR"]
-FIELDS: List[str] = ["0.1T", "1.5T", "3T", "5T", "7T"]
-SPLIT_MAP = {
-    "retro_train": "Training_retrospective",
-    "pro_train": "Training_prospective",
-    "pro_val": "Validating_prospective",
-    "pro_test": "Testing_prospective",
-}
-FILE_RE = re.compile(r"^[A-Z]_([A-Z0-9]+)_([0-9.]+T)_(\d+)\.nii\.gz$")
+from cfm.mmfm_vectorized import LatentVectorizer, VectorMMFM
 
 
 def _flat_class(mod_idx: int, field_idx: int, n_fields: int) -> int:
     return mod_idx * n_fields + field_idx
-
-
-def _center_crop_or_pad_np(vol: np.ndarray, size: Tuple[int, int, int]) -> np.ndarray:
-    th, tw, td = size
-    h, w, d = vol.shape
-
-    ph = max(0, th - h)
-    pw = max(0, tw - w)
-    pd = max(0, td - d)
-    if ph > 0 or pw > 0 or pd > 0:
-        vol = np.pad(
-            vol,
-            [(ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (pd // 2, pd - pd // 2)],
-            mode="reflect",
-        )
-        h, w, d = vol.shape
-
-    sh = max((h - th) // 2, 0)
-    sw = max((w - tw) // 2, 0)
-    sd = max((d - td) // 2, 0)
-    return vol[sh : sh + th, sw : sw + tw, sd : sd + td]
-
-
-class MultiModalNIfTILatentDataset(Dataset):
-    """Multi-modal / multi-field dataset for MMFM v1."""
-
-    def __init__(
-        self,
-        data_root: Path,
-        split: str,
-        modalities: List[str],
-        fields: List[str],
-        percentile_lower: float = 0.5,
-        percentile_upper: float = 99.5,
-        max_per_class: Optional[int] = None,
-        target_spacing: Optional[Tuple[float, float, float]] = None,
-        volume_size: Optional[Tuple[int, int, int]] = None,
-    ):
-        self.modalities = modalities
-        self.fields = fields
-        self.mod_to_idx = {m: i for i, m in enumerate(modalities)}
-        self.field_to_idx = {f: i for i, f in enumerate(fields)}
-        self.percentile_lower = percentile_lower
-        self.percentile_upper = percentile_upper
-        self.target_spacing = target_spacing
-        self.volume_size = volume_size
-
-        self.samples: List[Tuple[Path, int, int, int]] = []
-
-        split_dir = SPLIT_MAP.get(split, split)
-        for modality in modalities:
-            for field in fields:
-                class_files = sorted((Path(data_root) / split_dir / modality / field).glob("*.nii.gz"))
-                if max_per_class is not None:
-                    class_files = class_files[:max_per_class]
-                m_idx = self.mod_to_idx[modality]
-                f_idx = self.field_to_idx[field]
-                c_idx = _flat_class(m_idx, f_idx, len(fields))
-                for p in class_files:
-                    if FILE_RE.match(p.name) is None:
-                        continue
-                    self.samples.append((p, m_idx, f_idx, c_idx))
-
-        if not self.samples:
-            raise FileNotFoundError("Aucun volume NIfTI trouvé pour les classes MMFM.")
-
-        counts: Dict[int, int] = {}
-        for _, _, _, c in self.samples:
-            counts[c] = counts.get(c, 0) + 1
-        print(
-            f"MultiModalNIfTILatentDataset: {len(self.samples)} volumes | "
-            f"classes présentes={len(counts)}/{len(modalities) * len(fields)}"
-        )
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def _normalize(self, vol: np.ndarray) -> np.ndarray:
-        lo = np.percentile(vol, self.percentile_lower)
-        hi = np.percentile(vol, self.percentile_upper)
-        vol = np.clip((vol - lo) / max(hi - lo, 1e-8), 0.0, 1.0)
-        return vol * 2.0 - 1.0
-
-    def __getitem__(self, idx: int):
-        path, mod_idx, field_idx, class_idx = self.samples[idx]
-        img = nib.load(str(path))
-        vol = img.get_fdata(dtype=np.float32)
-
-        if self.target_spacing is not None:
-            spacing = np.abs(np.diag(img.affine)[:3])
-            vol = _resample_volume(vol, spacing, self.target_spacing)
-
-        vol = self._normalize(vol)
-        if self.volume_size is not None:
-            vol = _center_crop_or_pad_np(vol, self.volume_size)
-
-        x = torch.from_numpy(vol).unsqueeze(0)
-        return (
-            x,
-            torch.tensor(mod_idx, dtype=torch.long),
-            torch.tensor(field_idx, dtype=torch.long),
-            torch.tensor(class_idx, dtype=torch.long),
-        )
 
 
 def _infer_latent_shape(vae, volume_size: Tuple[int, int, int], device: torch.device) -> Tuple[int, ...]:
@@ -202,7 +78,7 @@ def _save_checkpoint(
     model: torch.nn.Module,
     ema: EMAModel,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
+    scaler,
     use_scaler: bool,
     cfg_path: str,
     latent_shape: Tuple[int, ...],
@@ -221,10 +97,14 @@ def _save_checkpoint(
     )
 
 
+def _make_infinite(loader):
+    while True:
+        yield from loader
+
+
 def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] = None):
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
-    cfg = _resolve_paths(cfg, _load_env(env_path))
+    cfg = load_yaml_with_include(cfg_path)
+    cfg = resolve_paths(cfg, load_env(env_path))
     if resume is not None:
         cfg["resume"] = resume
 
@@ -236,7 +116,7 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
         raise RuntimeError("data_root requis dans config/env")
 
     modalities = data_cfg.get("modalities", MODALITIES)
-    fields = data_cfg.get("fields", FIELDS)
+    fields = data_cfg.get("fields", DOMAINS)
 
     output_dir = Path(data_cfg["output_dir"])
     split = data_cfg.get("split", "retro_train")
