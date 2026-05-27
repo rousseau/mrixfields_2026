@@ -1,7 +1,7 @@
 # VAE Implementation Plan — MRIxFields 2026
 
 Date: 2026-05-27
-Status: Phase C — RHVAE 3D (completed)
+Status: Phase E — Evaluation scripts (completed)
 
 ---
 
@@ -142,8 +142,8 @@ The `BaseAE`/`BaseEncoder`/`BaseDecoder` infrastructure and the trainer are perf
 | **A. Infrastructure** | 2-3 days | `vae_base.py`, refactor wrappers, `dataset_vae.py`, configs multimodal | ✅ |
 | **B. Pythae VAE + VQ-VAE** | 3-4 days | `pythae_vae.py`, `pythae_vqvae.py`, 5D quantizer, scripts entraînement | ✅ |
 | **C. RHVAE** | 2-3 days | `pythae_rhvae.py`, custom metric network 3D, train script | ✅ |
-| **D. MAISI wrapper** | 1-2 days | Load pretrained weights, validate preprocessing alignment | ⏳ |
-| **E. Evaluation** | 2-3 days | UMAP, regularity, NIfTI extraction, cumulative CSV | ⏳ |
+| **D. MAISI wrapper** | 1-2 days | Load pretrained weights, validate preprocessing alignment | ✅ |
+| **E. Evaluation** | 2-3 days | UMAP, regularity, NIfTI extraction, cumulative CSV | ✅ |
 | **F. CFM integration** | 1-2 days | Verify `load_vae` + `to_vector` in all CFM scripts | ⏳ |
 
 ---
@@ -158,6 +158,29 @@ src/models/vae_loader.py            ← MODIFIED: support maisi, placeholder pyt
 src/common/dataset_vae.py           ← NEW: MRIxFieldsMultimodalDataset
 configs/vae3d_multimodal.yaml       ← NEW: AEKL 128³ multimodal config
 docs/VAE_IMPLEMENTATION_PLAN.md     ← THIS FILE
+```
+
+### Created / Modified (Phase E)
+```
+src/vae3d/visualize_latent_umap.py      ← NEW: UMAP 2D scatter (modality + field)
+src/vae3d/evaluate_latent_regularity.py ← NEW: interp smoothness, Lipschitz, modality gap
+src/vae3d/extract_latent_nifti.py       ← NEW: batch/single latent → NIfTI export
+docs/VAE_IMPLEMENTATION_PLAN.md         ← Phase E done
+```
+
+### Created / Modified (Phase D)
+```
+src/models/maisi_vae.py                     ← NEW: MedVAEFineTuneWrapper + build_medvae_wrapper()
+src/models/vae_loader.py                    ← MODIFIED: _load_medvae_finetune, routing medvae_finetune
+configs/medvae_finetune_multimodal.yaml     ← NEW: patch (112,128,80), decoder_only freeze mode
+src/vae3d/train_maisi_finetune.py           ← NEW: train/val loop, eval frozen, CLI --frozen/--lr
+src/slurm/train_vae_jeanzay.slurm          ← MODIFIED: routing medvae_finetune + _pip_install
+src/slurm/finetune_medvae_jeanzay.slurm    ← MODIFIED: _pip_install migration
+src/slurm/cfm_3d_jeanzay.slurm             ← MODIFIED: _pip_install migration
+src/slurm/train_vqvae_jeanzay.slurm        ← MODIFIED: _pip_install migration
+src/slurm/benchmark_vae_jeanzay.slurm      ← MODIFIED: _pip_install migration
+src/slurm/setup_jeanzay.sh                 ← MODIFIED: --no-cache-dir + MedVAE weight pre-download
+src/slurm/train_medvae_disentangle_jeanzay.slurm ← MODIFIED: _pip_install migration
 ```
 
 ### Created / Modified (Phase C)
