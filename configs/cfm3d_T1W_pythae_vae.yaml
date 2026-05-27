@@ -1,9 +1,8 @@
 method: cfm3d
 vae:
-  vae_type: aekl
-  source: local
-  checkpoint: outputs/vae3d/runs/vae3d_multimodal/weights/model_best.pth
-  vae_config: configs/vae3d_multimodal.yaml
+  vae_type: pythae_vae
+  checkpoint: outputs/pythae_vae/runs/pythae_vae_multimodal/weights/model_best.pth
+  vae_config: configs/pythae_vae_multimodal.yaml
 model:
   spatial_dims: 3
   model_channels: 128
@@ -23,7 +22,7 @@ model:
 data:
   modality: T1W
   split: retro_train
-  output_subdir: cfm3d/runs/cfm3d_{{TASK_NAME}}
+  output_subdir: cfm3d/runs/cfm3d_T1W_pythae_vae
   domains:
   - 0.1T
   - 1.5T
@@ -37,12 +36,12 @@ data:
   - 1.0
   - 1.0
   volume_size:
-  - 112
   - 128
-  - 80
+  - 128
+  - 128
   max_volumes_per_domain: null
 train:
-  batch_size: 2
+  batch_size: 1
   num_workers: 4
   total_iters: 150000
   lr: 0.0001
@@ -57,9 +56,4 @@ inference:
   n_steps: 50
   ode_solver: euler
   source_domain: 0.1T
-  vae_decode_patch_size:
-  - 64
-  - 64
-  - 64
-  vae_decode_overlap: 0.25
-task_name: cfm3d_T1W_aekl
+task_name: cfm3d_T1W_pythae_vae

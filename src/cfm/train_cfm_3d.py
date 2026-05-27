@@ -8,10 +8,16 @@ Architecture :
   - Output : champ vectoriel de vitesse → (B, C_lat, H', W', D')
   - Entraîné avec ExactOT conditional flow matching (torchcfm)
 
-VAE supportés (étape 2) :
-  - aekl    : AutoencoderKL MONAI (4 canaux latents, 8x compression)
-  - medvae  : MedVAE Stanford (frozen HuggingFace ou fine-tuné local)
-  - vqvae   : NeuroQuant adapté (src/vae3d/train_vqvae.py, données paired+unpaired)
+VAE supportés (étape 2, latent_format == "spatial") :
+  - aekl             : AutoencoderKL MONAI (4 canaux latents, 8x compression)
+  - medvae           : MedVAE Stanford frozen (legacy wrapper)
+  - medvae_finetune  : MedVAE Stanford fine-tunable (Phase D, recommandé)
+  - vqvae            : NeuroQuant adapté (latent 64 canaux)
+  - pythae_vae       : Pythae VAE 3D (8 canaux, scratch)
+  - pythae_vqvae     : Pythae VQ-VAE 3D (8 canaux, codebook discret)
+
+NON supportés (latent_format == "vector") → utiliser train_mmfm_3d.py :
+  - pythae_rhvae     : RHVAE 3D (latent vectoriel (256,))
 
 Usage :
   # Single-GPU
@@ -187,6 +193,15 @@ def train(
     # ── VAE (figé) ───────────────────────────────────────────────────────────
     vae = load_vae(cfg, device)
     latent_channels = vae.latent_channels
+
+    # Phase F: guard — UNet 3D spatial ne supporte que les VAE spatiaux.
+    # RHVAE (latent_format == "vector") doit passer par train_mmfm_3d.py.
+    if vae.latent_format != "spatial":
+        raise RuntimeError(
+            f"train_cfm_3d.py requiert un VAE spatial (latent_format='spatial'), "
+            f"mais {cfg['vae'].get('vae_type', '?')} a latent_format='{vae.latent_format}'. "
+            f"Utilisez train_mmfm_3d.py pour les VAE vectoriels (RHVAE, etc.)."
+        )
 
     # ── Dataset ─────────────────────────────────────────────────────────────
     train_ds = NIfTILatentDataset(
@@ -455,6 +470,13 @@ def infer(
     # ── Charger VAE ──────────────────────────────────────────────────────────
     vae = load_vae(cfg, device)
     latent_channels = vae.latent_channels
+
+    # Phase F: guard
+    if vae.latent_format != "spatial":
+        raise RuntimeError(
+            f"train_cfm_3d.py (infer) requiert un VAE spatial, "
+            f"got latent_format='{vae.latent_format}'."
+        )
 
     # ── Charger UNet ─────────────────────────────────────────────────────────
     unet = build_unet_3d(cfg, latent_channels).to(device)

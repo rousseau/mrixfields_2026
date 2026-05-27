@@ -1,0 +1,40 @@
+method: mmfm3d_vectorized_v1
+task_name: mmfm3d_aekl_multimodal
+
+vae:
+  vae_type: aekl
+  checkpoint: outputs/vae3d/runs/vae3d_multimodal/weights/model_best.pth
+  vae_config: configs/vae3d_multimodal.yaml
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+
+data:
+  split: retro_train
+  modalities: [T1W, T2W, T2FLAIR]
+  fields: [0.1T, 1.5T, 3T, 5T, 7T]
+  output_subdir: cfm3d/runs/mmfm3d_aekl_multimodal
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  target_spacing: [1.0, 1.0, 1.0]
+  volume_size: [128, 128, 128]
+  max_volumes_per_class: null
+
+train:
+  batch_size: 1
+  num_workers: 4
+  total_iters: 30000
+  lr: 1.0e-4
+  sigma: 0.0
+  ot_method: exact
+  save_every: 2000
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  num_targets_per_step: 2

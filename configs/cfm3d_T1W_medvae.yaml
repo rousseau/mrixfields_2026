@@ -1,9 +1,12 @@
 method: cfm3d
+# Config canonique MedVAE pour OT-CFM 3D (Phase D/F).
+# Utilise medvae_finetune (Phase D) : MedVAE avec fine-tuning optionnel.
+# Pour MedVAE purement frozen, voir cfm3d_T1W_medvae_frozen.yaml.
 vae:
-  vae_type: aekl
-  source: local
-  checkpoint: outputs/vae3d/runs/vae3d_multimodal/weights/model_best.pth
-  vae_config: configs/vae3d_multimodal.yaml
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true          # true = encoder+decoder figés pendant le CFM
+  checkpoint: null      # null = poids HuggingFace par défaut (medvae_4_1_3d)
 model:
   spatial_dims: 3
   model_channels: 128
@@ -23,7 +26,7 @@ model:
 data:
   modality: T1W
   split: retro_train
-  output_subdir: cfm3d/runs/cfm3d_{{TASK_NAME}}
+  output_subdir: cfm3d/runs/cfm3d_T1W_medvae
   domains:
   - 0.1T
   - 1.5T
@@ -62,4 +65,4 @@ inference:
   - 64
   - 64
   vae_decode_overlap: 0.25
-task_name: cfm3d_T1W_aekl
+task_name: cfm3d_T1W_medvae

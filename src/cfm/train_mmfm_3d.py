@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """MMFM v1 baseline for MRIxFields.
 
-This script keeps MedVAE unchanged and vectorizes the MedVAE latent before the
-flow model. The core flow model is a small residual MLP operating on flattened
-latents.
+This script keeps the VAE unchanged and vectorizes its latent before the
+flow model. Works with any MRIxFieldsVAE (spatial or vector latent format):
+  - Spatial VAEs (AEKL, MedVAE, Pythae VAE/VQ-VAE): latent flattened via
+    vae.to_vector() before MMFM, unflattened via vae.from_vector() before decode.
+  - Vector VAEs (RHVAE): to_vector() is identity, from_vector() is identity.
 
 Pipeline:
   1. 3D NIfTI volume
-  2. MedVAE encode -> latent tensor
-  3. Flatten latent tensor into a single vector
-  4. Conditional flow matching in vector space
+  2. VAE encode -> latent tensor (spatial or vector)
+  3. vae.to_vector() -> flat vector
+  4. Conditional flow matching in vector space (VectorMMFM residual MLP)
   5. Predict vector field
-  6. Unflatten the predicted vector back to latent tensor shape
-  7. Decode with MedVAE
+  6. vae.from_vector() -> latent tensor
+  7. VAE decode -> 3D volume
 """
 
 from __future__ import annotations
@@ -198,8 +200,14 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
 
     vae = load_vae(cfg, device)
     latent_shape = _infer_latent_shape(vae, volume_size, device)
+    # Phase F: utiliser vae.to_vector / vae.from_vector comme API canonique.
+    # LatentVectorizer n'est conservé que pour flat_dim (taille du vecteur).
+    latent_dim = vae.vector_dim
+    if latent_dim == 0:
+        # Fallback si vector_dim non renseigné (VAE legacy) : calculer depuis shape
+        latent_dim = int(torch.tensor(latent_shape).prod().item())
+
     vectorizer = LatentVectorizer(latent_shape)
-    latent_dim = vectorizer.flat_dim
 
     mmfm = build_vector_mmfm(cfg, latent_dim, n_classes).to(device)
     if is_distributed:
@@ -284,8 +292,9 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
                 z_src = vae.encode(src_x)
                 z_tgt = vae.encode(tgt_x)
 
-            z_src_vec = vectorizer.flatten(z_src)
-            z_tgt_vec = vectorizer.flatten(z_tgt)
+            # Phase F: API canonique to_vector (fonctionne pour spatial et vector)
+            z_src_vec = vae.to_vector(z_src)
+            z_tgt_vec = vae.to_vector(z_tgt)
             t_batch, z_t, ut = FM.sample_location_and_conditional_flow(z_src_vec, z_tgt_vec)
             t_vec = t_batch.to(device).float().reshape(z_src_vec.shape[0], -1).squeeze(-1)
             y_tgt = torch.full((z_src_vec.shape[0],), tgt_class, dtype=torch.long, device=device)
