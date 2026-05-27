@@ -1,7 +1,7 @@
 # VAE Implementation Plan — MRIxFields 2026
 
 Date: 2026-05-27
-Status: Phase A — Infrastructure (in progress)
+Status: Phase B — Pythae VAE + VQ-VAE 3D (completed)
 
 ---
 
@@ -139,12 +139,12 @@ The `BaseAE`/`BaseEncoder`/`BaseDecoder` infrastructure and the trainer are perf
 
 | Phase | Duration | Deliverables |
 |-------|----------|-------------|
-| **A. Infrastructure** | 2-3 days | `vae_base.py`, refactor wrappers, `dataset_vae.py`, configs multimodal |
-| **B. Pythae VAE + VQ-VAE** | 3-4 days | `train_pythae_vae.py`, `train_pythae_vqvae.py`, 5D quantizer |
-| **C. RHVAE** | 2-3 days | `train_pythae_rhvae.py`, custom metric network |
-| **D. MAISI wrapper** | 1-2 days | Load pretrained weights, validate preprocessing alignment |
-| **E. Evaluation** | 2-3 days | UMAP, regularity, NIfTI extraction, cumulative CSV |
-| **F. CFM integration** | 1-2 days | Verify `load_vae` + `to_vector` in all CFM scripts |
+| **A. Infrastructure** | 2-3 days | `vae_base.py`, refactor wrappers, `dataset_vae.py`, configs multimodal | ✅ |
+| **B. Pythae VAE + VQ-VAE** | 3-4 days | `pythae_vae.py`, `pythae_vqvae.py`, 5D quantizer, scripts entraînement | ✅ |
+| **C. RHVAE** | 2-3 days | `train_pythae_rhvae.py`, custom metric network | ⏳ |
+| **D. MAISI wrapper** | 1-2 days | Load pretrained weights, validate preprocessing alignment | ⏳ |
+| **E. Evaluation** | 2-3 days | UMAP, regularity, NIfTI extraction, cumulative CSV | ⏳ |
+| **F. CFM integration** | 1-2 days | Verify `load_vae` + `to_vector` in all CFM scripts | ⏳ |
 
 ---
 
@@ -158,6 +158,19 @@ src/models/vae_loader.py            ← MODIFIED: support maisi, placeholder pyt
 src/common/dataset_vae.py           ← NEW: MRIxFieldsMultimodalDataset
 configs/vae3d_multimodal.yaml       ← NEW: AEKL 128³ multimodal config
 docs/VAE_IMPLEMENTATION_PLAN.md     ← THIS FILE
+```
+
+### Created / Modified (Phase B)
+```
+src/models/pythae_vae.py            ← NEW: Encoder3D + Decoder3D + PythaeVAE3D wrapper
+src/models/pythae_vqvae.py          ← NEW: VQEncoder3D + Quantizer5D + PythaeVQVAE3D
+src/models/vae_loader.py            ← MODIFIED: _load_pythae_vae, _load_pythae_vqvae
+src/models/vae_base.py              ← MODIFIED: from_vector dynamique (racine cubique)
+src/vae3d/train_pythae_vae.py       ← NEW: entraînement multimodal VAE
+src/vae3d/train_pythae_vqvae.py     ← NEW: entraînement multimodal VQ-VAE
+configs/pythae_vae_multimodal.yaml  ← NEW: config VAE 128³ multimodal
+configs/pythae_vqvae_multimodal.yaml← NEW: config VQ-VAE 128³ multimodal
+src/slurm/train_vae_jeanzay.slurm   ← MODIFIED: routing pythae_vae / pythae_vqvae
 ```
 
 ### To Create (Phase B–F)

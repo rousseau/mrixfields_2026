@@ -1,0 +1,47 @@
+method: pythae_vae3d
+# Pythae VAE 3D multimodal : entraîné sur T1W + T2W + T2FLAIR, tous champs.
+# Encodeur/décodeur 3D conv + reparameterization (VAE classique).
+# Espace latent spatial (C, H/8, W/8, D/8) = (8, 16, 16, 16) pour patch 128³.
+task_name: pythae_vae3d_multimodal
+
+vae:
+  vae_type: pythae_vae
+  latent_channels: 8
+  base_channels: 32
+  num_groups: 8
+  # Laisser vide pour un entraînement from scratch
+  checkpoint: ""
+
+data:
+  modalities:
+    - T1W
+    - T2W
+    - T2FLAIR
+  fields:
+    - 0.1T
+    - 1.5T
+    - 3T
+    - 5T
+    - 7T
+  splits:
+    - retro_train
+  patch_size: [128, 128, 128]
+  target_spacing: [1.0, 1.0, 1.0]
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  output_subdir: pythae_vae3d/runs/pythae_vae3d_multimodal
+
+train:
+  batch_size: 1
+  num_workers: 4
+  total_epochs: 200
+  lr: 1.0e-4
+  # Poids du terme KL (β-VAE : β=1.0 = VAE standard)
+  kl_weight: 1.0e-4
+  kl_warmup_epochs: 10
+  save_every_epochs: 10
+  print_every: 100
+  use_amp: true
+  grad_clip: 1.0
+  dist_backend: nccl
+  resume: null

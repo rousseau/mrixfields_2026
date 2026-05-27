@@ -1,0 +1,53 @@
+method: pythae_vqvae3d
+# Pythae VQ-VAE 3D multimodal : entraîné sur T1W + T2W + T2FLAIR, tous champs.
+# Quantizer 5D adapté de Pythae (permute 5D au lieu de 4D).
+# EMA codebook update pour une stabilité accrue (pas de gradient sur embedding).
+# Espace latent spatial quantisé (C, H/8, W/8, D/8) = (8, 16, 16, 16) pour patch 128³.
+task_name: pythae_vqvae3d_multimodal
+
+vae:
+  vae_type: pythae_vqvae
+  latent_channels: 8
+  base_channels: 32
+  num_groups: 8
+  # Taille du codebook
+  num_embeddings: 512
+  # Poids des losses VQ
+  commitment_loss_factor: 0.25
+  quantization_loss_factor: 1.0
+  # EMA update du codebook (recommandé)
+  use_ema: true
+  decay: 0.99
+  # Laisser vide pour entraînement from scratch
+  checkpoint: ""
+
+data:
+  modalities:
+    - T1W
+    - T2W
+    - T2FLAIR
+  fields:
+    - 0.1T
+    - 1.5T
+    - 3T
+    - 5T
+    - 7T
+  splits:
+    - retro_train
+  patch_size: [128, 128, 128]
+  target_spacing: [1.0, 1.0, 1.0]
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  output_subdir: pythae_vqvae3d/runs/pythae_vqvae3d_multimodal
+
+train:
+  batch_size: 1
+  num_workers: 4
+  total_epochs: 200
+  lr: 3.0e-4
+  save_every_epochs: 10
+  print_every: 100
+  use_amp: true
+  grad_clip: 1.0
+  dist_backend: nccl
+  resume: null

@@ -116,12 +116,19 @@ class MRIxFieldsVAE(nn.Module, ABC):
     def from_vector(self, z_vec: torch.Tensor) -> torch.Tensor:
         """Reshape a vector back into spatial latent (only for spatial VAEs).
 
-        vector  (B,D_flat) -> (B,C,H',W',D')   if spatial
+        vector  (B,D_flat) -> (B,C,H',W',D')   if spatial (H'=W'=D' inferred)
         vector  (B,D_lat)  -> identity          if vector
         """
         if self.latent_format == "spatial":
-            shape = (-1, *self.latent_shape)  # type: ignore[arg-type]
-            return z_vec.view(shape)
+            C = self.latent_channels
+            D_flat = z_vec.shape[1]
+            spatial = D_flat // C
+            s = round(spatial ** (1/3))
+            if s ** 3 != spatial:
+                # Fallback: use stored latent_shape if available and consistent
+                shape = (-1, *self.latent_shape)
+                return z_vec.view(shape)
+            return z_vec.view(-1, C, s, s, s)
         return z_vec
 
     @property

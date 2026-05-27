@@ -9,9 +9,9 @@ Supported vae_types:
   - "medvae"            : Stanford MIMI MedVAE
   - "medvae_disentangle": MedVAE disentanglement v1
   - "vqvae"             : NeuroQuantHybrid VQ-VAE (deprecated, kept for compat)
-  - "pythae_vae"        : Pythae generic VAE 3D (future)
-  - "pythae_vqvae"      : Pythae VQ-VAE 3D (future)
-  - "pythae_rhvae"      : Pythae RHVAE 3D (future)
+  - "pythae_vae"        : Pythae VAE 3D (conv encoder/decoder + reparameterization)
+  - "pythae_vqvae"      : Pythae VQ-VAE 3D (5D quantizer, EMA codebook)
+  - "pythae_rhvae"      : Pythae RHVAE 3D (future — Phase C)
 """
 
 from __future__ import annotations
@@ -76,10 +76,14 @@ def load_vae(cfg: dict, device: torch.device) -> MRIxFieldsVAE:
         wrapper = _load_medvae_disentangle(vae_cfg, device)
     elif vae_type == "maisi":
         wrapper = _load_maisi(vae_cfg, device, vae_source)
-    elif vae_type in ("pythae_vae", "pythae_vqvae", "pythae_rhvae"):
+    elif vae_type == "pythae_vae":
+        wrapper = _load_pythae_vae(vae_cfg, device)
+    elif vae_type == "pythae_vqvae":
+        wrapper = _load_pythae_vqvae(vae_cfg, device)
+    elif vae_type == "pythae_rhvae":
         raise NotImplementedError(
-            f"{vae_type} support not yet implemented. "
-            "Please run Phase B of the VAE implementation plan."
+            "pythae_rhvae support not yet implemented. "
+            "Please run Phase C of the VAE implementation plan."
         )
     else:
         wrapper = _load_aekl(vae_cfg, device, vae_source)
@@ -349,3 +353,75 @@ def _load_medvae_disentangle(vae_cfg: dict, device: torch.device) -> MedVAEDisen
 
     model.eval()
     return MedVAEDisentangleWrapper(model)
+
+
+# --------------------------------------------------------------------------- #
+# Pythae VAE 3D                                                               #
+# --------------------------------------------------------------------------- #
+
+
+def _load_pythae_vae(vae_cfg: dict, device: torch.device):
+    """Load a Pythae VAE 3D (PythaeVAE3D wrapper)."""
+    from models.pythae_vae import build_pythae_vae_3d, PythaeVAE3D
+
+    latent_channels = int(vae_cfg.get("latent_channels", 8))
+    base_channels = int(vae_cfg.get("base_channels", 32))
+    num_groups = int(vae_cfg.get("num_groups", 8))
+
+    model = build_pythae_vae_3d(
+        latent_channels=latent_channels,
+        base_channels=base_channels,
+        num_groups=num_groups,
+    )
+
+    ckpt_path = vae_cfg.get("checkpoint", "")
+    if ckpt_path and Path(ckpt_path).exists():
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = state.get("model", state)
+        model.load_state_dict(state, strict=True)
+        print(f"  Pythae VAE 3D loaded from {ckpt_path}")
+    else:
+        print(f"  [WARN] Pythae VAE 3D checkpoint not found: {ckpt_path} — using random weights")
+
+    return model
+
+
+# --------------------------------------------------------------------------- #
+# Pythae VQ-VAE 3D                                                            #
+# --------------------------------------------------------------------------- #
+
+
+def _load_pythae_vqvae(vae_cfg: dict, device: torch.device):
+    """Load a Pythae VQ-VAE 3D (PythaeVQVAE3D wrapper)."""
+    from models.pythae_vqvae import build_pythae_vqvae_3d, PythaeVQVAE3D
+
+    latent_channels = int(vae_cfg.get("latent_channels", 8))
+    base_channels = int(vae_cfg.get("base_channels", 32))
+    num_embeddings = int(vae_cfg.get("num_embeddings", 512))
+    commitment_loss_factor = float(vae_cfg.get("commitment_loss_factor", 0.25))
+    quantization_loss_factor = float(vae_cfg.get("quantization_loss_factor", 1.0))
+    use_ema = bool(vae_cfg.get("use_ema", True))
+    decay = float(vae_cfg.get("decay", 0.99))
+    num_groups = int(vae_cfg.get("num_groups", 8))
+
+    model = build_pythae_vqvae_3d(
+        latent_channels=latent_channels,
+        base_channels=base_channels,
+        num_embeddings=num_embeddings,
+        commitment_loss_factor=commitment_loss_factor,
+        quantization_loss_factor=quantization_loss_factor,
+        use_ema=use_ema,
+        decay=decay,
+        num_groups=num_groups,
+    )
+
+    ckpt_path = vae_cfg.get("checkpoint", "")
+    if ckpt_path and Path(ckpt_path).exists():
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = state.get("model", state)
+        model.load_state_dict(state, strict=True)
+        print(f"  Pythae VQ-VAE 3D loaded from {ckpt_path}")
+    else:
+        print(f"  [WARN] Pythae VQ-VAE 3D checkpoint not found: {ckpt_path} — using random weights")
+
+    return model
