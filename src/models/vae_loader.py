@@ -11,7 +11,7 @@ Supported vae_types:
   - "vqvae"             : NeuroQuantHybrid VQ-VAE (deprecated, kept for compat)
   - "pythae_vae"        : Pythae VAE 3D (conv encoder/decoder + reparameterization)
   - "pythae_vqvae"      : Pythae VQ-VAE 3D (5D quantizer, EMA codebook)
-  - "pythae_rhvae"      : Pythae RHVAE 3D (future — Phase C)
+  - "pythae_rhvae"      : Pythae RHVAE 3D (Riemannian Hamiltonian VAE, vectorial latent)
 """
 
 from __future__ import annotations
@@ -81,10 +81,7 @@ def load_vae(cfg: dict, device: torch.device) -> MRIxFieldsVAE:
     elif vae_type == "pythae_vqvae":
         wrapper = _load_pythae_vqvae(vae_cfg, device)
     elif vae_type == "pythae_rhvae":
-        raise NotImplementedError(
-            "pythae_rhvae support not yet implemented. "
-            "Please run Phase C of the VAE implementation plan."
-        )
+        wrapper = _load_pythae_rhvae(vae_cfg, device)
     else:
         wrapper = _load_aekl(vae_cfg, device, vae_source)
 
@@ -423,5 +420,48 @@ def _load_pythae_vqvae(vae_cfg: dict, device: torch.device):
         print(f"  Pythae VQ-VAE 3D loaded from {ckpt_path}")
     else:
         print(f"  [WARN] Pythae VQ-VAE 3D checkpoint not found: {ckpt_path} — using random weights")
+
+    return model
+
+
+# --------------------------------------------------------------------------- #
+# Pythae RHVAE 3D                                                              #
+# --------------------------------------------------------------------------- #
+
+
+def _load_pythae_rhvae(vae_cfg: dict, device: torch.device):
+    """Load a Pythae RHVAE 3D (PythaeRHVAE3D wrapper)."""
+    from models.pythae_rhvae import build_pythae_rhvae_3d
+
+    latent_dim     = int(vae_cfg.get("latent_dim", 256))
+    base_channels  = int(vae_cfg.get("base_channels", 32))
+    num_groups     = int(vae_cfg.get("num_groups", 8))
+    spatial_size   = int(vae_cfg.get("spatial_size", 16))
+    n_lf           = int(vae_cfg.get("n_lf", 3))
+    eps_lf         = float(vae_cfg.get("eps_lf", 0.001))
+    beta_zero      = float(vae_cfg.get("beta_zero", 0.3))
+    temperature    = float(vae_cfg.get("temperature", 1.5))
+    regularization = float(vae_cfg.get("regularization", 0.01))
+
+    model = build_pythae_rhvae_3d(
+        latent_dim=latent_dim,
+        base_channels=base_channels,
+        num_groups=num_groups,
+        spatial_size=spatial_size,
+        n_lf=n_lf,
+        eps_lf=eps_lf,
+        beta_zero=beta_zero,
+        temperature=temperature,
+        regularization=regularization,
+    )
+
+    ckpt_path = vae_cfg.get("checkpoint", "")
+    if ckpt_path and Path(ckpt_path).exists():
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = state.get("model", state)
+        model.load_state_dict(state, strict=True)
+        print(f"  Pythae RHVAE 3D loaded from {ckpt_path}")
+    else:
+        print(f"  [WARN] Pythae RHVAE 3D checkpoint not found: {ckpt_path} — using random weights")
 
     return model

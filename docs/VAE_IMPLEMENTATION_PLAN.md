@@ -1,7 +1,7 @@
 # VAE Implementation Plan — MRIxFields 2026
 
 Date: 2026-05-27
-Status: Phase B — Pythae VAE + VQ-VAE 3D (completed)
+Status: Phase C — RHVAE 3D (completed)
 
 ---
 
@@ -141,7 +141,7 @@ The `BaseAE`/`BaseEncoder`/`BaseDecoder` infrastructure and the trainer are perf
 |-------|----------|-------------|
 | **A. Infrastructure** | 2-3 days | `vae_base.py`, refactor wrappers, `dataset_vae.py`, configs multimodal | ✅ |
 | **B. Pythae VAE + VQ-VAE** | 3-4 days | `pythae_vae.py`, `pythae_vqvae.py`, 5D quantizer, scripts entraînement | ✅ |
-| **C. RHVAE** | 2-3 days | `train_pythae_rhvae.py`, custom metric network | ⏳ |
+| **C. RHVAE** | 2-3 days | `pythae_rhvae.py`, custom metric network 3D, train script | ✅ |
 | **D. MAISI wrapper** | 1-2 days | Load pretrained weights, validate preprocessing alignment | ⏳ |
 | **E. Evaluation** | 2-3 days | UMAP, regularity, NIfTI extraction, cumulative CSV | ⏳ |
 | **F. CFM integration** | 1-2 days | Verify `load_vae` + `to_vector` in all CFM scripts | ⏳ |
@@ -160,7 +160,16 @@ configs/vae3d_multimodal.yaml       ← NEW: AEKL 128³ multimodal config
 docs/VAE_IMPLEMENTATION_PLAN.md     ← THIS FILE
 ```
 
-### Created / Modified (Phase B)
+### Created / Modified (Phase C)
+```
+src/models/pythae_rhvae.py              ← NEW: ConvFeatureExtractor3D, RHVAEEncoder3D,
+                                               RHVAEDecoder3D, RHVAEMetric3D, PythaeRHVAE3D
+src/models/vae_loader.py                ← MODIFIED: _load_pythae_rhvae
+src/vae3d/train_pythae_rhvae.py         ← NEW: entraînement multimodal RHVAE (update_metric)
+configs/pythae_rhvae_multimodal.yaml    ← NEW: config RHVAE 128³ multimodal
+src/slurm/train_vae_jeanzay.slurm       ← MODIFIED: routing pythae_rhvae
+docs/VAE_IMPLEMENTATION_PLAN.md         ← Phase C done
+```
 ```
 src/models/pythae_vae.py            ← NEW: Encoder3D + Decoder3D + PythaeVAE3D wrapper
 src/models/pythae_vqvae.py          ← NEW: VQEncoder3D + Quantizer5D + PythaeVQVAE3D

@@ -9,7 +9,7 @@
 #   sbatch src/slurm/train_vae_jeanzay.slurm <VAE_TYPE> [CONFIG] [RUN_NAME]
 #
 # Arguments :
-#   VAE_TYPE  : aekl | medvae | vqvae | pythae_vae | pythae_vqvae  (obligatoire)
+#   VAE_TYPE  : aekl | medvae | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae  (obligatoire)
 #   CONFIG    : chemin config YAML       (défaut : configs/vae3d_multimodal.yaml)
 #   RUN_NAME  : sous-répertoire de sortie (défaut : {VAE_TYPE}_multimodal_remote)
 #
@@ -51,13 +51,13 @@ LR="${LR:-1e-4}"
 
 # ── Validation ───────────────────────────────────────────────────────────────
 if [[ -z "$VAE_TYPE" ]]; then
-    echo "[ERREUR] VAE_TYPE manquant. Valeurs : aekl | medvae | vqvae | pythae_vae | pythae_vqvae"
+    echo "[ERREUR] VAE_TYPE manquant. Valeurs : aekl | medvae | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae"
     exit 1
 fi
 case "$VAE_TYPE" in
-    aekl|medvae|vqvae|pythae_vae|pythae_vqvae) ;;
+    aekl|medvae|vqvae|pythae_vae|pythae_vqvae|pythae_rhvae) ;;
     *)
-        echo "[ERREUR] VAE_TYPE invalide : $VAE_TYPE  (aekl | medvae | vqvae | pythae_vae | pythae_vqvae)"
+        echo "[ERREUR] VAE_TYPE invalide : $VAE_TYPE  (aekl | medvae | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae)"
         exit 1
         ;;
 esac
@@ -114,6 +114,8 @@ if [[ "$VAE_TYPE" == "pythae_vae" ]]; then
     TRAIN_SCRIPT="src/vae3d/train_pythae_vae.py"
 elif [[ "$VAE_TYPE" == "pythae_vqvae" ]]; then
     TRAIN_SCRIPT="src/vae3d/train_pythae_vqvae.py"
+elif [[ "$VAE_TYPE" == "pythae_rhvae" ]]; then
+    TRAIN_SCRIPT="src/vae3d/train_pythae_rhvae.py"
 else
     TRAIN_SCRIPT="src/vae3d/train_vae_3d.py"
 fi
