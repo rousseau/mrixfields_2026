@@ -68,24 +68,20 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export HF_HUB_OFFLINE="1"
 export TRANSFORMERS_OFFLINE="1"
 
-_require() {
-    python3 -c "import $1" 2>/dev/null || {
-        echo "[ERREUR] Module Python manquant : $1"
-        echo "Installer sur le nœud de login :"
-        echo "  module purge && module load arch/h100 && module load pytorch-gpu/py3/2.5.0"
-        echo "  export PYTHONUSERBASE=$WORK/.local && export PATH=$WORK/.local/bin:\$PATH"
-        echo "  pip install --user $2"
+_pip_install() {
+    python3 -c "import $1" 2>/dev/null && return 0
+    echo "[INFO] Installation de '$2'..."
+    pip install --user --no-cache-dir "$2" || {
+        echo "[ERREUR] Impossible d'installer '$2'."
+        echo "  Pré-installez depuis le nœud de login : bash src/slurm/setup_jeanzay.sh"
         exit 1
     }
 }
 
-_install_if_missing() {
-    python3 -c "import $1" 2>/dev/null || pip install --user --quiet "$2"
-}
-
-_require medvae medvae
-_install_if_missing nibabel nibabel
-_install_if_missing scipy  scipy
+_pip_install medvae  medvae
+_pip_install nibabel nibabel
+_pip_install scipy   scipy
+_pip_install einops  einops
 
 # ─── Vérification des poids MedVAE en cache ──────────────────────────────────
 python3 - <<'EOF'

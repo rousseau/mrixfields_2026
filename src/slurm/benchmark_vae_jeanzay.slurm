@@ -66,12 +66,23 @@ module load pytorch-gpu/py3/2.5.0
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 
-_install_if_missing() {
-    python3 -c "import $1" 2>/dev/null || pip install --user --quiet "$2"
+# Installation via pip --user --no-cache-dir (fonctionne depuis les nœuds de
+# calcul Jean Zay selon la doc IDRIS). En cas d'échec réseau persistant,
+# pré-installer depuis le nœud de login : bash src/slurm/setup_jeanzay.sh
+_pip_install() {
+    python3 -c "import $1" 2>/dev/null && return 0
+    echo "[INFO] Installation de '$2'..."
+    pip install --user --no-cache-dir "$2" || {
+        echo "[ERREUR] Impossible d'installer '$2'."
+        echo "  Pré-installez depuis le nœud de login : bash src/slurm/setup_jeanzay.sh"
+        exit 1
+    }
 }
-_install_if_missing nibabel nibabel
-_install_if_missing scipy scipy
-_install_if_missing medvae medvae
+_pip_install nibabel nibabel
+_pip_install scipy   scipy
+_pip_install einops  einops
+_pip_install pythae  pythae
+_pip_install medvae  medvae
 
 # ─── Cache PyTorch ───────────────────────────────────────────────────────────
 export TORCH_HOME="$WORK/.cache/torch"

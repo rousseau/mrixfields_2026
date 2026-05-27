@@ -97,6 +97,7 @@ fi
 # ─── 3. Installer les dépendances Python ─────────────────────────
 echo ""
 echo "[3/4] Installation des dépendances Python.."
+echo "      (nibabel, scipy, einops, torchcfm, pot, torchdiffeq, monai, pythae, medvae)"
 
 module purge
 module load arch/h100
@@ -105,13 +106,19 @@ module load pytorch-gpu/py3/2.5.0
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 
-pip install --user --quiet torchcfm pot torchdiffeq nibabel
+pip install --user --no-cache-dir nibabel scipy einops
+pip install --user --no-cache-dir torchcfm pot torchdiffeq
+pip install --user --no-cache-dir "monai[all]>=1.3.0"
+pip install --user --no-cache-dir pythae
+
+# MedVAE (StanfordMIMI — nécessite HuggingFace hub)
+pip install --user --no-cache-dir "huggingface_hub>=0.20" medvae
 
 # Package mrixfields
 if [ -f "$CHALLENGE_BASELINE/setup.py" ]; then
     # --no-deps : evite tensorflow<2.16 incompatible avec Python 3.12
     # On n'utilise que mrixfields.data.transforms (aucune dépendance TF)
-    pip install --user --quiet --no-deps "$CHALLENGE_BASELINE"
+    pip install --user --no-cache-dir --no-deps "$CHALLENGE_BASELINE"
     echo "  -> mrixfields installé (sans dépendances) depuis $CHALLENGE_BASELINE"
 elif [ -d "$CHALLENGE_DIR" ]; then
     echo "  [ATTENTION] setup.py introuvable dans $CHALLENGE_BASELINE"
@@ -122,6 +129,23 @@ else
 fi
 
 echo "[3/4] Dépendances installées dans \$WORK/.local"
+
+# ─── 3b. Pré-téléchargement des poids MedVAE (cache HuggingFace) ─────────────
+echo ""
+echo "[3b/4] Pré-téléchargement des poids MedVAE en cache HuggingFace..."
+echo "       (nécessaire car les nœuds de calcul peuvent ne pas avoir accès à HF)"
+python3 - <<'PY'
+try:
+    from medvae import MVAE
+    print("  Téléchargement medvae_4_1_3d ...")
+    MVAE(model_name="medvae_4_1_3d", modality="mri")
+    print("  Téléchargement medvae_8_1_3d ...")
+    MVAE(model_name="medvae_8_1_3d", modality="mri")
+    print("  [OK] Poids MedVAE en cache.")
+except Exception as e:
+    print(f"  [WARN] Impossible de pré-télécharger les poids MedVAE : {e}")
+    print("         Relancez 'python3 -c \"from medvae import MVAE; MVAE(...)\"' manuellement.")
+PY
 
 # ─── 4. Commandes d'entraînement ──────────────────────────────────
 echo ""

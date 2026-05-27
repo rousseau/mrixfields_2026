@@ -70,14 +70,26 @@ module load pytorch-gpu/py3/2.5.0
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 
-_install_if_missing() {
-    python3 -c "import $1" 2>/dev/null || pip install --user --quiet "$2"
+# Installation via pip --user --no-cache-dir (fonctionne depuis les nœuds de
+# calcul Jean Zay selon la doc IDRIS). Si le package est déjà présent dans
+# $WORK/.local, l'import réussit immédiatement sans toucher au réseau.
+# En cas d'échec réseau persistant, pré-installer depuis le nœud de login :
+#   bash src/slurm/setup_jeanzay.sh
+_pip_install() {
+    python3 -c "import $1" 2>/dev/null && return 0
+    echo "[INFO] Installation de '$2'..."
+    pip install --user --no-cache-dir "$2" || {
+        echo "[ERREUR] Impossible d'installer '$2'."
+        echo "  Pré-installez depuis le nœud de login : bash src/slurm/setup_jeanzay.sh"
+        exit 1
+    }
 }
-_install_if_missing torchcfm    torchcfm
-_install_if_missing ot          pot
-_install_if_missing torchdiffeq torchdiffeq
-_install_if_missing nibabel     nibabel
-_install_if_missing monai       "monai[all]>=1.3.0"
+_pip_install torchcfm    torchcfm
+_pip_install ot          pot
+_pip_install torchdiffeq torchdiffeq
+_pip_install nibabel     nibabel
+_pip_install monai       "monai[all]>=1.3.0"
+_pip_install medvae      medvae
 
 # Vérifie explicitement la disponibilité des modèles generative
 _ensure_monai_generative_models() {
@@ -98,8 +110,7 @@ PY
         echo "[INFO] AutoencoderKL/DiffusionModelUNet disponibles."
     else
         echo "[ERREUR] AutoencoderKL/DiffusionModelUNet introuvables dans l'environnement." >&2
-        echo "         Sur JeanZay (compute node sans internet), l'installation pip dynamique peut échouer." >&2
-        echo "         Pré-installez sur l'environnement partagé via login node, puis relancez." >&2
+        echo "         Pré-installez depuis le nœud de LOGIN : bash src/slurm/setup_jeanzay.sh" >&2
         exit 1
     fi
 }
@@ -109,7 +120,7 @@ _ensure_monai_generative_models
 CHALLENGE_BASELINE="$WORK/MRIX/challenge/Baseline"
 if [ -f "$CHALLENGE_BASELINE/setup.py" ]; then
     python3 -c "import mrixfields" 2>/dev/null || \
-        pip install --user --quiet --no-deps "$CHALLENGE_BASELINE"
+        pip install --user --no-cache-dir --no-deps "$CHALLENGE_BASELINE"
 else
     echo "[WARN] $CHALLENGE_BASELINE/setup.py introuvable."
 fi

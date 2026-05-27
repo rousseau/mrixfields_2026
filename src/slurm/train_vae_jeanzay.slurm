@@ -9,7 +9,7 @@
 #   sbatch src/slurm/train_vae_jeanzay.slurm <VAE_TYPE> [CONFIG] [RUN_NAME]
 #
 # Arguments :
-#   VAE_TYPE  : aekl | medvae | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae  (obligatoire)
+#   VAE_TYPE  : aekl | medvae | medvae_finetune | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae  (obligatoire)
 #   CONFIG    : chemin config YAML       (défaut : configs/vae3d_multimodal.yaml)
 #   RUN_NAME  : sous-répertoire de sortie (défaut : {VAE_TYPE}_multimodal_remote)
 #
@@ -55,9 +55,9 @@ if [[ -z "$VAE_TYPE" ]]; then
     exit 1
 fi
 case "$VAE_TYPE" in
-    aekl|medvae|vqvae|pythae_vae|pythae_vqvae|pythae_rhvae) ;;
+    aekl|medvae|medvae_finetune|vqvae|pythae_vae|pythae_vqvae|pythae_rhvae) ;;
     *)
-        echo "[ERREUR] VAE_TYPE invalide : $VAE_TYPE  (aekl | medvae | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae)"
+        echo "[ERREUR] VAE_TYPE invalide : $VAE_TYPE  (aekl | medvae | medvae_finetune | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae)"
         exit 1
         ;;
 esac
@@ -78,22 +78,48 @@ export TORCH_HOME="$WORK/.cache/torch"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export PYTHONPATH="$CODE_DIR/src"
 
-# ── Dépendances optionnelles ─────────────────────────────────────────────────
-_install_if_missing() {
-    python3 -c "import $1" >/dev/null 2>&1 || pip install --user --quiet "$2"
-}
-_install_if_missing nibabel nibabel
-_install_if_missing scipy scipy
-_install_if_missing einops einops
-
-if [[ "$VAE_TYPE" == "medvae" ]]; then
-    python3 -c "import medvae" >/dev/null 2>&1 || {
-        echo "[ERREUR] Package 'medvae' introuvable."
-        echo "Installez-le sur le nœud de connexion :"
-        echo "  pip install --user git+https://github.com/StanfordMIMI/MedVAE.git"
+# ── Dépendances Python ───────────────────────────────────────────────────────
+# Installation via pip --user --no-cache-dir (fonctionne depuis les nœuds de
+# calcul Jean Zay selon la doc IDRIS). Si le package est déjà présent dans
+# $WORK/.local, l'import réussit immédiatement sans toucher au réseau.
+# En cas d'échec réseau persistant, pré-installer depuis le nœud de login :
+#   bash src/slurm/setup_jeanzay.sh
+_pip_install() {
+    # $1 = module Python à importer, $2 = paquet pip (peut contenir des guillemets)
+    python3 -c "import $1" 2>/dev/null && return 0
+    echo "[INFO] Installation de '$2'..."
+    pip install --user --no-cache-dir "$2" || {
+        echo "[ERREUR] Impossible d'installer '$2'."
+        echo "  Pré-installez depuis le nœud de login : bash src/slurm/setup_jeanzay.sh"
         exit 1
     }
-fi
+}
+_pip_install nibabel  nibabel
+_pip_install scipy    scipy
+_pip_install einops   einops
+_pip_install monai    "monai[all]>=1.3.0"
+
+# Dépendances conditionnelles selon VAE_TYPE
+case "$VAE_TYPE" in
+    pythae_vae|pythae_vqvae|pythae_rhvae)
+        _pip_install pythae pythae
+        ;;
+    medvae|medvae_finetune)
+        _pip_install medvae medvae
+        # Vérifier que les poids MedVAE sont en cache HuggingFace
+        # (le téléchargement peut échouer sur les nœuds de calcul sans accès internet complet)
+        python3 -c "
+import os; os.environ['HF_HUB_OFFLINE'] = '1'
+try:
+    from medvae import MVAE; MVAE(model_name='medvae_4_1_3d', modality='mri')
+    print('[OK] Poids MedVAE disponibles dans le cache HuggingFace')
+except Exception as e:
+    print(f'[WARN] Poids MedVAE non mis en cache : {e}')
+    print('  Sur le nœud de login, exécuter :')
+    print('  python3 -c \"from medvae import MVAE; MVAE(model_name=\\\"medvae_4_1_3d\\\", modality=\\\"mri\\\")\"')
+"
+        ;;
+esac
 
 # ── Résumé ───────────────────────────────────────────────────────────────────
 echo "======================================================================="
@@ -116,6 +142,8 @@ elif [[ "$VAE_TYPE" == "pythae_vqvae" ]]; then
     TRAIN_SCRIPT="src/vae3d/train_pythae_vqvae.py"
 elif [[ "$VAE_TYPE" == "pythae_rhvae" ]]; then
     TRAIN_SCRIPT="src/vae3d/train_pythae_rhvae.py"
+elif [[ "$VAE_TYPE" == "medvae_finetune" ]]; then
+    TRAIN_SCRIPT="src/vae3d/train_maisi_finetune.py"
 else
     TRAIN_SCRIPT="src/vae3d/train_vae_3d.py"
 fi

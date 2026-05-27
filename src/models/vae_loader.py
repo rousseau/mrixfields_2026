@@ -6,7 +6,8 @@ Single entry point `load_vae(cfg, device)` used by all training/inference/eval s
 Supported vae_types:
   - "aekl"              : MONAI AutoencoderKL
   - "maisi"             : MONAI bundle MAISI / NV-Generate-CTMR autoencoder
-  - "medvae"            : Stanford MIMI MedVAE
+  - "medvae"            : Stanford MIMI MedVAE (frozen, legacy wrapper)
+  - "medvae_finetune"   : MedVAE fine-tunable (Phase D) — frozen or trainable
   - "medvae_disentangle": MedVAE disentanglement v1
   - "vqvae"             : NeuroQuantHybrid VQ-VAE (deprecated, kept for compat)
   - "pythae_vae"        : Pythae VAE 3D (conv encoder/decoder + reparameterization)
@@ -74,6 +75,8 @@ def load_vae(cfg: dict, device: torch.device) -> MRIxFieldsVAE:
         wrapper = _load_vqvae(vae_cfg, device)
     elif vae_type == "medvae_disentangle":
         wrapper = _load_medvae_disentangle(vae_cfg, device)
+    elif vae_type == "medvae_finetune":
+        wrapper = _load_medvae_finetune(vae_cfg, device)
     elif vae_type == "maisi":
         wrapper = _load_maisi(vae_cfg, device, vae_source)
     elif vae_type == "pythae_vae":
@@ -86,9 +89,13 @@ def load_vae(cfg: dict, device: torch.device) -> MRIxFieldsVAE:
         wrapper = _load_aekl(vae_cfg, device, vae_source)
 
     wrapper = wrapper.to(device)
-    wrapper.eval()
-    for p in wrapper.parameters():
-        p.requires_grad_(False)
+    # For medvae_finetune in training mode, don't freeze here — caller manages
+    if vae_type != "medvae_finetune":
+        wrapper.eval()
+        for p in wrapper.parameters():
+            p.requires_grad_(False)
+    else:
+        wrapper.eval()  # default; training script calls .train() when needed
 
     print(f"  [load_vae] latent_format={wrapper.latent_format} "
           f"latent_channels={wrapper.latent_channels} "
@@ -465,3 +472,49 @@ def _load_pythae_rhvae(vae_cfg: dict, device: torch.device):
         print(f"  [WARN] Pythae RHVAE 3D checkpoint not found: {ckpt_path} — using random weights")
 
     return model
+
+
+# --------------------------------------------------------------------------- #
+# MedVAE Fine-tunable (Phase D)                                               #
+# --------------------------------------------------------------------------- #
+
+
+def _load_medvae_finetune(vae_cfg: dict, device: torch.device):
+    """Load MedVAE as a fine-tunable MedVAEFineTuneWrapper (Phase D).
+
+    Config keys:
+        model_name   : 'medvae_4_1_3d' (default) or 'medvae_8_1_3d'
+        frozen       : True (inference) | False (fine-tune all) | 'decoder_only'
+        kl_weight    : float (default 1e-6)
+        checkpoint   : local path to fine-tuned weights (optional)
+    """
+    from models.maisi_vae import build_medvae_wrapper
+
+    model_name = vae_cfg.get("model_name", "medvae_4_1_3d")
+    frozen_cfg  = vae_cfg.get("frozen", True)
+    kl_weight   = float(vae_cfg.get("kl_weight", 1e-6))
+    ckpt_path   = vae_cfg.get("checkpoint", "")
+
+    # Parse frozen mode
+    if isinstance(frozen_cfg, str) and frozen_cfg == "decoder_only":
+        frozen = True   # start frozen, then unfreeze decoder
+    else:
+        frozen = bool(frozen_cfg)
+
+    wrapper = build_medvae_wrapper(
+        model_name=model_name,
+        frozen=frozen,
+        kl_weight=kl_weight,
+        checkpoint=ckpt_path if ckpt_path else None,
+    )
+
+    # Unfreeze decoder only if requested
+    if isinstance(frozen_cfg, str) and frozen_cfg == "decoder_only":
+        wrapper.unfreeze_decoder()
+        print(f"  MedVAEFineTune ({model_name}): decoder unfrozen, encoder frozen")
+    elif not frozen:
+        print(f"  MedVAEFineTune ({model_name}): all parameters trainable")
+    else:
+        print(f"  MedVAEFineTune ({model_name}): frozen (inference only)")
+
+    return wrapper
