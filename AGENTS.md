@@ -46,14 +46,14 @@ python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, GPUs: {torch
 
 ### Matériel supporté
 
-Les codes sont conçus pour fonctionner sur les deux environnements sans modification :
+Les codes sont conçus pour fonctionner sur deux environnements :
 
 | Environnement | Matériel | Config | Lancement |
-|---------------|----------|--------|-----------|
-| **Local — DGX Spark GB10** | GPU GB10, multi-GPU local | `configs/env/local.yaml` | Scripts `src/*.sh` ou `torchrun` |
-| **Jean Zay — HPC IDRIS** | 4×H100 SXM5 80GB | `configs/env/jeanzay.yaml` | Scripts `src/slurm/*.slurm` |
+|---|---|---|---|
+| **Local — DGX GB10 Lenovo ThinkStation** | GPU GB10 (128GB VRAM), multi-GPU local | `configs/env/local.yaml` | `src/slurm/launch_cfm3d_dgx.sh` ou `torchrun` |
+| **Remote — HPC** | 4×H100 SXM5 80GB | `configs/env/remote.yaml` | Scripts `src/slurm/*.slurm` |
 
-La bascule entre environnements se fait via `--env local` ou `--env jeanzay` :
+La bascule entre environnements se fait via `--env local` ou `--env remote` :
 
 ```bash
 # Local
@@ -109,12 +109,18 @@ sbatch src/slurm/stargan_jeanzay.slurm T1W retro_scratch
 
 Quatre architectures sont comparées :
 
-| VAE | Référence | Particularité |
-|-----|-----------|---------------|
-| **MedVAE** | https://github.com/StanfordMIMI/MedVAE | Pré-entraîné sur 1M images médicales — testé en version *frozen* (poids originaux) et *fine-tuné* sur MRIxFields |
-| **AEKL (MONAI)** | https://github.com/Project-MONAI/GenerativeModels | AutoencoderKL 3D — 4 canaux latents, 200 epochs entraînés |
-| **NeuroQuant (adapté)** | https://arxiv.org/html/2604.05171v1 | Adapté pour utiliser donn ées **paired et unpaired** — FiLM conditioning multi-champ, adversary d'invariance de modalité |
-| **MedVAE Disentanglement v1.2** | interne (ce repo) | MedVAE encodeur/décodeur **figés**, décomposition latent **anatomie/modalité** avec warmup progressif des pertes pairées (v1.2) |
+| VAE | Référence | Particularité | Latent |
+|-----|-----------|---------------|--------|
+| **AEKL (MONAI)** | https://github.com/Project-MONAI/GenerativeModels | AutoencoderKL 3D — 4 canaux latents | Spatial `(C,H',W',D')` |
+| **Pythae VAE 3D** | https://github.com/clementchadebec/benchmark_VAE | VAE propre 3D (remplace VQ-VAE NeuroQuant) | Spatial `(C,H',W',D')` |
+| **Pythae VQ-VAE 3D** | https://github.com/clementchadebec/benchmark_VAE | VQ-VAE 3D avec quantizer 5D custom | Spatial `(C,H',W',D')` |
+| **RHVAE 3D** | https://github.com/clementchadebec/benchmark_VAE | Riemannian Hamiltonian VAE — vecteur plat | Vectoriel `(D_lat)` |
+| **MedVAE** | https://github.com/StanfordMIMI/MedVAE | Pré-entraîné sur 1M images médicales — frozen / fine-tuné | Spatial `(C,H',W',D')` |
+| **MAISI** | https://github.com/NVIDIA-Medtech/NV-Generate-CTMR / MONAI bundle | Pré-entraîné sur 55k CT+MRI volumes | Spatial `(C,H',W',D')` |
+
+> **Règle challenge Task 3** : un seul modèle unifié est autorisé. Par conséquent, tous les VAE sont entraînés sur **T1W + T2W + T2FLAIR** (pas de modèles mono-modaux). Voir `docs/VAE_IMPLEMENTATION_PLAN.md`.
+
+> **Patch standard** : `(128, 128, 128)` pour tous les VAE (inférence patch-based via `PatchedVAE`).
 
 **Critères de sélection du VAE final** :
 - Qualité de reconstruction (MAE, MSE, SSIM sur volumes 3D complets)
@@ -123,25 +129,28 @@ Quatre architectures sont comparées :
 
 | Fichier | Rôle |
 |---------|------|
-| `src/vae3d/train_vae_3d.py` | Entraînement AEKL 3D |
-| `src/vae3d/train_vqvae.py` | Entraînement NeuroQuant adapté (VQ-VAE 3D) |
-| `src/vae3d/train_medvae_disentangle_v1.py` | Entraînement MedVAE Disentanglement v1 (anatomie/modalité, MedVAE figé) |
-| `src/vae3d/benchmark_vae.py` | **Script de benchmark unifié** — compare les VAE étape 2 (inclut v1) |
-| `src/vae3d/benchmark_disentanglement_v1.py` | Benchmark disentanglement v1 (`Acc(mod|z_m)` vs `Acc(mod|z_a)`, rec/cross L1) |
+| `src/models/vae_base.py` | Classe abstraite `MRIxFieldsVAE` — API commune |
+| `src/models/vae_wrappers.py` | Wrappers AEKL/MedVAE/VQ-VAE héritant de `MRIxFieldsVAE` |
+| `src/models/vae_loader.py` | `load_vae(cfg, device)` — point d'entrée unifié |
+| `src/common/dataset_vae.py` | Dataset **multimodal** (T1W+T2W+T2FLAIR × tous champs) |
+| `src/vae3d/train_vae_3d.py` | Entraînement AEKL 3D (refactorisé pour dataset multimodal) |
+| `src/vae3d/train_vqvae.py` | Entraînement NeuroQuant adapté (VQ-VAE 3D) — **deprecated** |
+| `src/vae3d/train_medvae_disentangle_v1.py` | Entraînement MedVAE Disentanglement v1 — legacy |
+| `src/vae3d/benchmark_vae.py` | **Script de benchmark unifié** — compare tous VAE |
+| `src/vae3d/benchmark_disentanglement_v1.py` | Benchmark disentanglement v1 (legacy) |
 | `src/vae3d/qc_vae_3d.py` | QC visuel des reconstructions |
-| `src/utils/patched_vae.py` | Wrapper patch-based pour volumes full-res |
+| `src/vae3d/visualize_latent_umap.py` | UMAP 2D coloré (modalité + champ) — à créer |
+| `src/utils/patched_vae.py` | Wrapper patch-based (inférence full-res) |
 | `src/slurm/train_vae_jeanzay.slurm` | Job SLURM unifié (aekl / vqvae / medvae) |
-| `src/slurm/train_vqvae_jeanzay.slurm` | Job SLURM VQ-VAE 3D (4×H100) |
-| `src/slurm/train_medvae_disentangle_jeanzay.slurm` | Job SLURM MedVAE Disentanglement v1 |
 
 ```bash
-# AEKL
-python src/vae3d/train_vae_3d.py --config configs/vae3d_T1W.yaml --env local
+# AEKL multimodal (128³)
+python src/vae3d/train_vae_3d.py --config configs/vae3d_multimodal.yaml --env local
 
-# NeuroQuant (VQ-VAE)
+# NeuroQuant (VQ-VAE) — legacy, remplacé par Pythae VQ-VAE dans Phase B
 python src/vae3d/train_vqvae.py --config configs/vqvae3d_T1W.yaml --env local
 
-# MedVAE Disentanglement v1 (anatomie/modalité)
+# MedVAE Disentanglement v1 (legacy)
 python src/vae3d/train_medvae_disentangle_v1.py \
     --data-root /home/rousseau/Data/MRIxFields_20260414 \
     --output-dir outputs/medvae_disentangle_v1/runs/dev_run \
@@ -152,18 +161,11 @@ python src/vae3d/train_medvae_disentangle_v1.py \
 # Benchmark automatique des architectures (étape 2)
 python src/vae3d/benchmark_vae.py --modality T1W --field 0.1T
 
-# Benchmark spécifique du disentanglement v1
-python src/vae3d/benchmark_disentanglement_v1.py \
-    --ckpt outputs/medvae_disentangle_v1/runs/dev_run/weights/model_best.pth
-
-# Jean Zay
-sbatch src/slurm/train_vae_jeanzay.slurm aekl vae3d_T1W
-sbatch src/slurm/train_vqvae_jeanzay.slurm vqvae3d_hybrid "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T" 0 4
-sbatch src/slurm/train_medvae_disentangle_jeanzay.slurm medvae_disentangle_v1 "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T"
-sbatch src/slurm/benchmark_vae_jeanzay.slurm T1W 0.1T
+# Jean Zay — AEKL multimodal
+sbatch src/slurm/train_vae_jeanzay.slurm aekl vae3d_multimodal
 ```
 
-**État** : AEKL ✅ (200 epochs), VQ-VAE ✅ (smoke tests), MedVAE ⏳ (fine-tuning à lancer), MedVAE Disentanglement v1 ✅ (premier run local).
+**État** : AEKL ✅ (T1W only, à ré-entraîner multimodal), Pythae VAE/VQ-VAE/RHVAE ⏳ (Phase A–C), MedVAE ⏳ (fine-tuning à lancer).
 
 ---
 
@@ -301,18 +303,23 @@ mrixfields_2026/
 │
 ├── configs/                            # ─── CONFIGURATIONS ───
 │   ├── env/
-│   │   ├── local.yaml                  #   DGX Spark GB10
-│   │   ├── jeanzay.yaml                #   IDRIS 4×H100 SXM5
-│   │   └── dgx.yaml                    #   DGX Station multi-GPU
-│   ├── vae3d_T1W.yaml                  #   AEKL 3D — T1W
-│   ├── vqvae3d_T1W.yaml                #   VQ-VAE 3D (NeuroQuant) — T1W
-│   ├── cfm3d_T1W_aekl.yaml              #   OT-CFM 3D + AEKL — T1W
-│   ├── cfm3d_T1W_medvae.yaml            #   OT-CFM 3D + MedVAE — T1W
-│   ├── cfm3d_T1W_vqvae.yaml             #   OT-CFM 3D + VQ-VAE — T1W
+│   │   ├── local.yaml                  #   DGX GB10 Lenovo ThinkStation
+│   │   └── jeanzay.yaml                #   IDRIS 4×H100 SXM5
+│   ├── vae3d_multimodal.yaml           #   AEKL 3D — multimodal
+│   ├── vae3d_T1W.yaml                  #   AEKL 3D — T1W (legacy)
+│   ├── vqvae3d_T1W.yaml                #   VQ-VAE 3D (NeuroQuant) — T1W (legacy)
+│   ├── cfm3d_T1W_aekl.yaml             #   OT-CFM 3D + AEKL — T1W
+│   ├── cfm3d_T1W_medvae.yaml           #   OT-CFM 3D + MedVAE — T1W
+│   ├── cfm3d_T1W_vqvae.yaml            #   OT-CFM 3D + VQ-VAE — T1W
 │   ├── stargan2d_T1W.yaml              #   StarGAN 2D — T1W
 │   └── benchmark.yaml                  #   Benchmark VAE (à créer)
 │
 ├── src/                                # ─── CODE SOURCE ───
+│   ├── models/
+│   │   ├── vae_base.py                 #   Classe abstraite MRIxFieldsVAE — API commune
+│   │   ├── vae_wrappers.py             #   Wrappers AEKL/MedVAE/VQ-VAE héritant de MRIxFieldsVAE
+│   │   └── vae_loader.py               #   load_vae(cfg, device) — point d'entrée unifié
+│   │
 │   ├── utils/
 │   │   └── patched_vae.py              #   Wrapper patch-based (inference full-res)
 │   │
@@ -328,11 +335,10 @@ mrixfields_2026/
 │   │   └── test_patched_vae.py         #     Smoke test wrapper
 │   │
 │   ├── cfm/                            #   Étape 3 : CFM
-│   │   ├── train_cfm2d.py              #     OT-CFM 2D
 │   │   ├── train_cfm_3d.py             #     OT-CFM 3D latent
-│   │   ├── launch_cfm_screen.sh        #     Lancement screen local
-│   │   ├── watch_and_viz_cfm2d.sh      #     Surveillance checkpoints
-│   │   └── test_benchmark_smoke.py     #     Smoke test
+│   │   ├── train_mmfm_3d.py            #     MMFM vectorisé
+│   │   ├── test_mmfm_v1_smoke.py       #     Smoke test MMFM
+│   │   └── mmfm_vectorized.py          #     Briques vectorielles
 │   │
 │   ├── stargan/                        #   Étape 1 : Baseline StarGAN 2D
 │   │   ├── train_stargan2d.sh          #     Entraînement
@@ -345,8 +351,13 @@ mrixfields_2026/
 │   │
 │   ├── visualization/                  #   Figures et QC
 │   │   ├── visualize.py
-│   │   ├── visualize_cfm2d.py
-│   │   └── visualize_stargan2d.py
+│   │   ├── visualize_stargan2d.py
+│   │   └── viz_normalization_effect.py
+│   │
+│   ├── common/                         #   Infrastructure commune
+│   │   ├── io.py                       #     NIfTI I/O, preprocessing
+│   │   ├── metrics.py                  #     Métriques (nRMSE, SSIM, LPIPS)
+│   │   └── dataset_vae.py              #     Dataset multimodal VAE
 │   │
 │   ├── analysis/                       #   Analyse du dataset
 │   │   └── dataset_stats.py
@@ -355,14 +366,13 @@ mrixfields_2026/
 │       ├── setup_jeanzay.sh
 │       ├── train_vae_jeanzay.slurm
 │       ├── train_vqvae_jeanzay.slurm
-│       ├── cfm_jeanzay.slurm
 │       ├── cfm_3d_jeanzay.slurm
 │       ├── stargan_jeanzay.slurm
 │       ├── benchmark_vae_jeanzay.slurm
 │       ├── submit_train_vae_jeanzay.sh
 │       └── launch_cfm3d_dgx.sh         #     Lancement multi-GPU local (DGX)
 │
-├── outputs/                            # ─── SORTIES LOURDES (gitignore) ───
+├── outputs/                            # ── SORTIES LOURDES (gitignore) ──
 │   ├── vae3d/runs/vae3d_T1W/weights/   #   AEKL — 20 ckpts + model_best + model_final ✅
 │   ├── vqvae3d/runs/                   #   VQ-VAE — smoke + stability tests ✅
 │   ├── cfm3d/runs/cfm3d_T1W/weights/   #   CFM 3D — ⚠️ vide (à entraîner)
@@ -381,6 +391,9 @@ mrixfields_2026/
 ├── docs/                               # ─── DOCUMENTATION ───
 │   ├── BENCHMARK_IMPLEMENTATION.md
 │   ├── BENCHMARK_PLAN.md
+│   ├── EVALUATION_SCRIPT.md
+│   ├── VAE_IMPLEMENTATION_PLAN.md      #   Plan VAE détaillé (Phases A–F)
+│   ├── MMFM_V1_VECTORIZED.md
 │   └── ARCHITECTURE.md                 #   (à créer)
 │
 ├── paper/                              # ─── PAPIER (vide) ───
@@ -431,7 +444,7 @@ mrixfields_2026/
 ## État d'avancement
 
 | Étape | Méthode | État | Checkpoint |
-|-------|---------|------|------------|
+|-----|---------|------|------------|
 | 1 | StarGAN 2D (T1W) | ✅ Terminé | `task3_any_to_any_T1W/` |
 | 2 | AEKL 3D (T1W) | ✅ Terminé | `vae3d_T1W/weights/model_best.pth` |
 | 2 | VQ-VAE NeuroQuant (T1W) | ✅ Smoke tests | `vqvae3d/runs/smoke_*` |
@@ -442,7 +455,7 @@ mrixfields_2026/
 | 3 | OT-CFM 3D + AEKL (T1W) | ⏳ Comparatif | `cfm3d_T1W_aekl/weights/` |
 | 3 | OT-CFM 3D + VQ-VAE (T1W) | ⏳ Comparatif | `cfm3d_T1W_vqvae/weights/` |
 | 4 | MedVAE vectorisé + MMFM | ✅ Baseline v1 | `cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1/weights/` |
-| — | Script évaluation unifié | ⏳ À créer | `src/evaluation/evaluate.py` |
+| — | Script évaluation unifié | ✅ Terminé | `src/evaluation/evaluate.py` (5 méthodes) |
 | — | Tableau métriques | ⏳ À initialiser | `results/evaluation_table.csv` |
 | — | Paper | ⬜ Vide | `paper/` |
 

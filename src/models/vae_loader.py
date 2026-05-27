@@ -2,6 +2,16 @@
 """Unified VAE loading utilities.
 
 Single entry point `load_vae(cfg, device)` used by all training/inference/eval scripts.
+
+Supported vae_types:
+  - "aekl"              : MONAI AutoencoderKL
+  - "maisi"             : MONAI bundle MAISI / NV-Generate-CTMR autoencoder
+  - "medvae"            : Stanford MIMI MedVAE
+  - "medvae_disentangle": MedVAE disentanglement v1
+  - "vqvae"             : NeuroQuantHybrid VQ-VAE (deprecated, kept for compat)
+  - "pythae_vae"        : Pythae generic VAE 3D (future)
+  - "pythae_vqvae"      : Pythae VQ-VAE 3D (future)
+  - "pythae_rhvae"      : Pythae RHVAE 3D (future)
 """
 
 from __future__ import annotations
@@ -25,20 +35,24 @@ except ImportError:
         from generative.networks.nets import AutoencoderKL
 
 # Imports locaux
+from models.vae_base import MRIxFieldsVAE
 from models.vae_wrappers import (
     AEKLWrapper,
     MedVAEWrapper,
     MedVAEDisentangleWrapper,
     VQVAEWrapper,
-    VAEWrapper,
+    _infer_medvae_latent_channels,
 )
+
+# Rétrocompatibilité
+VAEWrapper = MRIxFieldsVAE
 
 # --------------------------------------------------------------------------- #
 # Public API                                                                  #
 # --------------------------------------------------------------------------- #
 
 
-def load_vae(cfg: dict, device: torch.device) -> VAEWrapper:
+def load_vae(cfg: dict, device: torch.device) -> MRIxFieldsVAE:
     """Load and wrap a VAE based on cfg['vae'].
 
     Args:
@@ -60,6 +74,13 @@ def load_vae(cfg: dict, device: torch.device) -> VAEWrapper:
         wrapper = _load_vqvae(vae_cfg, device)
     elif vae_type == "medvae_disentangle":
         wrapper = _load_medvae_disentangle(vae_cfg, device)
+    elif vae_type == "maisi":
+        wrapper = _load_maisi(vae_cfg, device, vae_source)
+    elif vae_type in ("pythae_vae", "pythae_vqvae", "pythae_rhvae"):
+        raise NotImplementedError(
+            f"{vae_type} support not yet implemented. "
+            "Please run Phase B of the VAE implementation plan."
+        )
     else:
         wrapper = _load_aekl(vae_cfg, device, vae_source)
 
@@ -68,7 +89,9 @@ def load_vae(cfg: dict, device: torch.device) -> VAEWrapper:
     for p in wrapper.parameters():
         p.requires_grad_(False)
 
-    print(f"  [load_vae] latent_channels={wrapper.latent_channels}")
+    print(f"  [load_vae] latent_format={wrapper.latent_format} "
+          f"latent_channels={wrapper.latent_channels} "
+          f"latent_shape={wrapper.latent_shape}")
     return wrapper
 
 
@@ -82,7 +105,7 @@ def _load_aekl(vae_cfg: dict, device: torch.device, source: str) -> AEKLWrapper:
     if source == "maisi":
         model = _build_maisi_autoencoder(vae_cfg.get("maisi_cache_dir"))
     else:
-        vae_config_path = vae_cfg.get("vae_config", "configs/vae3d_T1W.yaml")
+        vae_config_path = vae_cfg.get("vae_config", "configs/vae3d_multimodal.yaml")
         if not os.path.isabs(vae_config_path):
             project_root = Path(__file__).resolve().parents[2]
             vae_config_path = str(project_root / vae_config_path)
@@ -137,6 +160,21 @@ def _remap_aekl_keys(state: dict) -> dict:
             k = k.replace(".conv.conv.", ".postconv.conv.")
         fixed[k] = v
     return fixed
+
+
+# --------------------------------------------------------------------------- #
+# MAISI / NV-Generate-CTMR                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def _load_maisi(vae_cfg: dict, device: torch.device, source: str) -> AEKLWrapper:
+    """Load MAISI autoencoder (MONAI bundle or NVIDIA NV-Generate-CTMR).
+
+    Internally uses _build_maisi_autoencoder which downloads the MONAI bundle.
+    In the future, this may load NVIDIA's v1/v2 checkpoints directly.
+    """
+    model = _build_maisi_autoencoder(vae_cfg.get("maisi_cache_dir"))
+    return AEKLWrapper(model)
 
 
 def _build_maisi_autoencoder(cache_dir: Optional[str] = None) -> AutoencoderKL:
@@ -211,21 +249,8 @@ def _load_medvae(vae_cfg: dict, device: torch.device, source: str) -> MedVAEWrap
     return MedVAEWrapper(model, latent_ch)
 
 
-def _infer_medvae_latent_channels(model: nn.Module) -> int:
-    try:
-        model.eval()
-        with torch.no_grad():
-            dummy = torch.zeros(1, 1, 32, 32, 32)
-            _z = model.encode(dummy)
-            if isinstance(_z, (tuple, list)):
-                _z = _z[0]
-            return int(_z.shape[1])
-    except Exception:
-        return 1
-
-
 # --------------------------------------------------------------------------- #
-# VQ-VAE                                                                      #
+# VQ-VAE (NeuroQuant)                                                         #
 # --------------------------------------------------------------------------- #
 
 

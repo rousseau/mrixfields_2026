@@ -10,7 +10,7 @@ Usage :
 
   # Multi-GPU (torchrun, DDP)
   torchrun --nproc_per_node=4 src/train_vae_3d.py \\
-      --config configs/vae3d_T1W.yaml --env jeanzay
+      --config configs/vae3d_T1W.yaml --env remote
 
   # Reprendre depuis un checkpoint
   python src/train_vae_3d.py --config configs/vae3d_T1W.yaml \\
@@ -45,6 +45,7 @@ except ImportError:
 from common.config import load_env, resolve_paths
 from common.distributed import is_main_process
 from common.io import DOMAINS, normalize_volume, resample_volume, list_nifti_files
+from common.dataset_vae import MRIxFieldsMultimodalDataset, vae_multimodal_collate
 from pathlib import Path
 import nibabel as nib
 
@@ -186,22 +187,30 @@ def build_vae(cfg: dict) -> AutoencoderKL:
 
 
 def train(
-    cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] = None
+    cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] = None,
+    overrides: Optional[dict] = None,
 ) -> None:
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
     cfg = resolve_paths(cfg, load_env(env_path))
     if resume is not None:
         cfg["resume"] = resume
+    # Appliquer les overrides CLI (fusionnés récursivement dans cfg)
+    if overrides:
+        for section, values in overrides.items():
+            cfg.setdefault(section, {}).update(values)
 
     data_root = cfg["data"].get("data_root")
     if data_root is None:
         raise RuntimeError("data_root requis dans la config ou l'env.")
 
     output_dir = Path(cfg["data"]["output_dir"])
-    modality = cfg["data"]["modality"]
-    split = cfg["data"].get("split", "retro_train")
-    domains = cfg["data"].get("domains", DOMAINS)
+    # Modality may be single or list; for multimodal we always load all three
+    modalities_cfg = cfg["data"].get("modalities", [cfg["data"].get("modality", "T1W")])
+    if isinstance(modalities_cfg, str):
+        modalities_cfg = [modalities_cfg]
+    splits = cfg["data"].get("splits", [cfg["data"].get("split", "retro_train")])
+    fields = cfg["data"].get("fields", DOMAINS)
     patch_size = tuple(cfg["data"]["patch_size"])
     p_lo = cfg["data"].get("percentile_lower", 0.5)
     p_hi = cfg["data"].get("percentile_upper", 99.5)
@@ -239,31 +248,31 @@ def train(
         print(f"Device     : {device}")
 
     # ── Dataset ─────────────────────────────────────────────────────────────
-    train_ds = PatchedNIfTIVolumeDataset(
+    train_ds = MRIxFieldsMultimodalDataset(
         data_root=Path(data_root),
-        split=split,
-        modality=modality,
-        domains=domains,
+        splits=splits,
+        modalities=modalities_cfg,
+        fields=fields,
         patch_size=patch_size,
+        target_spacing=target_spacing,
         percentile_lower=p_lo,
         percentile_upper=p_hi,
         is_training=True,
-        target_spacing=target_spacing,
     )
 
     # Validation split
     val_split_fraction = cfg["data"].get("val_split_fraction", 0.2)
     try:
-        val_ds = PatchedNIfTIVolumeDataset(
+        val_ds = MRIxFieldsMultimodalDataset(
             data_root=Path(data_root),
-            split="pro_val",
-            modality=modality,
-            domains=domains,
+            splits=["pro_val"],
+            modalities=modalities_cfg,
+            fields=fields,
             patch_size=patch_size,
+            target_spacing=target_spacing,
             percentile_lower=p_lo,
             percentile_upper=p_hi,
             is_training=False,
-            target_spacing=target_spacing,
         )
         if is_main_process():
             print(f"  → Validation dataset chargé depuis Validating_prospective")
@@ -271,7 +280,7 @@ def train(
         if is_main_process():
             print(f"  [INFO] Validation dataset non trouvé")
             print(
-                f"  → Création d'un split train/val depuis {split} "
+                f"  → Création d'un split train/val depuis {splits} "
                 f"({int((1 - val_split_fraction) * 100)}% train, {int(val_split_fraction * 100)}% val)"
             )
         full_ds = train_ds
@@ -296,6 +305,7 @@ def train(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=vae_multimodal_collate,
     )
     val_loader = DataLoader(
         val_ds,
@@ -303,6 +313,7 @@ def train(
         shuffle=False,
         num_workers=2,
         pin_memory=True,
+        collate_fn=vae_multimodal_collate,
     )
 
     # ── Modèle ──────────────────────────────────────────────────────────────
@@ -362,8 +373,8 @@ def train(
 
         raw_model = model.module if is_distributed else model
 
-        for i, batch in enumerate(train_loader):
-            images = batch.to(device)  # (B, 1, H, W, D)
+        for i, batch_dict in enumerate(train_loader):
+            images = batch_dict["x"].to(device)  # (B, 1, H, W, D)
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 recon, z_mu, z_sigma = raw_model(images)
@@ -466,8 +477,8 @@ def _validate(
     model.eval()
     total_loss = 0.0
     n = 0
-    for batch in val_loader:
-        images = batch.to(device)
+    for batch_dict in val_loader:
+        images = batch_dict["x"].to(device)
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             recon, z_mu, z_sigma = model(images)
             recon_loss = F.l1_loss(recon, images)
@@ -522,13 +533,23 @@ def decode_volume(
 def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VAE 3D — Pré-entraînement pour IRM")
     p.add_argument("--config", required=True, help="Chemin vers le YAML de config")
-    p.add_argument("--env", default=None, help="Env YAML ou nom (local, jeanzay)")
-    p.add_argument(
-        "--resume", default=None, help="Chemin vers un checkpoint à reprendre"
-    )
+    p.add_argument("--env", default=None, help="Env YAML ou nom (local, remote)")
+    p.add_argument("--resume", default=None, help="Chemin vers un checkpoint à reprendre")
+    # Overrides CLI (prioritaires sur le YAML)
+    p.add_argument("--vae-type",    default=None, help="Override vae.vae_type")
+    p.add_argument("--run-name",    default=None, help="Override data.run_name (sous-répertoire de sortie)")
+    p.add_argument("--steps",       default=None, type=int, help="Override train.total_epochs (en étapes)")
+    p.add_argument("--batch-size",  default=None, type=int, help="Override train.batch_size")
+    p.add_argument("--lr",          default=None, type=float, help="Override train.lr")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse()
-    train(args.config, env_path=args.env, resume=args.resume)
+    overrides: dict = {}
+    if args.vae_type   is not None: overrides.setdefault("vae",   {})["vae_type"]    = args.vae_type
+    if args.run_name   is not None: overrides.setdefault("data",  {})["run_name"]    = args.run_name
+    if args.steps      is not None: overrides.setdefault("train", {})["total_epochs"] = args.steps
+    if args.batch_size is not None: overrides.setdefault("train", {})["batch_size"]  = args.batch_size
+    if args.lr         is not None: overrides.setdefault("train", {})["lr"]          = args.lr
+    train(args.config, env_path=args.env, resume=args.resume, overrides=overrides)

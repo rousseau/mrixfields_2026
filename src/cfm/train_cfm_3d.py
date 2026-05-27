@@ -21,7 +21,7 @@ Usage :
 
   # Multi-GPU (torchrun DDP)
   torchrun --nproc_per_node=4 src/cfm/train_cfm_3d.py \\
-      --config configs/cfm3d_T1W_aekl.yaml --env jeanzay
+      --config configs/cfm3d_T1W_aekl.yaml --env remote
 
   # Inférence
   python src/cfm/train_cfm_3d.py --mode infer \\

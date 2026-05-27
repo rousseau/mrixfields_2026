@@ -1,45 +1,74 @@
 #!/usr/bin/env python3
-"""Unified VAE wrapper interfaces.
+"""Unified VAE wrapper interfaces — all architectures share MRIxFieldsVAE base.
 
-All VAE architectures (AEKL, MedVAE, VQ-VAE, MedVAE-disentangle) implement
-the VAEWrapper ABC so they can be used interchangeably by CFM training,
-benchmark, and evaluation scripts.
+Wrappers provided:
+  - AEKLWrapper        (MONAI AutoencoderKL)
+  - MedVAEWrapper      (MedVAE frozen / fine-tuned)
+  - VQVAEWrapper       (NeuroQuantHybrid — spatial quantized latent)
+  - MedVAEDisentangleWrapper  (MedVAE frozen + anatomie/modalité projection)
+
+All inherit MRIxFieldsVAE and expose:
+  latent_format == "spatial"
+  latent_shape  == (C, H', W', D')  (inferred at init via dummy pass)
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.vae_base import MRIxFieldsVAE
+
+# Rétrocompatibilité : alias pour les imports externes
+VAEWrapper = MRIxFieldsVAE
+
 
 # --------------------------------------------------------------------------- #
-# Abstract base                                                               #
+# Helpers                                                                     #
 # --------------------------------------------------------------------------- #
 
 
-class VAEWrapper(nn.Module, ABC):
-    """Unified interface for all VAE architectures.
+def _infer_latent_shape_spatial(
+    encode_fn, dummy_size: Tuple[int, int, int] = (32, 32, 32)
+) -> Tuple[int, int, int, int]:
+    """Infer (C, H', W', D') by encoding a dummy tensor."""
+    device = next(encode_fn.__self__.parameters()).device
+    dummy = torch.zeros(1, 1, *dummy_size, device=device)
+    with torch.no_grad():
+        z = encode_fn(dummy)
+    return tuple(z.shape[1:])
 
-    All subclasses must implement:
-      - encode(x) -> z
-      - decode(z) -> x
 
-    And set self.latent_channels to the number of latent channels.
-    """
+def _infer_aekl_latent_channels(model) -> int:
+    for attr in ("latent_channels", "z_channels", "latent_dim"):
+        v = getattr(model, attr, None)
+        if isinstance(v, int):
+            return v
+    try:
+        with torch.no_grad():
+            device = next(model.parameters()).device
+            dummy = torch.zeros(1, 1, 32, 32, 32, device=device)
+            z_mu, _ = model.encode(dummy)
+            return z_mu.shape[1]
+    except Exception:
+        return 4
 
-    latent_channels: int
 
-    @abstractmethod
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode input to latent: (B,1,H,W,D) -> (B,C,H',W',D')."""
-
-    @abstractmethod
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode latent to image: (B,C,H',W',D') -> (B,1,H,W,D)."""
+def _infer_medvae_latent_channels(model) -> int:
+    try:
+        model.eval()
+        with torch.no_grad():
+            device = next(model.parameters()).device
+            dummy = torch.zeros(1, 1, 32, 32, 32, device=device)
+            _z = model.encode(dummy)
+            if isinstance(_z, (tuple, list)):
+                _z = _z[0]
+            return int(_z.shape[1])
+    except Exception:
+        return 1
 
 
 # --------------------------------------------------------------------------- #
@@ -47,16 +76,23 @@ class VAEWrapper(nn.Module, ABC):
 # --------------------------------------------------------------------------- #
 
 
-class AEKLWrapper(VAEWrapper):
-    """Wrapper for MONAI AutoencoderKL.
-
-    encode() returns z_mu (deterministic, no sampling).
-    """
+class AEKLWrapper(MRIxFieldsVAE):
+    """Wrapper for MONAI AutoencoderKL — deterministic mean encoding."""
 
     def __init__(self, model):
         super().__init__()
         self.model = model
         self.latent_channels = _infer_aekl_latent_channels(model)
+        # Infer spatial latent shape via dummy pass
+        self._latent_shape = _infer_latent_shape_spatial(self.encode)
+
+    @property
+    def latent_format(self):
+        return "spatial"
+
+    @property
+    def latent_shape(self) -> Tuple[int, ...]:
+        return self._latent_shape
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         z_mu, _ = self.model.encode(x)
@@ -66,40 +102,31 @@ class AEKLWrapper(VAEWrapper):
         return self.model.decode(z)
 
 
-def _infer_aekl_latent_channels(model) -> int:
-    """Infer latent channels from MONAI AutoencoderKL instance."""
-    for attr in ("latent_channels", "z_channels", "latent_dim"):
-        v = getattr(model, attr, None)
-        if isinstance(v, int):
-            return v
-    # Fallback: forward pass with dummy
-    try:
-        with torch.no_grad():
-            dummy = torch.zeros(1, 1, 32, 32, 32, device=next(model.parameters()).device)
-            z_mu, _ = model.encode(dummy)
-            return z_mu.shape[1]
-    except Exception:
-        return 4
-
-
 # --------------------------------------------------------------------------- #
 # MedVAE (StanfordMIMI)                                                       #
 # --------------------------------------------------------------------------- #
 
 
-class MedVAEWrapper(VAEWrapper):
+class MedVAEWrapper(MRIxFieldsVAE):
     """Wrapper for MedVAE (frozen or fine-tuned).
 
-    Handles both (mean, logvar) tuple output and direct tensor output.
+    encode() returns the mean (first element if tuple).
+    decode() unwraps tuple/list outputs.
     """
 
     def __init__(self, model, latent_ch: Optional[int] = None):
         super().__init__()
         self.model = model
-        if latent_ch is not None:
-            self.latent_channels = latent_ch
-        else:
-            self.latent_channels = _infer_medvae_latent_channels(model)
+        self.latent_channels = latent_ch if latent_ch is not None else _infer_medvae_latent_channels(model)
+        self._latent_shape = _infer_latent_shape_spatial(self.encode)
+
+    @property
+    def latent_format(self):
+        return "spatial"
+
+    @property
+    def latent_shape(self) -> Tuple[int, ...]:
+        return self._latent_shape
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         z = self.model.encode(x)
@@ -114,33 +141,17 @@ class MedVAEWrapper(VAEWrapper):
         return out
 
 
-def _infer_medvae_latent_channels(model) -> int:
-    """Infer latent channels via forward pass dummy."""
-    try:
-        model.eval()
-        with torch.no_grad():
-            dummy = torch.zeros(1, 1, 32, 32, 32)
-            if next(model.parameters()).is_cuda:
-                dummy = dummy.cuda()
-            _z = model.encode(dummy)
-            if isinstance(_z, (tuple, list)):
-                _z = _z[0]
-            return int(_z.shape[1])
-    except Exception:
-        return 1
-
-
 # --------------------------------------------------------------------------- #
-# VQ-VAE (NeuroQuant)                                                         #
+# VQ-VAE (NeuroQuantHybrid)                                                   #
 # --------------------------------------------------------------------------- #
 
 
-class VQVAEWrapper(VAEWrapper):
-    """Wrapper for NeuroQuantHybrid / VQ-VAE.
+class VQVAEWrapper(MRIxFieldsVAE):
+    """Wrapper for NeuroQuantHybrid VQ-VAE.
 
     The CFM operates on the quantized anatomical latent z_q.
     encode() returns z_q and caches z_mod for decode().
-    decode() uses cached z_mod or zeros if not available.
+    decode() uses cached z_mod or zeros if unavailable.
     """
 
     def __init__(self, model):
@@ -150,10 +161,24 @@ class VQVAEWrapper(VAEWrapper):
         self.latent_channels = getattr(
             getattr(model, "quantizer", None), "embedding_dim", 64
         )
+        self._latent_shape = _infer_latent_shape_spatial(self.encode)
+
+    @property
+    def latent_format(self):
+        return "spatial"
+
+    @property
+    def latent_shape(self) -> Tuple[int, ...]:
+        return self._latent_shape
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         z_anat, z_mod = self.model.encoder(x)
-        z_q, _, _ = self.model.quantizer(z_anat)
+        # Note: NeuroQuant quantizer may return (z_q, vq_loss, indices, perplexity)
+        q_out = self.model.quantizer(z_anat)
+        if isinstance(q_out, tuple):
+            z_q = q_out[0]
+        else:
+            z_q = q_out
         self._cached_z_mod = z_mod.detach()
         return z_q
 
@@ -171,7 +196,15 @@ class VQVAEWrapper(VAEWrapper):
             z_mod = z_mod.to(device)
         mod_idx = torch.zeros(b, dtype=torch.long, device=device)
         field_idx = torch.zeros(b, dtype=torch.long, device=device)
-        return self.model.decoder(z_q, z_mod, mod_idx, field_idx)
+        # NeuroQuant decoder signature may vary; try common variants
+        try:
+            return self.model.decoder(z_q, z_mod, mod_idx, field_idx)
+        except TypeError:
+            try:
+                return self.model.decoder(z_q, z_mod)
+            except TypeError:
+                # VQVAECompatWrapper style
+                return self.model.decoder(z_q)
 
 
 # --------------------------------------------------------------------------- #
@@ -179,10 +212,10 @@ class VQVAEWrapper(VAEWrapper):
 # --------------------------------------------------------------------------- #
 
 
-class MedVAEDisentangleWrapper(VAEWrapper):
+class MedVAEDisentangleWrapper(MRIxFieldsVAE):
     """Wrapper for MedVAEDisentanglerV1.
 
-    encode() returns the fused latent z_hat decodable by MedVAE.
+    encode() returns the fused latent z_hat decodable by MedVAE (spatial).
     decode() calls MedVAE decode directly.
     """
 
@@ -190,10 +223,18 @@ class MedVAEDisentangleWrapper(VAEWrapper):
         super().__init__()
         self.model = model
         self.latent_channels = model.latent_channels
+        self._latent_shape = _infer_latent_shape_spatial(self.encode)
+
+    @property
+    def latent_format(self):
+        return "spatial"
+
+    @property
+    def latent_shape(self) -> Tuple[int, ...]:
+        return self._latent_shape
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         _, z_a, z_m = self.model.encode_parts(x)
-        # Default modality = 0; caller should override via model-specific logic
         mod_idx = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
         z_hat = self.model.fuse_to_latent(z_a, z_m, mod_idx)
         return z_hat
@@ -202,8 +243,6 @@ class MedVAEDisentangleWrapper(VAEWrapper):
         out = self.model.medvae.decode(z)
         if isinstance(out, (tuple, list)):
             out = out[0]
-        # Resize if needed
-        out_shape = tuple(z.shape[2:])
-        if out.shape[2:] != out_shape:
-            out = F.interpolate(out, size=out_shape, mode="trilinear", align_corners=False)
+        if out.shape[2:] != z.shape[2:]:
+            out = F.interpolate(out, size=z.shape[2:], mode="trilinear", align_corners=False)
         return out

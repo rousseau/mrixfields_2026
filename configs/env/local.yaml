@@ -1,17 +1,18 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Environnement LOCAL (machine rousseau)
+# Environnement LOCAL (DGX GB10 Lenovo ThinkStation — 128 GB VRAM)
 #
 # Utilisation :
-#   python src/cfm/train_cfm_3d.py --config configs/cfm3d_T1W_aekl.yaml --env local
+#   python src/vae3d/train_vae_3d.py --config configs/vae3d_multimodal.yaml --env local
+#   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Données brutes MRIxFields 2026 (NIfTI)
 data_root: /home/rousseau/Data/MRIxFields_20260414
 
-# Racine des sorties (préprocessing, runs, prédictions)
+# Racine des sorties (checkpoints, prédictions)
 output_root: /home/rousseau/Exp/mrixfields_2026/outputs
 
-# Racine du projet (scripts, configs, results/)
+# Racine du projet
 project_root: /home/rousseau/Exp/mrixfields_2026
 
 # Exécutable Python (avec CUDA)

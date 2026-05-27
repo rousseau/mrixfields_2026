@@ -217,7 +217,7 @@ torchrun \
     --master_port=29500 \
     "$SCRIPT" \
     --config "$CONFIG" \
-    --env jeanzay \
+    --env remote \
     $RESUME_FLAG
 
 echo "======================================================================="

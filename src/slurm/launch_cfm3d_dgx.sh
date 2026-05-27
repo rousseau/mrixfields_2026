@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# launch_cfm3d_dgx.sh — Lancement local multi-GPU (DGX Station, debug)
+# launch_cfm3d_dgx.sh — Lancement local DGX GB10 (single-GPU or multi-GPU)
 #
 # Usage :
 #   bash src/launch_cfm3d_dgx.sh <PHASE> <MODALITY> [N_GPUS] [CONFIG_OVERRIDE]
@@ -14,10 +14,8 @@
 # Exemples :
 #   bash src/launch_cfm3d_dgx.sh vae T1W          # auto-détection GPUs
 #   bash src/launch_cfm3d_dgx.sh vae T1W 1        # single-GPU, débug rapide
-#   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4                                            # medvae finetuned (défaut)
-#   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4 configs/cfm3d_T1W_medvae_0p1T_7T.yaml     # bidomaine 0.1T↔7T
-#   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4 configs/cfm3d_T1W_medvae_finetuned.yaml   # 5 domaines (défaut)
-#   bash src/slurm/launch_cfm3d_dgx.sh mmfm T1W 4 configs/mmfm3d_medvae_multimodal.yaml     # MMFM v1 vectorisé
+#   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4  # multi-GPU sur DGX GB10
+#   bash src/slurm/launch_cfm3d_dgx.sh mmfm T1W 4 configs/mmfm3d_medvae_multimodal.yaml
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -31,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-ENV_FILE="configs/env/dgx.yaml"
+ENV_FILE="configs/env/local.yaml"
 PYTHON=$(python3 -c "
 import yaml
 with open('$ENV_FILE') as f: e = yaml.safe_load(f)
@@ -40,7 +38,7 @@ print(e.get('python', 'python3'))
 
 # ── Config selon la phase ────────────────────────────────────────────────────
 if [[ "$PHASE" == "vae" ]]; then
-    CONFIG="${CONFIG_OVERRIDE:-configs/vae3d_T1W.yaml}"
+    CONFIG="${CONFIG_OVERRIDE:-configs/vae3d_multimodal.yaml}"
     SCRIPT="src/vae3d/train_vae_3d.py"
 elif [[ "$PHASE" == "cfm" ]]; then
     CONFIG="${CONFIG_OVERRIDE:-configs/cfm3d_T1W_medvae_finetuned.yaml}"
@@ -69,7 +67,7 @@ fi
 # ── Résolution du dernier checkpoint (resume automatique) ───────────────────
 OUTPUT_ROOT=$($PYTHON -c "
 import yaml
-with open('configs/env/dgx.yaml') as f: e = yaml.safe_load(f)
+with open('configs/env/local.yaml') as f: e = yaml.safe_load(f)
 with open('$CONFIG') as f: c = yaml.safe_load(f)
 subdir = c.get('data', {}).get('output_subdir', '')
 print(e['output_root'] + '/' + subdir)
@@ -101,12 +99,12 @@ if [[ "$N_GPUS" -gt 1 ]]; then
         --master_port=$(( RANDOM % 10000 + 29500 )) \
         "$SCRIPT" \
         --config "$CONFIG" \
-        --env dgx \
+        --env local \
         $RESUME_ARG
 else
     echo "  $PYTHON $SCRIPT (single-GPU)"
     $PYTHON "$SCRIPT" \
         --config "$CONFIG" \
-        --env dgx \
+        --env local \
         $RESUME_ARG
 fi

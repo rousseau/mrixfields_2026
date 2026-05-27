@@ -46,7 +46,7 @@ def load_env(env_arg: Optional[str]) -> Optional[dict]:
     Supports:
       - Absolute path
       - Relative path (tried from CWD and project root)
-      - Named env (local, jeanzay, dgx -> configs/env/{name}.yaml)
+      - Named env (local, remote -> configs/env/{name}.yaml)
 
     Args:
         env_arg: Path, name, or None.

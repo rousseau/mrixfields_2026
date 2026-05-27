@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Environnement JEAN ZAY (IDRIS — H100 SXM5)
+# Environnement REMOTE (HPC Jean Zay — 4×H100 SXM5 80 GB)
 #
 # $WORK = /lustre/fswork/projects/rech/crp/<LOGIN>
 #
@@ -9,13 +9,14 @@
 #   challenge/         ← code officiel du challenge (git clone, pour pip install)
 #
 # Utilisation dans le job SLURM :
-#   python src/cfm/train_cfm_3d.py --config configs/cfm3d_T1W_aekl.yaml --env jeanzay
+#   python src/vae3d/train_vae_3d.py --config configs/vae3d_multimodal.yaml --env remote
+#   sbatch src/slurm/train_vae_jeanzay.slurm aekl vae3d_multimodal
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Données brutes MRIxFields 2026 (NIfTI)
 data_root: $WORK/MRIX/data
 
-# Racine des sorties (préprocessing, runs, prédictions)
+# Racine des sorties (checkpoints, prédictions)
 output_root: $WORK/MRIX/mrixfields_2026/outputs
 
 # Racine du projet

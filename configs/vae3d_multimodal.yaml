@@ -1,0 +1,59 @@
+method: vae3d
+# Multi-modal AEKL: trained jointly on T1W + T2W + T2FLAIR,
+# all fields (0.1T, 1.5T, 3T, 5T, 7T), shared latent space.
+task_name: vae3d_multimodal
+
+model:
+  spatial_dims: 3
+  in_channels: 1
+  out_channels: 1
+  latent_channels: 4
+  channels: [64, 128, 256]
+  num_res_blocks: 2
+  norm_num_groups: 32
+  attention_levels: [false, false, false]
+  with_encoder_nonlocal_attn: false
+  with_decoder_nonlocal_attn: false
+  use_flash_attention: false
+  kl_weight: 1.0e-7
+
+data:
+  # Multi-modal: all contrasts
+  modalities:
+    - T1W
+    - T2W
+    - T2FLAIR
+  # All field strengths
+  fields:
+    - 0.1T
+    - 1.5T
+    - 3T
+    - 5T
+    - 7T
+  splits:
+    - retro_train
+  # Patch size: 128³ is the standard for all VAEs in this project
+  patch_size: [128, 128, 128]
+  target_spacing: [1.0, 1.0, 1.0]
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  # Output directory relative to output_root in env/{local,jeanzay}.yaml
+  output_subdir: vae3d/runs/vae3d_multimodal
+
+train:
+  batch_size: 1
+  num_workers: 4
+  total_epochs: 200
+  lr: 1.0e-4
+  kl_warmup_epochs: 10
+  save_every_epochs: 10
+  print_every: 100
+  use_amp: true
+  grad_clip: 1.0
+  perceptual_weight: 0.0
+  adv_weight: 0.0
+
+  # Multi-GPU (DDP via torchrun)
+  dist_backend: nccl
+  # For resuming from checkpoint
+  resume: null

@@ -1,73 +1,73 @@
 #!/bin/bash
-# Unified SLURM launcher for VAE training on Jean Zay.
+# ─────────────────────────────────────────────────────────────────────────────
+# Script SLURM — Entraînement VAE 3D sur Jean Zay (H100 SXM5 80GB)
 #
-# Usage:
+# Partition gpu_p6 : H100 SXM5 80GB, 1 GPU/nœud (suffisant pour VAE)
+# QOS : qos_gpu_h100-t4 (100h max)
+#
+# Usage :
+#   sbatch src/slurm/train_vae_jeanzay.slurm <VAE_TYPE> [CONFIG] [RUN_NAME]
+#
+# Arguments :
+#   VAE_TYPE  : aekl | medvae | vqvae   (obligatoire)
+#   CONFIG    : chemin config YAML       (défaut : configs/vae3d_multimodal.yaml)
+#   RUN_NAME  : sous-répertoire de sortie (défaut : {VAE_TYPE}_multimodal_remote)
+#
+# Exemples :
 #   sbatch src/slurm/train_vae_jeanzay.slurm aekl
-#   sbatch src/slurm/train_vae_jeanzay.slurm vqvae my_vq_run "T1W T2W T2FLAIR" "0.1T 1.5T 3T 5T 7T"
-#   sbatch src/slurm/train_vae_jeanzay.slurm medvae my_med_run
+#   sbatch src/slurm/train_vae_jeanzay.slurm aekl configs/vae3d_multimodal.yaml
+#   sbatch src/slurm/train_vae_jeanzay.slurm medvae configs/vae3d_multimodal.yaml medvae_multimodal_v1
 #
-# Positional args:
-#   $1: VAE_TYPE   -> aekl | vqvae | medvae
-#   $2: RUN_NAME   -> optional (default: <vae>_jeanzay)
-#   $3: MODALITIES -> optional, quoted list, only for vqvae
-#   $4: FIELDS     -> optional, quoted list, only for vqvae
+# Tuning via variables d'environnement :
+#   STEPS=30000 BATCH_SIZE=2 LR=1e-4 sbatch src/slurm/train_vae_jeanzay.slurm aekl
 #
-# Common tunables via env at submit time:
-#   --export=ALL,STEPS=20000,BATCH_SIZE=2,LR=1e-4,TIME_LIMIT=48:00:00
+# Prérequis (via setup_jeanzay.sh) :
+#   $WORK/MRIX/mrixfields_2026/   ← ce repo
+#   $WORK/MRIX/data/              ← données NIfTI
+# ─────────────────────────────────────────────────────────────────────────────
 
-#SBATCH --job-name=vae_train
+#SBATCH --job-name=vae3d
 #SBATCH -A crp@h100
 #SBATCH -C h100
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --partition=gpu_p6
 #SBATCH --qos=qos_gpu_h100-t4
 #SBATCH --time=48:00:00
-#SBATCH --output=logs/vae_%x_%j.out
-#SBATCH --error=logs/vae_%x_%j.err
+#SBATCH --output=logs/vae3d_%x_%j.out
+#SBATCH --error=logs/vae3d_%x_%j.err
 
 set -euo pipefail
 
 VAE_TYPE="${1:-}"
-RUN_NAME="${2:-${VAE_TYPE}_jeanzay}"
-MODALITIES="${3:-T1W T2W T2FLAIR}"
-FIELDS="${4:-0.1T 1.5T 3T 5T 7T}"
-
-if [[ -z "$VAE_TYPE" ]]; then
-  echo "[ERREUR] VAE_TYPE manquant. Valeurs: aekl | vqvae | medvae"
-  exit 1
-fi
-
-case "$VAE_TYPE" in
-  aekl|vqvae|medvae) ;;
-  *)
-    echo "[ERREUR] VAE_TYPE invalide: $VAE_TYPE"
-    echo "Valeurs acceptées: aekl | vqvae | medvae"
-    exit 1
-    ;;
-esac
-
-CODE_DIR="$WORK/MRIX/mrixfields_2026"
-DATA_ROOT="${DATA_ROOT:-$WORK/MRIX/data}"
-OUT_ROOT="${OUT_ROOT:-$WORK/MRIX/outputs}"
+CONFIG="${2:-configs/vae3d_multimodal.yaml}"
+RUN_NAME="${3:-${VAE_TYPE}_multimodal_remote}"
 
 STEPS="${STEPS:-20000}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 LR="${LR:-1e-4}"
 
-DEFAULT_BATCH_SIZE=2
-DEFAULT_STEPS=20000
-if [[ "$VAE_TYPE" == "vqvae" ]]; then
-  DEFAULT_BATCH_SIZE=1
-  DEFAULT_STEPS=10000  # Conservative default for VQ-VAE due to memory accumulation
+# ── Validation ───────────────────────────────────────────────────────────────
+if [[ -z "$VAE_TYPE" ]]; then
+    echo "[ERREUR] VAE_TYPE manquant. Valeurs : aekl | medvae | vqvae"
+    exit 1
 fi
-BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_BATCH_SIZE}"
-STEPS="${STEPS:-$DEFAULT_STEPS}"
+case "$VAE_TYPE" in
+    aekl|medvae|vqvae) ;;
+    *)
+        echo "[ERREUR] VAE_TYPE invalide : $VAE_TYPE  (aekl | medvae | vqvae)"
+        exit 1
+        ;;
+esac
 
+# ── Chemins ──────────────────────────────────────────────────────────────────
+CODE_DIR="$WORK/MRIX/mrixfields_2026"
 mkdir -p "$CODE_DIR/logs"
-mkdir -p "$OUT_ROOT"
+cd "$CODE_DIR"
 
+# ── Modules ──────────────────────────────────────────────────────────────────
 module purge
 module load arch/h100
 module load pytorch-gpu/py3/2.5.0
@@ -75,77 +75,49 @@ module load pytorch-gpu/py3/2.5.0
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 export TORCH_HOME="$WORK/.cache/torch"
-# Avoid CUDA memory fragmentation on long-running training
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export PYTHONPATH="$CODE_DIR/src"
 
+# ── Dépendances optionnelles ─────────────────────────────────────────────────
 _install_if_missing() {
-  python3 -c "import $1" >/dev/null 2>&1 || pip install --user --quiet "$2"
+    python3 -c "import $1" >/dev/null 2>&1 || pip install --user --quiet "$2"
 }
-
-_require_module() {
-  python3 -c "import $1" >/dev/null 2>&1 || {
-    echo "[ERREUR] Module Python manquant: $1"
-    echo "Installez-le sur login node puis relancez:"
-    echo "  module purge && module load arch/h100 && module load pytorch-gpu/py3/2.5.0"
-    echo "  export PYTHONUSERBASE=$WORK/.local && export PATH=$WORK/.local/bin:$PATH"
-    echo "  pip install --user $1"
-    exit 1
-  }
-}
-
 _install_if_missing nibabel nibabel
 _install_if_missing scipy scipy
 _install_if_missing einops einops
 
 if [[ "$VAE_TYPE" == "medvae" ]]; then
-  # Compute nodes may not have external network access; require preinstalled package.
-  _require_module medvae
+    python3 -c "import medvae" >/dev/null 2>&1 || {
+        echo "[ERREUR] Package 'medvae' introuvable."
+        echo "Installez-le sur le nœud de connexion :"
+        echo "  pip install --user git+https://github.com/StanfordMIMI/MedVAE.git"
+        exit 1
+    }
 fi
 
-if [[ ! -d "$DATA_ROOT" ]]; then
-  echo "[ERREUR] DATA_ROOT introuvable: $DATA_ROOT"
-  exit 1
-fi
-
-cd "$CODE_DIR"
-
+# ── Résumé ───────────────────────────────────────────────────────────────────
 echo "======================================================================="
 echo " Job ID    : ${SLURM_JOB_ID:-N/A}"
+echo " Nœud      : ${SLURM_JOB_NODELIST:-N/A}"
 echo " VAE type  : $VAE_TYPE"
+echo " Config    : $CONFIG"
 echo " Run name  : $RUN_NAME"
-echo " Data root : $DATA_ROOT"
-echo " Output    : $OUT_ROOT"
+echo " Env       : remote (configs/env/remote.yaml)"
 echo " Steps     : $STEPS"
 echo " Batch     : $BATCH_SIZE"
 echo " LR        : $LR"
 echo "======================================================================="
 
-if [[ "$VAE_TYPE" == "vqvae" ]]; then
-  OUTPUT_DIR="$OUT_ROOT/vqvae3d/runs/$RUN_NAME"
-  python3 src/train_vqvae.py \
-    --data-root "$DATA_ROOT" \
-    --splits retro_train \
-    --modalities $MODALITIES \
-    --fields $FIELDS \
-    --batch-size "$BATCH_SIZE" \
-    --num-workers 8 \
+# ── Lancement ────────────────────────────────────────────────────────────────
+python3 src/vae3d/train_vae_3d.py \
+    --config "$CONFIG" \
+    --env remote \
+    --run-name "$RUN_NAME" \
+    --vae-type "$VAE_TYPE" \
     --steps "$STEPS" \
-    --lr "$LR" \
-    --use-amp \
-    --output-dir "$OUTPUT_DIR"
-else
-  OUTPUT_DIR="$OUT_ROOT/train_${VAE_TYPE}/$RUN_NAME"
-  python3 src/train_vae.py \
-    --vae "$VAE_TYPE" \
-    --data-root "$DATA_ROOT" \
     --batch-size "$BATCH_SIZE" \
-    --steps "$STEPS" \
-    --lr "$LR" \
-    --device cuda \
-    --output-dir "$OUTPUT_DIR" \
-    --use-amp
-fi
+    --lr "$LR"
 
 echo "======================================================================="
-echo " Training terminé pour $VAE_TYPE"
+echo " Entraînement terminé : $VAE_TYPE / $RUN_NAME"
 echo "======================================================================="
