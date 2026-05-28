@@ -31,3 +31,12 @@ MedVAE fine-tuné (recon),T1W,5T,5T,,0.8258,,,,medvae_finetune_all/weights/model
 MedVAE fine-tuné (recon),T1W,7T,7T,,0.8386,,,,medvae_finetune_all/weights/model_final.pth,MAE=0.1578 MSE=0.1498 t=129.7s/vol 6.9GB
 MedVAE fine-tuné (recon),T2W,3T,3T,,0.8281,,,,medvae_finetune_all/weights/model_final.pth,MAE=0.1635 MSE=0.1509 t=128.6s/vol 6.9GB
 MedVAE fine-tuné (recon),T2FLAIR,3T,3T,,0.8392,,,,medvae_finetune_all/weights/model_final.pth,MAE=0.1584 MSE=0.1498 t=119.3s/vol 6.9GB
+# --- MMFM-UNet 5k iters vs MMFM-MLP 30k iters — 2026-05-28 — sujet P_T1W_0.1T_0006 --- pred resampled to GT space ---
+MMFM-UNet 3D (5k iters),T1W,0.1T,1.5T,0.8580,0.1029,,,,mmfm3d_unet_medvae_multimodal/weights/checkpoint_5000.pth,MedVAE fine-tuné latent spatial — 178M params — MONAI DiffusionModelUNet
+MMFM-UNet 3D (5k iters),T1W,0.1T,3T,0.8102,0.0893,,,,mmfm3d_unet_medvae_multimodal/weights/checkpoint_5000.pth,MedVAE fine-tuné latent spatial — 178M params — MONAI DiffusionModelUNet
+MMFM-UNet 3D (5k iters),T1W,0.1T,5T,0.8669,0.0439,,,,mmfm3d_unet_medvae_multimodal/weights/checkpoint_5000.pth,MedVAE fine-tuné latent spatial — 178M params — MONAI DiffusionModelUNet
+MMFM-UNet 3D (5k iters),T1W,0.1T,7T,0.8507,0.0397,,,,mmfm3d_unet_medvae_multimodal/weights/checkpoint_5000.pth,MedVAE fine-tuné latent spatial — 178M params — MONAI DiffusionModelUNet
+MMFM-MLP (30k iters),T1W,0.1T,1.5T,0.8682,0.1370,,,,mmfm3d_medvae_multimodal_vectorized_v1/weights/model_final.pth,MedVAE fine-tuné latent vectorisé flat_dim=20480
+MMFM-MLP (30k iters),T1W,0.1T,3T,0.8717,0.1274,,,,mmfm3d_medvae_multimodal_vectorized_v1/weights/model_final.pth,MedVAE fine-tuné latent vectorisé flat_dim=20480
+MMFM-MLP (30k iters),T1W,0.1T,5T,0.8650,0.1252,,,,mmfm3d_medvae_multimodal_vectorized_v1/weights/model_final.pth,MedVAE fine-tuné latent vectorisé flat_dim=20480
+MMFM-MLP (30k iters),T1W,0.1T,7T,0.8743,0.1283,,,,mmfm3d_medvae_multimodal_vectorized_v1/weights/model_final.pth,MedVAE fine-tuné latent vectorisé flat_dim=20480

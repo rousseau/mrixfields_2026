@@ -113,6 +113,46 @@ def _make_infinite(loader: DataLoader):
 
 
 # ===========================================================================
+# Compatibilité MONAI : remapping des clés d'attention
+# ===========================================================================
+
+
+def _remap_monai_attention_keys(state_dict: dict) -> dict:
+    """Remappe les clés d'attention de l'ancienne API MONAI (≤1.3) vers la nouvelle (≥1.4).
+
+    Ancienne (Jean Zay pytorch-gpu/py3/2.5.0) :
+        <prefix>.to_q / to_k / to_v / proj_attn
+    Nouvelle (MONAI ≥1.4, local) :
+        <prefix>.attn.to_q / attn.to_k / attn.to_v / attn.out_proj
+    """
+    import re
+    new_sd = {}
+    # Pattern : tout ce qui se termine par .to_q, .to_k, .to_v, .proj_attn
+    _remap = {
+        r"(\.attentions\.\d+)\.to_q\.(weight|bias)$":    r"\1.attn.to_q.\2",
+        r"(\.attentions\.\d+)\.to_k\.(weight|bias)$":    r"\1.attn.to_k.\2",
+        r"(\.attentions\.\d+)\.to_v\.(weight|bias)$":    r"\1.attn.to_v.\2",
+        r"(\.attentions\.\d+)\.proj_attn\.(weight|bias)$": r"\1.attn.out_proj.\2",
+        r"(\.attention)\.to_q\.(weight|bias)$":           r"\1.attn.to_q.\2",
+        r"(\.attention)\.to_k\.(weight|bias)$":           r"\1.attn.to_k.\2",
+        r"(\.attention)\.to_v\.(weight|bias)$":           r"\1.attn.to_v.\2",
+        r"(\.attention)\.proj_attn\.(weight|bias)$":      r"\1.attn.out_proj.\2",
+    }
+    for k, v in state_dict.items():
+        new_k = k
+        for pat, repl in _remap.items():
+            new_k2 = re.sub(pat, repl, new_k)
+            if new_k2 != new_k:
+                new_k = new_k2
+                break
+        new_sd[new_k] = v
+    n_remapped = sum(1 for k, nk in zip(state_dict, new_sd) if k != nk)
+    if n_remapped:
+        print(f"  [remap_monai_attn] {n_remapped} clés reméppées (ancienne API → MONAI ≥1.4)")
+    return new_sd
+
+
+# ===========================================================================
 # Build UNet 3D multimodal
 # ===========================================================================
 
@@ -320,7 +360,7 @@ def train(
     resume_path = cfg.get("resume")
     if resume_path and Path(resume_path).exists():
         state = torch.load(resume_path, map_location=device, weights_only=False)
-        raw_unet.load_state_dict(state["model"])
+        raw_unet.load_state_dict(_remap_monai_attention_keys(state["model"]))
         optimizer.load_state_dict(state["optimizer"])
         if "ema" in state:
             ema.load_state_dict(state["ema"])
@@ -621,12 +661,12 @@ def infer(
         ema_state = ckpt["ema"]
         shadow = ema_state.get("shadow_params", None)
         if shadow is not None:
-            unet.load_state_dict(shadow)
+            unet.load_state_dict(_remap_monai_attention_keys(shadow))
             loaded_from = "ema.shadow_params"
         else:
-            unet.load_state_dict(ckpt["model"])
+            unet.load_state_dict(_remap_monai_attention_keys(ckpt["model"]))
     else:
-        unet.load_state_dict(ckpt["model"])
+        unet.load_state_dict(_remap_monai_attention_keys(ckpt["model"]))
 
     unet.eval()
     trained_at = ckpt.get("iter", "?")
