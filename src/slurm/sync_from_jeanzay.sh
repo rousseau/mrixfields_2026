@@ -10,40 +10,62 @@
 #
 # Usage :
 #   bash src/slurm/sync_from_jeanzay.sh [FILTRE]
+#   bash src/slurm/sync_from_jeanzay.sh --all
 #
-#   FILTRE : optionnel, sous-chaîne du nom de run (ex: "mmfm", "cfm3d")
+#   FILTRE : sous-chaîne du nom de run (ex: "mmfm_unet", "cfm3d")
+#   --all  : sync tous les runs sans demander de confirmation
 #
 # Exemples :
-#   bash src/slurm/sync_from_jeanzay.sh              # tous les runs
 #   bash src/slurm/sync_from_jeanzay.sh mmfm_unet    # seulement mmfm_unet
 #   bash src/slurm/sync_from_jeanzay.sh cfm3d        # tous les cfm3d
+#   bash src/slurm/sync_from_jeanzay.sh --all        # tout syncer sans confirmation
 #
-# Configuration du proxy (identifiants Jean Zay) :
+# Configuration requise :
 #   Copier src/slurm/sync_from_jeanzay.sh.env.example → .sync_env
-#   et y renseigner JEANZAY_USER, PROXY_USER, PROXY_HOST
+#   et y renseigner JEANZAY_USER, PROXY_USER, PROXY_HOST, REMOTE_BASE
+#   Ce fichier est ignoré par git.
 # =============================================================================
 set -euo pipefail
 
 FILTER="${1:-}"
+FORCE_ALL=0
+if [[ "$FILTER" == "--all" ]]; then
+    FORCE_ALL=1
+    FILTER=""
+fi
 
 # ── Résolution des chemins ───────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-# ── Configuration de connexion ───────────────────────────────────────────────
-# Priorité : fichier .sync_env local > variables d'environnement > valeurs par défaut
+# ── Configuration de connexion (requiert .sync_env) ──────────────────────────
 ENV_FILE="$PROJECT_ROOT/.sync_env"
 if [[ -f "$ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
 fi
 
-JEANZAY_USER="${JEANZAY_USER:-ulq73oz}"
-JEANZAY_HOST="${JEANZAY_HOST:-jean-zay.idris.fr}"
-PROXY_USER="${PROXY_USER:-froussea}"
-PROXY_HOST="${PROXY_HOST:-ssh.telecom-bretagne.eu}"
-REMOTE_BASE="${REMOTE_BASE:-/lustre/fswork/projects/rech/crp/${JEANZAY_USER}/MRIX/mrixfields_2026}"
+# Vérification que les variables obligatoires sont définies
+_check_var() {
+    local var_name="$1"
+    if [[ -z "${!var_name:-}" ]]; then
+        echo "[ERREUR] Variable '$var_name' non définie."
+        echo ""
+        echo "Créer le fichier .sync_env à la racine du projet :"
+        echo "  cp src/slurm/sync_from_jeanzay.sh.env.example .sync_env"
+        echo "  # Puis éditer .sync_env avec vos identifiants"
+        echo ""
+        echo "Ce fichier est ignoré par git (.gitignore)."
+        exit 1
+    fi
+}
+
+_check_var JEANZAY_USER
+_check_var JEANZAY_HOST
+_check_var PROXY_USER
+_check_var PROXY_HOST
+_check_var REMOTE_BASE
 
 SCP_OPTS="-o ProxyCommand=\"ssh ${PROXY_USER}@${PROXY_HOST} nc %h %p\" -o StrictHostKeyChecking=no -o ConnectTimeout=15"
 REMOTE="${JEANZAY_USER}@${JEANZAY_HOST}"
@@ -61,9 +83,9 @@ for path in sorted(glob.glob(f"{configs_dir}/*.yaml")):
         if not isinstance(cfg, dict):
             continue
         subdir = cfg.get("data", {}).get("output_subdir", "")
-        if subdir:
+        if subdir and "{{" not in subdir:  # ignorer les templates non résolus
             subdirs.add(subdir)
-    except Exception as e:
+    except Exception:
         pass  # ignorer les configs malformées
 
 for s in sorted(subdirs):
@@ -81,8 +103,9 @@ if [[ -n "$FILTER" ]]; then
     mapfile -t SUBDIRS < <(printf '%s\n' "${ALL_SUBDIRS[@]}" | grep -i "$FILTER" || true)
     if [[ ${#SUBDIRS[@]} -eq 0 ]]; then
         echo "[ERREUR] Aucun run ne correspond au filtre '$FILTER'"
-        echo "Runs disponibles :"
-        printf '  %s\n' "${ALL_SUBDIRS[@]}"
+        echo ""
+        echo "Runs disponibles (${#ALL_SUBDIRS[@]}) — noms utilisables comme filtre :"
+        for _s in "${ALL_SUBDIRS[@]}"; do printf '  %-45s  (%s)\n' "$(basename "$_s")" "$_s"; done
         exit 1
     fi
 else
@@ -103,9 +126,24 @@ printf '    - %s\n' "${SUBDIRS[@]}"
 echo "======================================================================="
 echo ""
 
+# ── Confirmation si aucun filtre et pas de --all ─────────────────────────────
+if [[ -z "$FILTER" && $FORCE_ALL -eq 0 ]]; then
+    echo "[ATTENTION] Aucun filtre spécifié — ${#SUBDIRS[@]} runs seront tentés."
+    echo "Cela peut prendre plusieurs minutes (une tentative SSH par run)."
+    echo ""
+    read -r -p "Continuer ? [o/N] " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[oOyY]$ ]]; then
+        echo "Annulé."
+        echo ""
+        echo "Conseil : utiliser un filtre pour cibler un run spécifique :"
+        echo "  bash src/slurm/sync_from_jeanzay.sh mmfm_unet"
+        exit 0
+    fi
+    echo ""
+fi
+
 # ── Fonction scp avec gestion d'erreur silencieuse ──────────────────────────
 _scp() {
-    # _scp <remote_path> <local_dest>
     local remote_path="$1"
     local local_dest="$2"
     eval scp -rp $SCP_OPTS \
@@ -124,7 +162,6 @@ for SUBDIR in "${SUBDIRS[@]}"; do
 
     echo "── $RUN_NAME"
 
-    # Créer répertoire local
     mkdir -p "$LOCAL_DIR/weights"
 
     # 1. Checkpoints
@@ -138,9 +175,9 @@ for SUBDIR in "${SUBDIRS[@]}"; do
         N_FAIL=$((N_FAIL + 1))
     fi
 
-    # 2. train_metrics.jsonl (léger — toujours copier)
+    # 2. train_metrics.jsonl
     echo -n "   metrics    ... "
-    if _scp "${REMOTE_DIR}/train_metrics.jsonl" "${LOCAL_DIR}/train_metrics.jsonl" 2>/dev/null; then
+    if _scp "${REMOTE_DIR}/train_metrics.jsonl" "${LOCAL_DIR}/train_metrics.jsonl"; then
         NLINES=$(wc -l < "$LOCAL_DIR/train_metrics.jsonl" 2>/dev/null || echo "0")
         echo "OK  ($NLINES entrées)"
     else
