@@ -314,7 +314,21 @@ def train(
     raw_unet = unet.module if is_distributed else unet
 
     for step in range(start_iter, total_iters):
-        src_domain, tgt_domain = random.sample(available_domains, 2)
+        # Synchroniser le choix src/tgt entre tous les ranks DDP pour garantir
+        # que chaque GPU travaille sur la même paire de domaines au même step.
+        if is_distributed:
+            if dist.get_rank() == 0:
+                pair = torch.tensor(
+                    random.sample(range(len(available_domains)), 2),
+                    dtype=torch.long, device=device,
+                )
+            else:
+                pair = torch.zeros(2, dtype=torch.long, device=device)
+            dist.broadcast(pair, src=0)
+            src_domain = available_domains[pair[0].item()]
+            tgt_domain = available_domains[pair[1].item()]
+        else:
+            src_domain, tgt_domain = random.sample(available_domains, 2)
         tgt_idx = DOMAIN_TO_IDX[tgt_domain]
 
         src_vol, _ = next(domain_loaders[src_domain])

@@ -145,7 +145,7 @@ if [ "$PHASE" = "vae" ]; then
     if [ -n "$CONFIG_ARG" ]; then
         CONFIG="$CONFIG_ARG"
     else
-        CONFIG="configs/vae3d_T1W.yaml"
+        CONFIG="configs/vae3d_multimodal.yaml"
     fi
 elif [ "$PHASE" = "cfm" ]; then
     SCRIPT="src/cfm/train_cfm_3d.py"
@@ -211,12 +211,14 @@ echo "======================================================================="
 echo " Démarrage torchrun (4 GPUs H100)"
 echo "======================================================================="
 
+MASTER_PORT=$(( 29500 + SLURM_JOB_ID % 1000 ))
+
 torchrun \
     --nproc_per_node=4 \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=localhost \
-    --master_port=29500 \
+    --master_port="$MASTER_PORT" \
     "$SCRIPT" \
     --config "$CONFIG" \
     --env remote \

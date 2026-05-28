@@ -31,8 +31,8 @@
 #SBATCH -C h100
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
-#SBATCH --ntasks=4
-#SBATCH --cpus-per-task=8
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
 #SBATCH --partition=gpu_p6
 #SBATCH --qos=qos_gpu_h100-t4
 #SBATCH --time=48:00:00
@@ -132,6 +132,9 @@ echo " LR        : $LR"
 echo "======================================================================="
 
 # ── Lancement ────────────────────────────────────────────────────────────────
+# Port dynamique pour éviter les collisions si deux jobs tournent sur le même nœud
+MASTER_PORT=$(( 29500 + SLURM_JOB_ID % 1000 ))
+
 # Routing vers le script d'entraînement selon le type de VAE
 if [[ "$VAE_TYPE" == "pythae_vae" ]]; then
     TRAIN_SCRIPT="src/vae3d/train_pythae_vae.py"
@@ -140,7 +143,17 @@ elif [[ "$VAE_TYPE" == "pythae_vqvae" ]]; then
 elif [[ "$VAE_TYPE" == "pythae_rhvae" ]]; then
     TRAIN_SCRIPT="src/vae3d/train_pythae_rhvae.py"
 elif [[ "$VAE_TYPE" == "medvae_finetune" ]]; then
-    TRAIN_SCRIPT="src/vae3d/train_maisi_finetune.py"
+    # train_maisi_finetune.py n'accepte pas --run-name ni --steps
+    torchrun \
+        --nproc_per_node=4 \
+        --nnodes=1 \
+        --node_rank=0 \
+        --master_addr=localhost \
+        --master_port="$MASTER_PORT" \
+        src/vae3d/train_maisi_finetune.py \
+        --config "$CONFIG" \
+        --env remote
+    exit $?
 else
     TRAIN_SCRIPT="src/vae3d/train_vae_3d.py"
 fi
@@ -150,7 +163,7 @@ torchrun \
     --nnodes=1 \
     --node_rank=0 \
     --master_addr=localhost \
-    --master_port=29500 \
+    --master_port="$MASTER_PORT" \
     "$TRAIN_SCRIPT" \
     --config "$CONFIG" \
     --env remote \

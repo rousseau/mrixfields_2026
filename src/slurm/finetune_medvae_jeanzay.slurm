@@ -1,6 +1,6 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# SLURM — Fine-tuning MedVAE 3D sur Jean Zay (1×H100 SXM5 80GB)
+# SLURM — Fine-tuning MedVAE 3D sur Jean Zay (4×H100 SXM5 80GB)
 #
 # Fine-tune medvae_4_1_3d sur Training_retrospective complet
 # (T1W + T2W + T2FLAIR × 0.1T + 1.5T + 3T + 5T + 7T, ~1939 volumes).
@@ -12,28 +12,21 @@
 #   STEPS=30000 LR=5e-6 sbatch src/slurm/finetune_medvae_jeanzay.slurm
 #
 # Prérequis sur le nœud de login (une seule fois) :
-#   module purge && module load arch/h100 && module load pytorch-gpu/py3/2.5.0
-#   export PYTHONUSERBASE=$WORK/.local && export PATH=$WORK/.local/bin:$PATH
-#   pip install --user medvae
-#   # Pré-télécharger les poids (réseau disponible sur login node, pas sur compute)
-#   python3 -c "from medvae import MVAE; MVAE(model_name='medvae_4_1_3d', modality='mri')"
+#   bash src/slurm/setup_jeanzay.sh
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=medvae_ft
-# SBATCH_ACCOUNT doit être défini avant sbatch :
-#   export SBATCH_ACCOUNT=<projet>@h100   (ex: crp@h100)
 #SBATCH -A crp@h100
 #SBATCH -C h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=32
 #SBATCH --partition=gpu_p6
 #SBATCH --qos=qos_gpu_h100-t4
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/medvae_ft_%x_%j.out
 #SBATCH --error=logs/medvae_ft_%x_%j.err
-# Signal USR1 envoyé 120s avant la fin → auto-requeue propre
 #SBATCH --signal=USR1@120
 
 set -euo pipefail
@@ -130,16 +123,25 @@ if [ -z "$RESUME_FLAG" ]; then
     echo "Aucun checkpoint — démarrage à zéro."
 fi
 
-# ─── Lancement (single GPU) ──────────────────────────────────────────────────
+# ─── Lancement (4×H100, DDP via torchrun) ────────────────────────────────────
 cd "$CODE_DIR"
 
+MASTER_PORT=$(( 29500 + SLURM_JOB_ID % 1000 ))
+
 echo "======================================================================="
-echo " Démarrage fine-tuning MedVAE (1×H100)"
+echo " Démarrage fine-tuning MedVAE (4×H100, DDP)"
+echo " Master port : $MASTER_PORT"
 echo "======================================================================="
 
-python3 src/vae3d/finetune_medvae.py \
+torchrun \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    --node_rank=0 \
+    --master_addr=localhost \
+    --master_port="$MASTER_PORT" \
+    src/vae3d/finetune_medvae.py \
     --config "$CONFIG" \
-    --env    jeanzay \
+    --env    remote \
     $RESUME_FLAG
 
 echo "======================================================================="

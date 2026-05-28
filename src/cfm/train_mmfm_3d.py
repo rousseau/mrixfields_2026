@@ -271,10 +271,35 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
     mmfm.train()
 
     for step in range(start_iter, total_iters):
-        src_class = random.choice(available_classes)
-        tgt_candidates = [c for c in available_classes if c != src_class]
-        k = min(num_targets_per_step, len(tgt_candidates))
-        tgt_classes = random.sample(tgt_candidates, k=k)
+        # Synchroniser le choix src/tgt entre tous les ranks DDP pour garantir
+        # que chaque GPU travaille sur la même paire de classes au même step.
+        if is_distributed:
+            if dist.get_rank() == 0:
+                src_idx = torch.tensor(
+                    [random.randrange(len(available_classes))],
+                    dtype=torch.long, device=device,
+                )
+            else:
+                src_idx = torch.zeros(1, dtype=torch.long, device=device)
+            dist.broadcast(src_idx, src=0)
+            src_class = available_classes[src_idx.item()]
+
+            tgt_candidates = [c for c in available_classes if c != src_class]
+            k = min(num_targets_per_step, len(tgt_candidates))
+            if dist.get_rank() == 0:
+                tgt_idx_t = torch.tensor(
+                    random.sample(range(len(tgt_candidates)), k),
+                    dtype=torch.long, device=device,
+                )
+            else:
+                tgt_idx_t = torch.zeros(k, dtype=torch.long, device=device)
+            dist.broadcast(tgt_idx_t, src=0)
+            tgt_classes = [tgt_candidates[i] for i in tgt_idx_t.tolist()]
+        else:
+            src_class = random.choice(available_classes)
+            tgt_candidates = [c for c in available_classes if c != src_class]
+            k = min(num_targets_per_step, len(tgt_candidates))
+            tgt_classes = random.sample(tgt_candidates, k=k)
 
         src_batch = next(class_loaders[src_class])
         src_x = src_batch[0].to(device)
