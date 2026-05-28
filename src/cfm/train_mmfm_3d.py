@@ -42,6 +42,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import sys
@@ -295,6 +296,7 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
         )
 
     weights_dir = output_dir / "weights"
+    metrics_path = output_dir / "train_metrics.jsonl"
     t0 = time.time()
     last_log_t = t0
     recent_losses: List[float] = []
@@ -400,6 +402,18 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
                 f"lr={lr_cur:.2e} src={src_class} tgts={tgt_classes} speed={it_s:.2f} it/s "
                 f"eta={eta_s/3600:.2f}h t={elapsed/60:.1f}min mem={mem_gb:.1f}GB"
             )
+            # ── Écriture train_metrics.jsonl ──────────────────────────────
+            record = {
+                "iter": step + 1,
+                "loss": round(avg_recent, 6),
+                "grad_norm": round(float(grad_norm), 4),
+                "lr": round(lr_cur, 8),
+                "speed_it_s": round(it_s, 3),
+                "elapsed_s": round(elapsed, 1),
+                "mem_gb": round(mem_gb, 2),
+            }
+            with open(metrics_path, "a") as _mf:
+                _mf.write(json.dumps(record) + "\n")
             last_log_t = time.time()
 
         if is_main_process() and (step + 1) % save_every == 0:

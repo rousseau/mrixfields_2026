@@ -39,6 +39,7 @@ Usage :
 
 import argparse
 import inspect
+import json
 import os
 import random
 import sys
@@ -296,6 +297,7 @@ def train(
             print(f"Reprise depuis iter {start_iter} : {resume_path}")
 
     weights_dir = output_dir / "weights"
+    metrics_path = output_dir / "train_metrics.jsonl"
     amp_dtype = torch.float16 if use_amp else torch.float32
 
     if is_main_process():
@@ -386,6 +388,19 @@ def train(
                 f"  t={elapsed / 60:.1f}min"
                 f"  mem={mem_gb:.1f}GB"
             )
+            # ── Écriture train_metrics.jsonl ──────────────────────────────
+            record = {
+                "iter": step + 1,
+                "loss": round(avg_recent, 6),
+                "loss_ema": round(float(ema_loss), 6),
+                "grad_norm": round(float(grad_norm), 4),
+                "lr": round(lr_cur, 8),
+                "speed_it_s": round(iter_per_s, 3),
+                "elapsed_s": round(elapsed, 1),
+                "mem_gb": round(mem_gb, 2),
+            }
+            with open(metrics_path, "a") as _mf:
+                _mf.write(json.dumps(record) + "\n")
             last_log_t = time.time()
 
         if is_main_process() and (step + 1) % save_every == 0:

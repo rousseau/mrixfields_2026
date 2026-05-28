@@ -19,6 +19,7 @@ dist/
 build/
 *.so
 .env
+.sync_env
 .venv
 venv/
 
