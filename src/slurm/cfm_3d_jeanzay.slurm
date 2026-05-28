@@ -50,8 +50,9 @@
 
 set -e
 
-PHASE="${1:-cfm}"          # "vae" ou "cfm"
+PHASE="${1:-cfm}"          # "vae", "cfm", "mmfm" ou "mmfm_unet"
 MODALITY="${2:-T1W}"
+MODALITY="${MODALITY^^}"   # normalisation en majuscules (T1w → T1W)
 CONFIG_ARG="${3:-}"
 CODE_DIR="$WORK/MRIX/mrixfields_2026"
 mkdir -p "$CODE_DIR/logs"
