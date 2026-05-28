@@ -116,19 +116,34 @@ class MRIxFieldsVAE(nn.Module, ABC):
     def from_vector(self, z_vec: torch.Tensor) -> torch.Tensor:
         """Reshape a vector back into spatial latent (only for spatial VAEs).
 
-        vector  (B,D_flat) -> (B,C,H',W',D')   if spatial (H'=W'=D' inferred)
+        vector  (B,D_flat) -> (B,C,H',W',D')   if spatial
         vector  (B,D_lat)  -> identity          if vector
+
+        NOTE: prefer LatentVectorizer(latent_shape).unflatten() when the
+        exact latent_shape is known at call-site (e.g. from _infer_latent_shape).
+        This method tries to reconstruct the shape from D_flat + latent_channels,
+        first as a cube, then falling back to the stored latent_shape if the
+        flat dimension matches.
         """
         if self.latent_format == "spatial":
             C = self.latent_channels
             D_flat = z_vec.shape[1]
             spatial = D_flat // C
+            # Try perfect cube
             s = round(spatial ** (1/3))
-            if s ** 3 != spatial:
-                # Fallback: use stored latent_shape if available and consistent
-                shape = (-1, *self.latent_shape)
-                return z_vec.view(shape)
-            return z_vec.view(-1, C, s, s, s)
+            if s ** 3 == spatial:
+                return z_vec.view(-1, C, s, s, s)
+            # Fallback: stored latent_shape if total elements match
+            stored_total = 1
+            for v in self.latent_shape:
+                stored_total *= v
+            if stored_total == D_flat:
+                return z_vec.view(-1, *self.latent_shape)
+            raise ValueError(
+                f"from_vector: cannot infer spatial shape from D_flat={D_flat}, "
+                f"latent_channels={C}, stored latent_shape={self.latent_shape}. "
+                "Use LatentVectorizer(latent_shape).unflatten(z_vec) instead."
+            )
         return z_vec
 
     @property

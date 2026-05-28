@@ -2,8 +2,10 @@ method: cfm3d
 vae:
   vae_type: aekl
   source: local
-  checkpoint: outputs/vae3d/runs/vae3d_multimodal/weights/model_best.pth
-  vae_config: configs/vae3d_multimodal.yaml
+  # Checkpoint T1W disponible (le multimodal est en cours d'entraînement sur le serveur distant).
+  # Mettre à jour vers vae3d_multimodal/weights/model_best.pth dès que disponible.
+  checkpoint: outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth
+  vae_config: configs/vae3d_T1W.yaml
 model:
   spatial_dims: 3
   model_channels: 128

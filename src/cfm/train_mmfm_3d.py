@@ -15,6 +15,28 @@ Pipeline:
   5. Predict vector field
   6. vae.from_vector() -> latent tensor
   7. VAE decode -> 3D volume
+
+Usage:
+  # Entraînement
+  PYTHONPATH=src python src/cfm/train_mmfm_3d.py \\
+      --config configs/mmfm3d_medvae_multimodal.yaml --env local
+
+  # Inférence (toutes les combinaisons source → cible)
+  PYTHONPATH=src python src/cfm/train_mmfm_3d.py --mode infer \\
+      --config configs/mmfm3d_medvae_multimodal.yaml --env local \\
+      --checkpoint outputs/cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1/weights/model_final.pth \\
+      --input_dir /path/to/nifti/ --output_dir outputs/predictions/mmfm/ \\
+      --source_field 0.1T --source_modality T1W \\
+      --target_field 7T   --target_modality T1W
+
+  # Inférence single-volume
+  PYTHONPATH=src python src/cfm/train_mmfm_3d.py --mode infer \\
+      --config configs/mmfm3d_medvae_multimodal.yaml --env local \\
+      --checkpoint outputs/cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1/weights/model_final.pth \\
+      --input_volume /path/to/sub_T1W_0.1T_0001.nii.gz \\
+      --output_dir outputs/predictions/mmfm/ \\
+      --source_field 0.1T --source_modality T1W \\
+      --target_field 7T   --target_modality T1W
 """
 
 from __future__ import annotations
@@ -27,10 +49,12 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import nibabel as nib
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -39,7 +63,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from common.config import load_yaml_with_include, load_env, resolve_paths
 from common.dataset import MultiModalNIfTILatentDataset
 from common.distributed import is_main_process, EMAModel
-from common.io import DOMAINS, MODALITIES
+from common.io import (
+    DOMAINS,
+    MODALITIES,
+    DOMAIN_TO_IDX,
+    MODALITY_TO_IDX,
+    adjust_affine_for_crop_pad,
+    load_nifti_volume,
+    resample_volume,
+)
 from models.vae_loader import load_vae
 
 from torchcfm.conditional_flow_matching import (
@@ -200,12 +232,10 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
 
     vae = load_vae(cfg, device)
     latent_shape = _infer_latent_shape(vae, volume_size, device)
-    # Phase F: utiliser vae.to_vector / vae.from_vector comme API canonique.
-    # LatentVectorizer n'est conservé que pour flat_dim (taille du vecteur).
-    latent_dim = vae.vector_dim
-    if latent_dim == 0:
-        # Fallback si vector_dim non renseigné (VAE legacy) : calculer depuis shape
-        latent_dim = int(torch.tensor(latent_shape).prod().item())
+    # Calculer latent_dim depuis latent_shape réel (volume_size-dependent).
+    # NE PAS utiliser vae.vector_dim : il est inféré sur un dummy (32³) et peut
+    # différer si volume_size n'est pas un cube.
+    latent_dim = int(torch.tensor(latent_shape).prod().item())
 
     vectorizer = LatentVectorizer(latent_shape)
 
@@ -406,14 +436,328 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
         dist.destroy_process_group()
 
 
+# ===========================================================================
+# Inference
+# ===========================================================================
+
+
+@torch.no_grad()
+def _euler_integrate_vector(
+    mmfm: VectorMMFM,
+    z_src_vec: Tensor,
+    tgt_class: int,
+    n_steps: int,
+    device: torch.device,
+    use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """Intégration Euler du champ vectoriel MMFM : z_src_vec → z_tgt_vec.
+
+    Args:
+        mmfm: VectorMMFM chargé et en mode eval.
+        z_src_vec: Vecteur latent source, shape (1, D).
+        tgt_class: Indice de classe cible (mod_idx * n_fields + field_idx).
+        n_steps: Nombre de pas d'intégration Euler.
+        device: Périphérique de calcul.
+        use_amp: Activer l'autocast AMP.
+        amp_dtype: Type de données AMP.
+
+    Returns:
+        Vecteur latent prédit, shape (1, D).
+    """
+    dt = 1.0 / n_steps
+    z = z_src_vec.clone().to(device).float()
+    z_src = z_src_vec.to(device).float()
+    y = torch.tensor([tgt_class], dtype=torch.long, device=device)
+
+    for step_i in range(n_steps):
+        t_val = step_i * dt
+        t_vec = torch.tensor([t_val], dtype=torch.float32, device=device)
+        with torch.amp.autocast(
+            "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+        ):
+            vt = mmfm(z, z_src, t_vec, y)
+        z = z + dt * vt.float()
+
+    return z
+
+
+def infer(
+    cfg_path: str,
+    checkpoint: str,
+    output_dir: str,
+    source_field: str,
+    source_modality: str,
+    target_field: str,
+    target_modality: str,
+    env_path: Optional[str] = None,
+    input_dir: Optional[str] = None,
+    input_volume: Optional[str] = None,
+    n_steps: Optional[int] = None,
+    use_ema: bool = True,
+) -> None:
+    """Inférence MMFM : encode → intégration ODE vectorielle → decode.
+
+    Accepte soit un répertoire de volumes NIfTI (input_dir) soit un volume
+    unique (input_volume).
+
+    Args:
+        cfg_path: Chemin vers le fichier de configuration YAML.
+        checkpoint: Chemin vers le checkpoint MMFM (.pth).
+        output_dir: Répertoire de sortie pour les volumes prédits.
+        source_field: Champ magnétique source (ex. "0.1T").
+        source_modality: Modalité source (ex. "T1W").
+        target_field: Champ magnétique cible (ex. "7T").
+        target_modality: Modalité cible (ex. "T1W").
+        env_path: Chemin vers l'env YAML (local/remote).
+        input_dir: Répertoire contenant des fichiers .nii.gz.
+        input_volume: Chemin vers un volume .nii.gz unique.
+        n_steps: Nombre de pas Euler (défaut: config inference.n_steps ou 20).
+        use_ema: Utiliser les poids EMA si disponibles.
+    """
+    cfg = load_yaml_with_include(cfg_path)
+    cfg = resolve_paths(cfg, load_env(env_path))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    data_cfg = cfg["data"]
+    train_cfg = cfg["train"]
+
+    amp_dtype_name = train_cfg.get("amp_dtype", "bf16")
+    use_amp = bool(train_cfg.get("use_amp", True))
+    if amp_dtype_name == "bf16":
+        amp_dtype = torch.bfloat16
+    elif amp_dtype_name == "fp16":
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.float32
+        use_amp = False
+
+    n_steps = n_steps or cfg.get("inference", {}).get("n_steps", 20)
+    p_lo = data_cfg.get("percentile_lower", 0.5)
+    p_hi = data_cfg.get("percentile_upper", 99.5)
+    raw_vs = data_cfg.get("volume_size", None)
+    volume_size = tuple(int(v) for v in raw_vs) if raw_vs else None
+    raw_ts = data_cfg.get("target_spacing", None)
+    target_spacing = tuple(float(v) for v in raw_ts) if raw_ts else None
+
+    modalities = data_cfg.get("modalities", MODALITIES)
+    fields = data_cfg.get("fields", DOMAINS)
+    n_fields = len(fields)
+    n_classes = len(modalities) * n_fields
+
+    # Valider source/cible
+    for name, val, lst in [
+        ("source_field", source_field, fields),
+        ("target_field", target_field, fields),
+        ("source_modality", source_modality, modalities),
+        ("target_modality", target_modality, modalities),
+    ]:
+        if val not in lst:
+            raise ValueError(f"{name}='{val}' non présent dans la config ({lst})")
+
+    tgt_mod_idx = modalities.index(target_modality)
+    tgt_field_idx = fields.index(target_field)
+    tgt_class = _flat_class(tgt_mod_idx, tgt_field_idx, n_fields)
+
+    print(
+        f"Inférence MMFM v1 : {source_modality}@{source_field} → "
+        f"{target_modality}@{target_field}  |  tgt_class={tgt_class}  |  {n_steps} steps Euler"
+    )
+
+    # ── VAE ──────────────────────────────────────────────────────────────────
+    vae = load_vae(cfg, device)
+    latent_shape = _infer_latent_shape(vae, volume_size, device)
+    # Calculer latent_dim depuis latent_shape réel (volume_size-dependent).
+    latent_dim = int(torch.tensor(latent_shape).prod().item())
+
+    print(f"  VAE: latent_shape={latent_shape}  flat_dim={latent_dim}")
+
+    # ── MMFM ─────────────────────────────────────────────────────────────────
+    mmfm = build_vector_mmfm(cfg, latent_dim, n_classes).to(device)
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+
+    # Vérifier cohérence du checkpoint
+    saved_latent_shape = ckpt.get("latent_shape", None)
+    if saved_latent_shape is not None and tuple(saved_latent_shape) != latent_shape:
+        raise RuntimeError(
+            f"Incohérence latent_shape : checkpoint={saved_latent_shape}, "
+            f"config courante={latent_shape}. "
+            "Utilisez la même config que lors de l'entraînement."
+        )
+
+    # Charger poids EMA si disponibles
+    loaded_from = "model"
+    if use_ema and "ema" in ckpt and ckpt["ema"]:
+        ema_state = ckpt["ema"]
+        shadow = ema_state.get("shadow_params", None)
+        if shadow is not None:
+            mmfm.load_state_dict(shadow)
+            loaded_from = "ema.shadow_params"
+        else:
+            mmfm.load_state_dict(ckpt["model"])
+    else:
+        mmfm.load_state_dict(ckpt["model"])
+
+    mmfm.eval()
+    trained_at = ckpt.get("iter", "?")
+    print(f"  MMFM chargé (clé: {loaded_from}, iter={trained_at}) depuis {checkpoint}")
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collecter les fichiers à traiter
+    if input_volume is not None:
+        input_files = [Path(input_volume)]
+    elif input_dir is not None:
+        input_files = sorted(Path(input_dir).glob("*.nii.gz"))
+        if not input_files:
+            raise FileNotFoundError(f"Aucun fichier .nii.gz dans {input_dir}")
+    else:
+        raise ValueError("Fournir --input_dir ou --input_volume.")
+
+    print(f"  {len(input_files)} volume(s) à prédire → {out_dir}")
+
+    for nii_path in input_files:
+        t_start = time.time()
+
+        # ── Chargement & prétraitement ────────────────────────────────────
+        vol, _ = load_nifti_volume(
+            nii_path,
+            target_spacing=target_spacing,
+            volume_size=volume_size,
+            normalize=True,
+            lo_pct=p_lo,
+            hi_pct=p_hi,
+        )
+
+        # Affine corrigé pour crop/pad
+        img_nib = nib.load(str(nii_path))
+        orig_spacing = np.abs(np.diag(img_nib.affine)[:3])
+        orig_shape = np.array(img_nib.shape[:3])
+        if target_spacing is not None:
+            resampled_arr = resample_volume(
+                np.zeros(orig_shape.tolist(), dtype=np.float32),
+                orig_spacing,
+                target_spacing,
+            )
+            resampled_shape = resampled_arr.shape
+        else:
+            resampled_shape = None
+
+        out_affine = adjust_affine_for_crop_pad(
+            img_nib.affine.copy().astype(float),
+            orig_shape,
+            volume_size,
+            resampled_shape,
+            target_spacing,
+            orig_spacing,
+        )
+
+        vol_tensor = torch.from_numpy(vol).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W,D)
+
+        # ── Encode ───────────────────────────────────────────────────────
+        with torch.no_grad(), torch.amp.autocast(
+            "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+        ):
+            z_src = vae.encode(vol_tensor)
+
+        z_src_vec = vae.to_vector(z_src).float()  # (1, D)
+
+        # ── Intégration Euler vectorielle ────────────────────────────────
+        z_tgt_vec = _euler_integrate_vector(
+            mmfm, z_src_vec, tgt_class, n_steps, device, use_amp, amp_dtype
+        )
+
+        # ── Decode ───────────────────────────────────────────────────────
+        # Utiliser LatentVectorizer pour le reshape (from_vector suppose un cube parfait)
+        z_tgt = LatentVectorizer(latent_shape).unflatten(z_tgt_vec)
+        with torch.no_grad(), torch.amp.autocast(
+            "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+        ):
+            recon = vae.decode(z_tgt)
+
+        pred_vol = recon.squeeze().cpu().float().numpy()
+        pred_vol = (np.clip(pred_vol, -1.0, 1.0) + 1.0) / 2.0  # [-1,1] → [0,1]
+
+        # ── Sauvegarde ───────────────────────────────────────────────────
+        stem = nii_path.name.replace(".nii.gz", "")
+        out_name = f"{stem}_{target_modality}_{target_field}_mmfm.nii.gz"
+        out_path = out_dir / out_name
+        nib.save(nib.Nifti1Image(pred_vol, out_affine), str(out_path))
+
+        elapsed = time.time() - t_start
+        print(f"  {nii_path.name} → {out_name}  ({elapsed:.1f}s)")
+
+    print(f"\nInférence MMFM terminée. Prédictions dans : {out_dir}")
+
+
 def _parse() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="MMFM v1 vectorized baseline")
-    p.add_argument("--config", required=True)
-    p.add_argument("--env", default=None)
-    p.add_argument("--resume", default=None)
+    p = argparse.ArgumentParser(description="MMFM v1 vectorized baseline — train & infer")
+    p.add_argument("--mode", default="train", choices=["train", "infer"],
+                   help="'train' : entraînement | 'infer' : inférence sur volumes NIfTI")
+    p.add_argument("--config", required=True, help="Chemin vers le YAML de configuration")
+    p.add_argument("--env", default=None, help="Env YAML (local / remote / chemin)")
+    # Train-only
+    p.add_argument("--resume", default=None, help="[train] Reprendre depuis ce checkpoint")
+    # Infer-only
+    p.add_argument("--checkpoint", default=None,
+                   help="[infer] Chemin vers le checkpoint MMFM (.pth)")
+    p.add_argument("--input_dir", default=None,
+                   help="[infer] Répertoire de volumes .nii.gz source")
+    p.add_argument("--input_volume", default=None,
+                   help="[infer] Volume .nii.gz unique source")
+    p.add_argument("--output_dir", default=None,
+                   help="[infer] Répertoire de sortie des prédictions")
+    p.add_argument("--source_field", default=None,
+                   help="[infer] Champ magnétique source (ex. '0.1T')")
+    p.add_argument("--source_modality", default=None,
+                   help="[infer] Modalité source (ex. 'T1W')")
+    p.add_argument("--target_field", default=None,
+                   help="[infer] Champ magnétique cible (ex. '7T')")
+    p.add_argument("--target_modality", default=None,
+                   help="[infer] Modalité cible (ex. 'T1W')")
+    p.add_argument("--n_steps", type=int, default=None,
+                   help="[infer] Nombre de pas Euler (défaut: 20)")
+    p.add_argument("--no_ema", action="store_true",
+                   help="[infer] Ignorer les poids EMA et utiliser les poids bruts")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse()
-    train(args.config, env_path=args.env, resume=args.resume)
+    if args.mode == "train":
+        train(args.config, env_path=args.env, resume=args.resume)
+    else:
+        missing = [
+            name for name, val in [
+                ("--checkpoint", args.checkpoint),
+                ("--output_dir", args.output_dir),
+                ("--source_field", args.source_field),
+                ("--source_modality", args.source_modality),
+                ("--target_field", args.target_field),
+                ("--target_modality", args.target_modality),
+            ]
+            if val is None
+        ]
+        if missing:
+            raise ValueError(
+                f"Mode infer : arguments manquants : {', '.join(missing)}\n"
+                "Fournir aussi --input_dir ou --input_volume."
+            )
+        if args.input_dir is None and args.input_volume is None:
+            raise ValueError("Mode infer : fournir --input_dir ou --input_volume.")
+
+        infer(
+            cfg_path=args.config,
+            checkpoint=args.checkpoint,
+            output_dir=args.output_dir,
+            source_field=args.source_field,
+            source_modality=args.source_modality,
+            target_field=args.target_field,
+            target_modality=args.target_modality,
+            env_path=args.env,
+            input_dir=args.input_dir,
+            input_volume=args.input_volume,
+            n_steps=args.n_steps,
+            use_ema=not args.no_ema,
+        )

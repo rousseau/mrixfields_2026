@@ -14,9 +14,10 @@ method: mmfm3d_vectorized_v1
 task_name: mmfm3d_medvae_multimodal_vectorized_v1
 
 vae:
-  vae_type: medvae
+  vae_type: medvae_finetune
   source: local
   model_name: medvae_4_1_3d
+  frozen: true
   checkpoint: "outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth"
 
 model:

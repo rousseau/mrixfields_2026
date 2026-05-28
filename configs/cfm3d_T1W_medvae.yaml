@@ -6,7 +6,9 @@ vae:
   vae_type: medvae_finetune
   model_name: medvae_4_1_3d
   frozen: true          # true = encoder+decoder figés pendant le CFM
-  checkpoint: null      # null = poids HuggingFace par défaut (medvae_4_1_3d)
+  # Checkpoint fine-tuné local (20k iters, multimodal T1W+T2W+T2FLAIR).
+  # null = repli sur les poids HuggingFace par défaut.
+  checkpoint: outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth
 model:
   spatial_dims: 3
   model_channels: 128

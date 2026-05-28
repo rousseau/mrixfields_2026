@@ -124,15 +124,22 @@ def _load_aekl(vae_cfg: dict, device: torch.device, source: str) -> AEKLWrapper:
 
         if source != "random":
             ckpt_path = vae_cfg.get("checkpoint", "")
-            if ckpt_path and Path(ckpt_path).exists():
-                state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-                state = state.get("model", state)
-                # Handle key remapping from older MONAI versions
-                state = _remap_aekl_keys(state)
-                model.load_state_dict(state, strict=False)
-                print(f"  AEKL loaded from {ckpt_path}")
-            else:
-                print(f"  [WARN] AEKL checkpoint not found: {ckpt_path}")
+            if not ckpt_path:
+                raise FileNotFoundError(
+                    "AEKL checkpoint requis (vae.checkpoint dans la config). "
+                    "Utilisez source: random pour des poids aléatoires (debug uniquement)."
+                )
+            if not Path(ckpt_path).exists():
+                raise FileNotFoundError(
+                    f"AEKL checkpoint introuvable : {ckpt_path}\n"
+                    "Vérifiez le chemin dans la config ou attendez la fin de l'entraînement VAE."
+                )
+            state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            state = state.get("model", state)
+            # Handle key remapping from older MONAI versions
+            state = _remap_aekl_keys(state)
+            model.load_state_dict(state, strict=False)
+            print(f"  AEKL loaded from {ckpt_path}")
 
     return AEKLWrapper(model)
 
