@@ -41,8 +41,8 @@ data:
   output_subdir: vae3d/runs/vae3d_multimodal
 
 train:
-  batch_size: 1
-  num_workers: 4
+  batch_size: 4        # par GPU — batch effectif = 4×4 = 16 avec DDP (4×H100 80GB)
+  num_workers: 8       # 8 CPUs par GPU (32 total / 4 GPUs)
   total_epochs: 200
   lr: 1.0e-4
   kl_warmup_epochs: 10

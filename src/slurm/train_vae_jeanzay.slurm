@@ -30,9 +30,9 @@
 #SBATCH -A crp@h100
 #SBATCH -C h100
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:4
+#SBATCH --ntasks=4
+#SBATCH --cpus-per-task=8
 #SBATCH --partition=gpu_p6
 #SBATCH --qos=qos_gpu_h100-t4
 #SBATCH --time=48:00:00
@@ -145,7 +145,13 @@ else
     TRAIN_SCRIPT="src/vae3d/train_vae_3d.py"
 fi
 
-python3 "$TRAIN_SCRIPT" \
+torchrun \
+    --nproc_per_node=4 \
+    --nnodes=1 \
+    --node_rank=0 \
+    --master_addr=localhost \
+    --master_port=29500 \
+    "$TRAIN_SCRIPT" \
     --config "$CONFIG" \
     --env remote \
     --run-name "$RUN_NAME" \
