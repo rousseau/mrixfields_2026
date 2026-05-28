@@ -134,7 +134,9 @@ echo "[3/4] Dépendances installées dans \$WORK/.local"
 echo ""
 echo "[3b/4] Pré-téléchargement des poids MedVAE en cache HuggingFace..."
 echo "       (nécessaire car les nœuds de calcul peuvent ne pas avoir accès à HF)"
-python3 - <<'PY'
+CUDA_VISIBLE_DEVICES="" IDR_DEBUG=WARN python3 - <<'PY'
+import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 try:
     from medvae import MVAE
     print("  Téléchargement medvae_4_1_3d ...")
@@ -144,7 +146,8 @@ try:
     print("  [OK] Poids MedVAE en cache.")
 except Exception as e:
     print(f"  [WARN] Impossible de pré-télécharger les poids MedVAE : {e}")
-    print("         Relancez 'python3 -c \"from medvae import MVAE; MVAE(...)\"' manuellement.")
+    print("         Relancez manuellement depuis le nœud de login :")
+    print("         CUDA_VISIBLE_DEVICES='' python3 -c \"from medvae import MVAE; MVAE(model_name='medvae_4_1_3d', modality='mri')\"")
 PY
 
 # ─── 4. Commandes d'entraînement ──────────────────────────────────

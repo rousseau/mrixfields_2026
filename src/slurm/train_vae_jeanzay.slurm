@@ -78,36 +78,30 @@ export TORCH_HOME="$WORK/.cache/torch"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export PYTHONPATH="$CODE_DIR/src"
 
-# ── Dépendances Python ───────────────────────────────────────────────────────
-# Installation via pip --user --no-cache-dir (fonctionne depuis les nœuds de
-# calcul Jean Zay selon la doc IDRIS). Si le package est déjà présent dans
-# $WORK/.local, l'import réussit immédiatement sans toucher au réseau.
-# En cas d'échec réseau persistant, pré-installer depuis le nœud de login :
+# ── Vérification des dépendances Python ─────────────────────────────────────
+# Les nœuds de calcul Jean Zay n'ont PAS accès à internet.
+# Toutes les dépendances doivent être pré-installées depuis le nœud de login :
 #   bash src/slurm/setup_jeanzay.sh
-_pip_install() {
-    # $1 = module Python à importer, $2 = paquet pip (peut contenir des guillemets)
+_check_import() {
+    # $1 = module Python à importer, $2 = paquet pip correspondant
     python3 -c "import $1" 2>/dev/null && return 0
-    echo "[INFO] Installation de '$2'..."
-    pip install --user --no-cache-dir "$2" || {
-        echo "[ERREUR] Impossible d'installer '$2'."
-        echo "  Pré-installez depuis le nœud de login : bash src/slurm/setup_jeanzay.sh"
-        exit 1
-    }
+    echo "[ERREUR] Package '$1' introuvable dans \$WORK/.local."
+    echo "  Pré-installez depuis le nœud de login : bash src/slurm/setup_jeanzay.sh"
+    exit 1
 }
-_pip_install nibabel  nibabel
-_pip_install scipy    scipy
-_pip_install einops   einops
-_pip_install monai    "monai[all]>=1.3.0"
+_check_import nibabel nibabel
+_check_import scipy   scipy
+_check_import einops  einops
+_check_import monai   "monai[all]"
 
-# Dépendances conditionnelles selon VAE_TYPE
+# Vérifications conditionnelles selon VAE_TYPE
 case "$VAE_TYPE" in
     pythae_vae|pythae_vqvae|pythae_rhvae)
-        _pip_install pythae pythae
+        _check_import pythae pythae
         ;;
     medvae|medvae_finetune)
-        _pip_install medvae medvae
-        # Vérifier que les poids MedVAE sont en cache HuggingFace
-        # (le téléchargement peut échouer sur les nœuds de calcul sans accès internet complet)
+        _check_import medvae medvae
+        # Vérifier que les poids MedVAE sont en cache HuggingFace local
         python3 -c "
 import os; os.environ['HF_HUB_OFFLINE'] = '1'
 try:
