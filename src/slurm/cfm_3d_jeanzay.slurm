@@ -17,6 +17,9 @@
 #   # Baseline MMFM v1 vectorisée sur latent MedVAE aplati
 #   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm T1W configs/mmfm3d_medvae_multimodal.yaml
 #
+#   # MMFM-UNet 3D spatial sur latent MedVAE
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm_unet T1W configs/mmfm3d_unet_medvae_multimodal.yaml
+#
 # Prérequis (via setup_jeanzay.sh) :
 #   $WORK/MRIX/mrixfields_2026/   ← ce repo
 #   $WORK/MRIX/challenge/         ← code officiel du challenge
@@ -161,8 +164,15 @@ elif [ "$PHASE" = "mmfm" ]; then
     else
         CONFIG="configs/mmfm3d_medvae_multimodal.yaml"
     fi
+elif [ "$PHASE" = "mmfm_unet" ]; then
+    SCRIPT="src/cfm/train_mmfm_unet_3d.py"
+    if [ -n "$CONFIG_ARG" ]; then
+        CONFIG="$CONFIG_ARG"
+    else
+        CONFIG="configs/mmfm3d_unet_medvae_multimodal.yaml"
+    fi
 else
-    echo "[ERREUR] Phase inconnue : '$PHASE'. Utiliser 'vae', 'cfm' ou 'mmfm'."
+    echo "[ERREUR] Phase inconnue : '$PHASE'. Utiliser 'vae', 'cfm', 'mmfm' ou 'mmfm_unet'."
     exit 1
 fi
 

@@ -16,6 +16,7 @@
 #   bash src/launch_cfm3d_dgx.sh vae T1W 1        # single-GPU, débug rapide
 #   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4  # multi-GPU sur DGX GB10
 #   bash src/slurm/launch_cfm3d_dgx.sh mmfm T1W 4 configs/mmfm3d_medvae_multimodal.yaml
+#   bash src/slurm/launch_cfm3d_dgx.sh mmfm_unet T1W 4 configs/mmfm3d_unet_medvae_multimodal.yaml
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -46,8 +47,11 @@ elif [[ "$PHASE" == "cfm" ]]; then
 elif [[ "$PHASE" == "mmfm" ]]; then
     CONFIG="${CONFIG_OVERRIDE:-configs/mmfm3d_medvae_multimodal.yaml}"
     SCRIPT="src/cfm/train_mmfm_3d.py"
+elif [[ "$PHASE" == "mmfm_unet" ]]; then
+    CONFIG="${CONFIG_OVERRIDE:-configs/mmfm3d_unet_medvae_multimodal.yaml}"
+    SCRIPT="src/cfm/train_mmfm_unet_3d.py"
 else
-    echo "ERREUR : PHASE doit être 'vae', 'cfm' ou 'mmfm' (reçu : '$PHASE')" >&2
+    echo "ERREUR : PHASE doit être 'vae', 'cfm', 'mmfm' ou 'mmfm_unet' (reçu : '$PHASE')" >&2
     exit 1
 fi
 
