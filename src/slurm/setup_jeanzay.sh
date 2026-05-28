@@ -106,6 +106,11 @@ module load pytorch-gpu/py3/2.5.0
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 
+# Cache HuggingFace dans $WORK pour éviter de saturer le quota HOME (3 GiB)
+export HF_HOME="$WORK/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+mkdir -p "$HF_HOME"
+
 pip install --user --no-cache-dir nibabel scipy einops
 pip install --user --no-cache-dir torchcfm pot torchdiffeq
 pip install --user --no-cache-dir "monai[all]>=1.3.0"
@@ -130,24 +135,44 @@ fi
 
 echo "[3/4] Dépendances installées dans \$WORK/.local"
 
-# ─── 3b. Pré-téléchargement des poids MedVAE (cache HuggingFace) ─────────────
+# ─── 3b. Pré-téléchargement des poids MedVAE (cache HuggingFace dans $WORK) ──
 echo ""
-echo "[3b/4] Pré-téléchargement des poids MedVAE en cache HuggingFace..."
-echo "       (nécessaire car les nœuds de calcul peuvent ne pas avoir accès à HF)"
+echo "[3b/4] Vérification/téléchargement des poids MedVAE..."
+echo "       Cache : $HF_HOME  (quota WORK, pas HOME)"
 CUDA_VISIBLE_DEVICES="" IDR_DEBUG=WARN python3 - <<'PY'
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# S'assurer que le cache HF pointe vers $WORK, pas $HOME
+hf_home = os.environ.get("HF_HOME", "")
+if not hf_home or ".cache/huggingface" not in hf_home.replace("\\", "/"):
+    print("  [WARN] HF_HOME ne pointe pas vers $WORK — vérifiez setup_jeanzay.sh")
+
 try:
     from medvae import MVAE
-    print("  Téléchargement medvae_4_1_3d ...")
-    MVAE(model_name="medvae_4_1_3d", modality="mri")
-    print("  Téléchargement medvae_8_1_3d ...")
-    MVAE(model_name="medvae_8_1_3d", modality="mri")
-    print("  [OK] Poids MedVAE en cache.")
+
+    def _check_or_download(model_name):
+        hub_cache = os.environ.get("HUGGINGFACE_HUB_CACHE", os.path.join(hf_home, "hub"))
+        # Chercher un fichier .ckpt déjà présent dans le cache
+        import glob
+        pattern = os.path.join(hub_cache, "**", "*.ckpt")
+        ckpts = glob.glob(pattern, recursive=True)
+        already = [c for c in ckpts if model_name.replace("_", "") in c.replace("_", "").replace("-", "")]
+        if already:
+            print(f"  [OK] {model_name} déjà en cache : {already[0]}")
+            return
+        print(f"  Téléchargement {model_name} ...")
+        MVAE(model_name=model_name, modality="mri")
+        print(f"  [OK] {model_name} téléchargé.")
+
+    _check_or_download("medvae_4_1_3d")
+    _check_or_download("medvae_8_1_3d")
+    print("  [OK] Poids MedVAE prêts.")
 except Exception as e:
-    print(f"  [WARN] Impossible de pré-télécharger les poids MedVAE : {e}")
+    print(f"  [WARN] Impossible de vérifier/télécharger les poids MedVAE : {e}")
     print("         Relancez manuellement depuis le nœud de login :")
-    print("         CUDA_VISIBLE_DEVICES='' python3 -c \"from medvae import MVAE; MVAE(model_name='medvae_4_1_3d', modality='mri')\"")
+    print("         CUDA_VISIBLE_DEVICES='' HF_HOME=$WORK/.cache/huggingface \\")
+    print("           python3 -c \"from medvae import MVAE; MVAE(model_name='medvae_4_1_3d', modality='mri')\"")
 PY
 
 # ─── 4. Commandes d'entraînement ──────────────────────────────────

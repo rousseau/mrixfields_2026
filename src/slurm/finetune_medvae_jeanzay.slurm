@@ -62,26 +62,25 @@ module load pytorch-gpu/py3/2.5.0
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 export TORCH_HOME="$WORK/.cache/torch"
+export HF_HOME="$WORK/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 # Évite la fragmentation mémoire CUDA sur les longs trainings
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-# HuggingFace offline : pas de réseau sur les nœuds compute
-export HF_HUB_OFFLINE="1"
-export TRANSFORMERS_OFFLINE="1"
 
-_pip_install() {
+# Les nœuds de calcul Jean Zay n'ont PAS accès à internet.
+# Toutes les dépendances doivent être pré-installées : bash src/slurm/setup_jeanzay.sh
+_check_import() {
     python3 -c "import $1" 2>/dev/null && return 0
-    echo "[INFO] Installation de '$2'..."
-    pip install --user --no-cache-dir "$2" || {
-        echo "[ERREUR] Impossible d'installer '$2'."
-        echo "  Pré-installez depuis le nœud de login : bash src/slurm/setup_jeanzay.sh"
-        exit 1
-    }
+    echo "[ERREUR] Package '$1' introuvable. Pré-installez : bash src/slurm/setup_jeanzay.sh"
+    exit 1
 }
 
-_pip_install medvae  medvae
-_pip_install nibabel nibabel
-_pip_install scipy   scipy
-_pip_install einops  einops
+_check_import medvae
+_check_import nibabel
+_check_import scipy
+_check_import einops
 
 # ─── Vérification des poids MedVAE en cache ──────────────────────────────────
 python3 - <<'EOF'

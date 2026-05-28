@@ -75,6 +75,9 @@ module load pytorch-gpu/py3/2.5.0
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 export TORCH_HOME="$WORK/.cache/torch"
+export HF_HOME="$WORK/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_HUB_OFFLINE=1          # pas d'accès internet depuis les nœuds de calcul
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export PYTHONPATH="$CODE_DIR/src"
 

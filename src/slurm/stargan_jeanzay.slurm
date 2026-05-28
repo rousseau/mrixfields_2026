@@ -65,27 +65,32 @@ module purge
 module load arch/h100
 module load pytorch-gpu/py3/2.5.0
 
-# ─── Dépendances utilisateur ($WORK/.local, installées une seule fois) ───────
+# ─── Dépendances utilisateur ($WORK/.local, pré-installées via setup_jeanzay.sh) ─
 export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 
-_install_if_missing() {
-    python3 -c "import $1" 2>/dev/null || pip install --user --quiet "$2"
+# Les nœuds de calcul Jean Zay n'ont PAS accès à internet.
+_check_import() {
+    python3 -c "import $1" 2>/dev/null && return 0
+    echo "[ERREUR] Package '$1' introuvable. Pré-installez : bash src/slurm/setup_jeanzay.sh"
+    exit 1
 }
-_install_if_missing nibabel nibabel
+_check_import nibabel
 
 # Package challenge (mrixfields) — installé depuis Baseline/ du clone local
 CHALLENGE_BASELINE="$WORK/MRIX/challenge/Baseline"
 if [ -f "$CHALLENGE_BASELINE/setup.py" ]; then
-    python3 -c "import mrixfields" 2>/dev/null || \
-        pip install --user --quiet --no-deps "$CHALLENGE_BASELINE"
+    _check_import mrixfields
 else
     echo "[ERREUR] $CHALLENGE_BASELINE/setup.py introuvable."
     exit 1
 fi
 
-# ─── Cache PyTorch ────────────────────────────────────────────────────────────
+# ─── Cache PyTorch / HuggingFace dans $WORK ──────────────────────────────────
 export TORCH_HOME="$WORK/.cache/torch"
+export HF_HOME="$WORK/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_HUB_OFFLINE=1
 
 # ─── Gestion auto-requeue ─────────────────────────────────────────────────────
 _requeue_handler() {

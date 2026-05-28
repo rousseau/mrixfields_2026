@@ -71,25 +71,19 @@ export PYTHONUSERBASE="$WORK/.local"
 export PATH="$WORK/.local/bin:$PATH"
 
 # Installation via pip --user --no-cache-dir (fonctionne depuis les nœuds de
-# calcul Jean Zay selon la doc IDRIS). Si le package est déjà présent dans
-# $WORK/.local, l'import réussit immédiatement sans toucher au réseau.
-# En cas d'échec réseau persistant, pré-installer depuis le nœud de login :
-#   bash src/slurm/setup_jeanzay.sh
-_pip_install() {
+# Les nœuds de calcul Jean Zay n'ont PAS accès à internet.
+# Toutes les dépendances doivent être pré-installées : bash src/slurm/setup_jeanzay.sh
+_check_import() {
     python3 -c "import $1" 2>/dev/null && return 0
-    echo "[INFO] Installation de '$2'..."
-    pip install --user --no-cache-dir "$2" || {
-        echo "[ERREUR] Impossible d'installer '$2'."
-        echo "  Pré-installez depuis le nœud de login : bash src/slurm/setup_jeanzay.sh"
-        exit 1
-    }
+    echo "[ERREUR] Package '$1' introuvable. Pré-installez : bash src/slurm/setup_jeanzay.sh"
+    exit 1
 }
-_pip_install torchcfm    torchcfm
-_pip_install ot          pot
-_pip_install torchdiffeq torchdiffeq
-_pip_install nibabel     nibabel
-_pip_install monai       "monai[all]>=1.3.0"
-_pip_install medvae      medvae
+_check_import torchcfm
+_check_import ot
+_check_import torchdiffeq
+_check_import nibabel
+_check_import monai
+_check_import medvae
 
 # Vérifie explicitement la disponibilité des modèles generative
 _ensure_monai_generative_models() {
@@ -116,17 +110,14 @@ PY
 }
 _ensure_monai_generative_models
 
-# Package challenge (mrixfields)
-CHALLENGE_BASELINE="$WORK/MRIX/challenge/Baseline"
-if [ -f "$CHALLENGE_BASELINE/setup.py" ]; then
-    python3 -c "import mrixfields" 2>/dev/null || \
-        pip install --user --no-cache-dir --no-deps "$CHALLENGE_BASELINE"
-else
-    echo "[WARN] $CHALLENGE_BASELINE/setup.py introuvable."
-fi
+# Package challenge (mrixfields) — doit être pré-installé via setup_jeanzay.sh
+_check_import mrixfields
 
-# ─── Cache PyTorch ───────────────────────────────────────────────────────────
+# ─── Cache PyTorch / HuggingFace dans $WORK (évite de saturer le quota HOME) ─
 export TORCH_HOME="$WORK/.cache/torch"
+export HF_HOME="$WORK/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_HUB_OFFLINE=1
 
 # ─── Gestion auto-requeue ─────────────────────────────────────────────────────
 _requeue_handler() {
