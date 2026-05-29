@@ -1,0 +1,57 @@
+# MMFM v1 vectorized — NV-Generate-CTMR autoencoder_v2.pt (MRI baseline)
+#
+# Same MMFM-MLP architecture as mmfm3d_medvae_multimodal.yaml, with NV-Generate
+# as the frozen encoder/decoder instead of MedVAE.
+#
+# NV-Generate autoencoder_v2.pt:
+#   - Architecture : AutoencoderKL [64,128,256], 4 latent channels
+#   - Downsampling : 4× per axis → 128³ patch → latent (4,32,32,32) = 131072 floats
+#   - Trained on  : ~20k volumes, 17 public MRI datasets (non-commercial license)
+#   - Epoch       : 351
+#
+# Flat latent dim for volume_size [128,128,80]:
+#   latent shape = (4, 32, 32, 20) → flat_dim = 81920
+#
+# Comparable to MedVAE (flat_dim ~20480 for same volume_size with 8× downsampling),
+# but NV-Generate compresses 4× per axis vs MedVAE's 8× → larger latent vector.
+
+method: mmfm3d_vectorized_v1
+task_name: mmfm3d_nvgenerate_multimodal_vectorized_v1
+
+vae:
+  vae_type: maisi
+  source: nvgenerate
+  checkpoint: "outputs/nvgenerate/models/autoencoder_v2.pt"
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+
+data:
+  split: retro_train
+  modalities: [T1W, T2W, T2FLAIR]
+  fields: [0.1T, 1.5T, 3T, 5T, 7T]
+  output_subdir: cfm3d/runs/mmfm3d_nvgenerate_multimodal_vectorized_v1
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  target_spacing: [1.0, 1.0, 1.0]
+  volume_size: [128, 128, 80]
+  max_volumes_per_class: null
+
+train:
+  batch_size: 1
+  num_workers: 4
+  total_iters: 30000
+  lr: 1.0e-4
+  sigma: 0.0
+  ot_method: exact
+  save_every: 2000
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  num_targets_per_step: 2

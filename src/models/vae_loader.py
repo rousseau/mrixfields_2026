@@ -5,7 +5,8 @@ Single entry point `load_vae(cfg, device)` used by all training/inference/eval s
 
 Supported vae_types:
   - "aekl"              : MONAI AutoencoderKL
-  - "maisi"             : MONAI bundle MAISI / NV-Generate-CTMR autoencoder
+  - "maisi"             : NV-Generate-CTMR autoencoder_v2.pt (MRI, source=nvgenerate, default)
+                          ou MONAI bundle maisi_ct_generative (CT+MRI, source=monai)
   - "medvae"            : Stanford MIMI MedVAE (frozen, legacy wrapper)
   - "medvae_finetune"   : MedVAE fine-tunable (Phase D) — frozen or trainable
   - "medvae_disentangle": MedVAE disentanglement v1
@@ -181,19 +182,126 @@ def _remap_aekl_keys(state: dict) -> dict:
 # MAISI / NV-Generate-CTMR                                                    #
 # --------------------------------------------------------------------------- #
 
+# Architecture NV-Generate-CTMR autoencoder_v2.pt (MRI, 17 public datasets)
+# Confirmed from checkpoint inspection: AutoencoderKL [64,128,256], 4 latent ch,
+# 2 res-blocks/level, 3 downsampling levels → 8× per axis (e.g. 128³ → 16³ latent)
+# Checkpoint key convention: .conv.conv.weight  (extra .conv wrapper vs MONAI)
+_NVGENERATE_AEKL_CFG = {
+    "model": {
+        "spatial_dims": 3,
+        "in_channels": 1,
+        "out_channels": 1,
+        "latent_channels": 4,
+        "channels": [64, 128, 256],
+        "num_res_blocks": 2,
+        "norm_num_groups": 32,
+        "attention_levels": [False, False, False],
+        "with_encoder_nonlocal_attn": False,
+        "with_decoder_nonlocal_attn": False,
+    }
+}
+
 
 def _load_maisi(vae_cfg: dict, device: torch.device, source: str) -> AEKLWrapper:
-    """Load MAISI autoencoder (MONAI bundle or NVIDIA NV-Generate-CTMR).
+    """Load MAISI/NV-Generate autoencoder.
 
-    Internally uses _build_maisi_autoencoder which downloads the MONAI bundle.
-    In the future, this may load NVIDIA's v1/v2 checkpoints directly.
+    source="nvgenerate" (default): loads NVIDIA NV-Generate-CTMR autoencoder_v2.pt
+        Requires vae.checkpoint pointing to the .pt file.
+        Architecture: AutoencoderKL [64,128,256], 4 latent channels, 8× downsampling.
+
+    source="monai": downloads MONAI bundle maisi_ct_generative (CT+MRI, 60k volumes).
+        Uses vae.maisi_cache_dir (optional, defaults to ~/.cache/monai/bundles).
     """
-    model = _build_maisi_autoencoder(vae_cfg.get("maisi_cache_dir"))
+    if source == "monai":
+        model = _build_maisi_monai_bundle(vae_cfg.get("maisi_cache_dir"))
+    else:
+        # Default: NV-Generate-CTMR autoencoder_v2.pt
+        ckpt_path = vae_cfg.get("checkpoint", "")
+        if not ckpt_path:
+            raise FileNotFoundError(
+                "NV-Generate checkpoint requis (vae.checkpoint dans la config).\n"
+                "Téléchargez avec: hf download nvidia/NV-Generate-MR models/autoencoder_v2.pt "
+                "--local-dir outputs/nvgenerate"
+            )
+        model = _build_nvgenerate_autoencoder(ckpt_path)
     return AEKLWrapper(model)
 
 
-def _build_maisi_autoencoder(cache_dir: Optional[str] = None) -> AutoencoderKL:
-    """Download and load MAISI autoencoder from MONAI Model Zoo."""
+def _build_nvgenerate_autoencoder(ckpt_path: str) -> AutoencoderKL:
+    """Load NV-Generate-CTMR autoencoder_v2.pt into a MONAI AutoencoderKL.
+
+    The checkpoint stores weights under key 'unet_state_dict' with an extra
+    .conv wrapper layer in conv key names (e.g. .conv.conv.weight vs MONAI's
+    .conv.weight). This function remaps those keys for strict loading.
+    """
+    if not Path(ckpt_path).exists():
+        raise FileNotFoundError(f"NV-Generate checkpoint introuvable: {ckpt_path}")
+
+    vae = _build_aekl_from_config(_NVGENERATE_AEKL_CFG)
+
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    # Checkpoint format: {'epoch': int, 'unet_state_dict': {...}, 'epoch_finished': bool}
+    sd = raw.get("unet_state_dict", raw.get("state_dict", raw))
+    sd = _remap_nvgenerate_keys(sd)
+
+    missing, unexpected = vae.load_state_dict(sd, strict=False)
+    if missing:
+        raise RuntimeError(
+            f"NV-Generate: {len(missing)} missing keys after remap.\n"
+            f"First 5: {missing[:5]}"
+        )
+    if unexpected:
+        print(f"  [nvgenerate] {len(unexpected)} unexpected keys ignored: {unexpected[:3]}")
+    print(f"  NV-Generate VAE loaded from {ckpt_path} "
+          f"(epoch={raw.get('epoch', '?')})")
+    return vae
+
+
+def _remap_nvgenerate_keys(sd: dict) -> dict:
+    """Remap NV-Generate checkpoint keys to MONAI AutoencoderKL convention.
+
+    NV-Generate wraps every Conv3d in a thin .conv layer, yielding an extra
+    .conv segment vs MONAI.  Three distinct patterns exist:
+
+    1. Standard conv blocks (blocks 0,1,2,4,5,7,8 + nin_shortcut):
+       NV-Generate:  .conv.conv.weight
+       MONAI:        .conv.weight
+       → strip one .conv level
+
+    2. Encoder strided-conv blocks (blocks 3, 6):
+       NV-Generate:  encoder.blocks.{3,6}.conv.conv.conv.weight
+       MONAI:        encoder.blocks.{3,6}.conv.conv.weight
+       → strip one .conv level (same rule as above, applied once)
+
+    3. Decoder strided-conv / upsample blocks (blocks 3, 6):
+       NV-Generate:  decoder.blocks.{3,6}.conv.conv.conv.weight
+       MONAI:        decoder.blocks.{3,6}.postconv.conv.weight
+       → rename .conv.conv.conv. → .postconv.conv.
+    """
+    import re
+    remapped = {}
+    for k, v in sd.items():
+        k2 = k
+        # Case 3: decoder strided blocks — must be handled before generic strip
+        # decoder.blocks.{3,6}.conv.conv.conv.{weight,bias}
+        k2 = re.sub(
+            r'^(decoder\.blocks\.\d+)\.conv\.conv\.conv\.(weight|bias)$',
+            r'\1.postconv.conv.\2',
+            k2,
+        )
+        # Case 1 & 2: strip one extra .conv wrapper everywhere else
+        # .conv.conv.weight → .conv.weight  (applies to both standard and encoder strided)
+        if k2 == k:  # not already remapped by case 3
+            k2 = k2.replace('.conv.conv.', '.conv.')
+        remapped[k2] = v
+    return remapped
+
+
+def _build_maisi_monai_bundle(cache_dir: Optional[str] = None) -> AutoencoderKL:
+    """Download and load MAISI autoencoder from MONAI Model Zoo (CT+MRI, 60k volumes).
+
+    Architecture: AutoencoderKL [64,128,256,512], 4 latent channels.
+    """
     try:
         from monai.bundle import download
     except ImportError:
@@ -211,6 +319,7 @@ def _build_maisi_autoencoder(cache_dir: Optional[str] = None) -> AutoencoderKL:
         raise FileNotFoundError(f"MAISI autoencoder not found in {models_dir}")
     ckpt_path = candidates[0]
 
+    # MONAI bundle uses 4-level architecture [64,128,256,512]
     cfg = {
         "model": {
             "spatial_dims": 3,
@@ -229,7 +338,7 @@ def _build_maisi_autoencoder(cache_dir: Optional[str] = None) -> AutoencoderKL:
     state = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     state = state.get("state_dict", state.get("model", state))
     vae.load_state_dict(state, strict=True)
-    print(f"  MAISI VAE loaded from {ckpt_path}")
+    print(f"  MAISI (MONAI bundle) VAE loaded from {ckpt_path}")
     return vae
 
 
