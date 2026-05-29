@@ -8,9 +8,11 @@
 #   - outputs/<subdir>/train_metrics.jsonl
 #   - logs/*.{out,err}                 (logs SLURM)
 #
-# Prérequis : avoir configuré les clés SSH sans mot de passe via :
-#   bash src/slurm/setup_ssh_keys.sh
-# Cela ajoute un alias "jeanzay" dans ~/.ssh/config — utilisé ici.
+# Principe de connexion (ControlMaster) :
+#   Le script ouvre une connexion SSH maître au début du script.
+#   Les 2 mots de passe (proxy + Jean Zay) sont demandés une seule fois.
+#   Tous les scp suivants réutilisent ce tunnel sans redemander de mot de passe.
+#   Le tunnel est fermé proprement à la fin.
 #
 # Usage :
 #   bash src/slurm/sync_from_jeanzay.sh [FILTRE]
@@ -26,8 +28,7 @@
 #
 # Configuration requise :
 #   Copier src/slurm/sync_from_jeanzay.sh.env.example → .sync_env
-#   et y renseigner JEANZAY_USER et REMOTE_BASE.
-#   Ce fichier est ignoré par git.
+#   et y renseigner les variables. Ce fichier est ignoré par git.
 # =============================================================================
 set -euo pipefail
 
@@ -59,30 +60,15 @@ _check_var() {
         echo "Créer le fichier .sync_env à la racine du projet :"
         echo "  cp src/slurm/sync_from_jeanzay.sh.env.example .sync_env"
         echo "  # Puis éditer .sync_env avec vos identifiants"
-        echo ""
-        echo "Pour configurer les clés SSH (connexion sans mot de passe) :"
-        echo "  bash src/slurm/setup_ssh_keys.sh"
         exit 1
     fi
 }
 
+_check_var JEANZAY_USER
+_check_var JEANZAY_HOST
+_check_var PROXY_USER
+_check_var PROXY_HOST
 _check_var REMOTE_BASE
-
-# SSH_ALIAS : alias défini dans ~/.ssh/config par setup_ssh_keys.sh
-# Peut être surchargé dans .sync_env si nécessaire.
-SSH_ALIAS="${SSH_ALIAS:-jeanzay}"
-
-# ── Vérification que l'alias SSH est configuré ───────────────────────────────
-if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$SSH_ALIAS" true 2>/dev/null; then
-    echo "[ERREUR] Impossible de se connecter à '$SSH_ALIAS' sans mot de passe."
-    echo ""
-    echo "Configurer les clés SSH en lançant :"
-    echo "  bash src/slurm/setup_ssh_keys.sh"
-    echo ""
-    echo "Ce script dépose votre clé SSH sur le proxy et Jean Zay,"
-    echo "et configure l'alias 'jeanzay' dans ~/.ssh/config."
-    exit 1
-fi
 
 # ── Découverte automatique des runs depuis configs/*.yaml ───────────────────
 mapfile -t ALL_SUBDIRS < <(python3 - <<'PYEOF'
@@ -132,8 +118,9 @@ fi
 echo "======================================================================="
 echo " sync_from_jeanzay.sh — Synchronisation depuis Jean Zay"
 echo "======================================================================="
-echo "  SSH alias : $SSH_ALIAS"
-echo "  Remote    : ${SSH_ALIAS}:${REMOTE_BASE}"
+echo "  Jean Zay  : ${JEANZAY_USER}@${JEANZAY_HOST}"
+echo "  Proxy     : ${PROXY_USER}@${PROXY_HOST}"
+echo "  Remote    : ${REMOTE_BASE}"
 if [[ -n "$FILTER" ]]; then
     echo "  Filtre    : $FILTER"
 fi
@@ -158,14 +145,43 @@ if [[ -z "$FILTER" && $FORCE_ALL -eq 0 ]]; then
     echo ""
 fi
 
-# ── Fonction scp simplifiée (utilise l'alias ~/.ssh/config) ─────────────────
+# ── Ouverture du tunnel SSH maître (ControlMaster) ───────────────────────────
+# Les 2 mots de passe (proxy + Jean Zay) sont demandés ici, une seule fois.
+# Tous les scp suivants réutilisent ce tunnel sans redemander de mot de passe.
+SOCK="/tmp/jz_sync_$$.sock"
+
+_close_tunnel() {
+    ssh -S "$SOCK" -O exit "${JEANZAY_USER}@${JEANZAY_HOST}" 2>/dev/null || true
+    rm -f "$SOCK"
+}
+trap _close_tunnel EXIT
+
+PROXY_CMD="ssh -i ~/.ssh/id_mrixfields -o StrictHostKeyChecking=no ${PROXY_USER}@${PROXY_HOST} nc %h %p"
+
+echo "Ouverture du tunnel SSH (2 mots de passe demandés) ..."
+echo ""
+ssh -fNM \
+    -S "$SOCK" \
+    -o "ProxyCommand=${PROXY_CMD}" \
+    -o "StrictHostKeyChecking=no" \
+    -o "ConnectTimeout=30" \
+    -o "ServerAliveInterval=60" \
+    "${JEANZAY_USER}@${JEANZAY_HOST}"
+
+echo ""
+echo "Tunnel ouvert. Début de la synchronisation."
+echo ""
+
+# Options scp réutilisant le tunnel maître
+SCP_CTRL="-o ControlPath=${SOCK} -o ControlMaster=no -o BatchMode=yes -o ConnectTimeout=15"
+
+# ── Fonction scp via tunnel ──────────────────────────────────────────────────
 _scp() {
     local remote_path="$1"
     local local_dest="$2"
-    scp -rp \
-        -o ConnectTimeout=15 \
-        -o BatchMode=yes \
-        "${SSH_ALIAS}:${remote_path}" \
+    # shellcheck disable=SC2086
+    scp -rp $SCP_CTRL \
+        "${JEANZAY_USER}@${JEANZAY_HOST}:${remote_path}" \
         "${local_dest}" 2>/dev/null
 }
 
@@ -209,17 +225,23 @@ done
 echo "── Logs SLURM (logs/*.out + logs/*.err)"
 mkdir -p "$PROJECT_ROOT/logs"
 echo -n "   logs/      ... "
-if scp -p \
-    -o ConnectTimeout=15 \
-    -o BatchMode=yes \
-    "${SSH_ALIAS}:${REMOTE_BASE}/logs/*.out" \
-    "${SSH_ALIAS}:${REMOTE_BASE}/logs/*.err" \
+# shellcheck disable=SC2086
+if scp -p $SCP_CTRL \
+    "${JEANZAY_USER}@${JEANZAY_HOST}:${REMOTE_BASE}/logs/*.out" \
+    "${JEANZAY_USER}@${JEANZAY_HOST}:${REMOTE_BASE}/logs/*.err" \
     "$PROJECT_ROOT/logs/" 2>/dev/null; then
     N_LOGS=$(find "$PROJECT_ROOT/logs" -name "*.out" -o -name "*.err" | wc -l)
     echo "OK  ($N_LOGS fichiers)"
 else
     echo "SKIP (aucun log ou erreur réseau)"
 fi
+
+# ── État des jobs SLURM ──────────────────────────────────────────────────────
+echo ""
+echo "── État des jobs SLURM (squeue)"
+# shellcheck disable=SC2086
+ssh $SCP_CTRL "${JEANZAY_USER}@${JEANZAY_HOST}" \
+    "squeue -u ${JEANZAY_USER} --format='%.10i %.20j %.8T %.12M %.5D %R' 2>/dev/null || echo '  (aucun job en cours)'"
 
 # ── Résumé ───────────────────────────────────────────────────────────────────
 echo ""
