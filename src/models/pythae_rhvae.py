@@ -299,8 +299,14 @@ class PythaeRHVAE3D(MRIxFieldsVAE):
         decoder = RHVAEDecoder3D(latent_dim, base_channels, num_groups, spatial_size)
         metric = RHVAEMetric3D(latent_dim, base_channels, num_groups)
 
+        # input_dim must match the actual volume shape so that Pythae's
+        # _log_p_x_given_z correctly reshapes recon_x and x before MSE.
+        # spatial_size is patch_size / 8 (3 stride-2 downsamples), so the
+        # full patch size is spatial_size * 8 on each spatial axis.
+        patch_size = spatial_size * 8
         cfg = RHVAEConfig(
-            input_dim=(1,),       # unused by our encoder, set to dummy
+            input_dim=(1, patch_size, patch_size, patch_size),
+            reconstruction_loss="mse",
             latent_dim=latent_dim,
             n_lf=n_lf,
             eps_lf=eps_lf,

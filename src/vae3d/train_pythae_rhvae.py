@@ -190,6 +190,9 @@ def train(cfg_path: str, env_path: Optional[str] = None,
         model.train()
         epoch_loss = 0.0
         n_batches = 0
+        # input_dim used to normalise loss for readability (loss/pixel ~ MAE scale)
+        input_dim = spatial_size * 8  # patch size per spatial dim
+        input_dim_total = input_dim ** 3  # 1 × H × W × D (single channel)
 
         for step, batch in enumerate(loader):
             x = batch["x"].to(device, non_blocking=True)  # (B, 1, H, W, D)
@@ -198,6 +201,11 @@ def train(cfg_path: str, env_path: Optional[str] = None,
                 raw_model = model.module if is_distributed else model
                 out = raw_model.forward_train(x)
                 loss = out.loss
+
+            # Skip non-finite loss (guard against early instability)
+            if not torch.isfinite(loss):
+                optimizer.zero_grad()
+                continue
 
             if scaler:
                 scaler.scale(loss).backward()
@@ -215,17 +223,25 @@ def train(cfg_path: str, env_path: Optional[str] = None,
             n_batches += 1
 
             if is_main_process() and (step + 1) % print_every == 0:
+                # loss/pixel is comparable to MAE (~0.05-0.1 when trained)
+                loss_per_px = loss.item() / (x.shape[0] * input_dim_total)
                 print(f"  Ep {epoch:04d} | step {step+1:05d}/{len(loader)} "
-                      f"| loss={loss.item():.4f}", flush=True)
+                      f"| loss={loss.item():.1f} | loss/px={loss_per_px:.5f}", flush=True)
 
         avg_loss = epoch_loss / max(1, n_batches)
-        print_main(f"Epoch {epoch:04d}/{total_epochs} | loss={avg_loss:.4f}")
+        avg_loss_per_px = avg_loss / input_dim_total
+        print_main(f"Epoch {epoch:04d}/{total_epochs} | loss={avg_loss:.1f} | loss/px={avg_loss_per_px:.5f}")
 
         # ── Update Riemannian metric (end of epoch) ────────────────────────────
-        # Must be called on raw (non-DDP) model — syncs metric centroids across
-        # accumulated M / centroids stored during the epoch.
+        # Must be called on ALL ranks (each GPU has accumulated its own M/centroids
+        # deque during the epoch). Pythae's deque(maxlen=100) keeps the last 100
+        # batches — in DDP each rank updates its own local metric independently,
+        # which is the intended behaviour (metric is rebuilt at inference from the
+        # full saved M_tens / centroids_tens).
         raw_model = model.module if is_distributed else model
         raw_model.update_metric()
+        if is_distributed:
+            torch.distributed.barrier()  # ensure all ranks finish update before next epoch
 
         # ── Checkpoint ────────────────────────────────────────────────────────
         if is_main_process():
