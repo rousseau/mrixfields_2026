@@ -6,23 +6,27 @@
 # puis rapatrie pour chaque run :
 #   - outputs/<subdir>/weights/        (checkpoints .pth)
 #   - outputs/<subdir>/train_metrics.jsonl
-#   - logs/<job_name>_*.{out,err}      (logs SLURM)
+#   - logs/*.{out,err}                 (logs SLURM)
+#
+# Prérequis : avoir configuré les clés SSH sans mot de passe via :
+#   bash src/slurm/setup_ssh_keys.sh
+# Cela ajoute un alias "jeanzay" dans ~/.ssh/config — utilisé ici.
 #
 # Usage :
 #   bash src/slurm/sync_from_jeanzay.sh [FILTRE]
 #   bash src/slurm/sync_from_jeanzay.sh --all
 #
-#   FILTRE : sous-chaîne du nom de run (ex: "mmfm_unet", "cfm3d")
+#   FILTRE : sous-chaîne du nom de run (ex: "mmfm3d_unet", "cfm3d")
 #   --all  : sync tous les runs sans demander de confirmation
 #
 # Exemples :
-#   bash src/slurm/sync_from_jeanzay.sh mmfm_unet    # seulement mmfm_unet
-#   bash src/slurm/sync_from_jeanzay.sh cfm3d        # tous les cfm3d
-#   bash src/slurm/sync_from_jeanzay.sh --all        # tout syncer sans confirmation
+#   bash src/slurm/sync_from_jeanzay.sh mmfm3d_unet   # un run spécifique
+#   bash src/slurm/sync_from_jeanzay.sh cfm3d         # tous les cfm3d
+#   bash src/slurm/sync_from_jeanzay.sh --all         # tout sans confirmation
 #
 # Configuration requise :
 #   Copier src/slurm/sync_from_jeanzay.sh.env.example → .sync_env
-#   et y renseigner JEANZAY_USER, PROXY_USER, PROXY_HOST, REMOTE_BASE
+#   et y renseigner JEANZAY_USER et REMOTE_BASE.
 #   Ce fichier est ignoré par git.
 # =============================================================================
 set -euo pipefail
@@ -39,14 +43,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-# ── Configuration de connexion (requiert .sync_env) ──────────────────────────
+# ── Chargement de .sync_env ──────────────────────────────────────────────────
 ENV_FILE="$PROJECT_ROOT/.sync_env"
 if [[ -f "$ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
 fi
 
-# Vérification que les variables obligatoires sont définies
+# Vérification des variables obligatoires
 _check_var() {
     local var_name="$1"
     if [[ -z "${!var_name:-}" ]]; then
@@ -56,23 +60,33 @@ _check_var() {
         echo "  cp src/slurm/sync_from_jeanzay.sh.env.example .sync_env"
         echo "  # Puis éditer .sync_env avec vos identifiants"
         echo ""
-        echo "Ce fichier est ignoré par git (.gitignore)."
+        echo "Pour configurer les clés SSH (connexion sans mot de passe) :"
+        echo "  bash src/slurm/setup_ssh_keys.sh"
         exit 1
     fi
 }
 
-_check_var JEANZAY_USER
-_check_var JEANZAY_HOST
-_check_var PROXY_USER
-_check_var PROXY_HOST
 _check_var REMOTE_BASE
 
-SCP_OPTS="-o ProxyCommand=\"ssh ${PROXY_USER}@${PROXY_HOST} nc %h %p\" -o StrictHostKeyChecking=no -o ConnectTimeout=15"
-REMOTE="${JEANZAY_USER}@${JEANZAY_HOST}"
+# SSH_ALIAS : alias défini dans ~/.ssh/config par setup_ssh_keys.sh
+# Peut être surchargé dans .sync_env si nécessaire.
+SSH_ALIAS="${SSH_ALIAS:-jeanzay}"
+
+# ── Vérification que l'alias SSH est configuré ───────────────────────────────
+if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$SSH_ALIAS" true 2>/dev/null; then
+    echo "[ERREUR] Impossible de se connecter à '$SSH_ALIAS' sans mot de passe."
+    echo ""
+    echo "Configurer les clés SSH en lançant :"
+    echo "  bash src/slurm/setup_ssh_keys.sh"
+    echo ""
+    echo "Ce script dépose votre clé SSH sur le proxy et Jean Zay,"
+    echo "et configure l'alias 'jeanzay' dans ~/.ssh/config."
+    exit 1
+fi
 
 # ── Découverte automatique des runs depuis configs/*.yaml ───────────────────
 mapfile -t ALL_SUBDIRS < <(python3 - <<'PYEOF'
-import yaml, glob, os, re, sys
+import yaml, glob, sys
 
 configs_dir = "configs"
 subdirs = set()
@@ -105,7 +119,9 @@ if [[ -n "$FILTER" ]]; then
         echo "[ERREUR] Aucun run ne correspond au filtre '$FILTER'"
         echo ""
         echo "Runs disponibles (${#ALL_SUBDIRS[@]}) — noms utilisables comme filtre :"
-        for _s in "${ALL_SUBDIRS[@]}"; do printf '  %-45s  (%s)\n' "$(basename "$_s")" "$_s"; done
+        for _s in "${ALL_SUBDIRS[@]}"; do
+            printf '  %-45s  (%s)\n' "$(basename "$_s")" "$_s"
+        done
         exit 1
     fi
 else
@@ -116,38 +132,40 @@ fi
 echo "======================================================================="
 echo " sync_from_jeanzay.sh — Synchronisation depuis Jean Zay"
 echo "======================================================================="
-echo "  Remote  : ${REMOTE}:${REMOTE_BASE}"
-echo "  Proxy   : ${PROXY_USER}@${PROXY_HOST}"
+echo "  SSH alias : $SSH_ALIAS"
+echo "  Remote    : ${SSH_ALIAS}:${REMOTE_BASE}"
 if [[ -n "$FILTER" ]]; then
-    echo "  Filtre  : $FILTER"
+    echo "  Filtre    : $FILTER"
 fi
-echo "  Runs    : ${#SUBDIRS[@]}"
+echo "  Runs      : ${#SUBDIRS[@]}"
 printf '    - %s\n' "${SUBDIRS[@]}"
 echo "======================================================================="
 echo ""
 
 # ── Confirmation si aucun filtre et pas de --all ─────────────────────────────
 if [[ -z "$FILTER" && $FORCE_ALL -eq 0 ]]; then
-    echo "[ATTENTION] Aucun filtre spécifié — ${#SUBDIRS[@]} runs seront tentés."
-    echo "Cela peut prendre plusieurs minutes (une tentative SSH par run)."
+    echo "[ATTENTION] Aucun filtre — ${#SUBDIRS[@]} runs seront tentés."
+    echo "Cela peut prendre plusieurs minutes."
     echo ""
     read -r -p "Continuer ? [o/N] " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[oOyY]$ ]]; then
         echo "Annulé."
         echo ""
-        echo "Conseil : utiliser un filtre pour cibler un run spécifique :"
-        echo "  bash src/slurm/sync_from_jeanzay.sh mmfm_unet"
+        echo "Conseil : utiliser un filtre pour cibler un run :"
+        echo "  bash src/slurm/sync_from_jeanzay.sh mmfm3d_unet"
         exit 0
     fi
     echo ""
 fi
 
-# ── Fonction scp avec gestion d'erreur silencieuse ──────────────────────────
+# ── Fonction scp simplifiée (utilise l'alias ~/.ssh/config) ─────────────────
 _scp() {
     local remote_path="$1"
     local local_dest="$2"
-    eval scp -rp $SCP_OPTS \
-        "${REMOTE}:${remote_path}" \
+    scp -rp \
+        -o ConnectTimeout=15 \
+        -o BatchMode=yes \
+        "${SSH_ALIAS}:${remote_path}" \
         "${local_dest}" 2>/dev/null
 }
 
@@ -191,9 +209,11 @@ done
 echo "── Logs SLURM (logs/*.out + logs/*.err)"
 mkdir -p "$PROJECT_ROOT/logs"
 echo -n "   logs/      ... "
-if eval scp -p $SCP_OPTS \
-    "${REMOTE}:${REMOTE_BASE}/logs/*.out" \
-    "${REMOTE}:${REMOTE_BASE}/logs/*.err" \
+if scp -p \
+    -o ConnectTimeout=15 \
+    -o BatchMode=yes \
+    "${SSH_ALIAS}:${REMOTE_BASE}/logs/*.out" \
+    "${SSH_ALIAS}:${REMOTE_BASE}/logs/*.err" \
     "$PROJECT_ROOT/logs/" 2>/dev/null; then
     N_LOGS=$(find "$PROJECT_ROOT/logs" -name "*.out" -o -name "*.err" | wc -l)
     echo "OK  ($N_LOGS fichiers)"
