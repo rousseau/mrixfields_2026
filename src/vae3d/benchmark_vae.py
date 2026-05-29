@@ -140,7 +140,7 @@ VAE_REGISTRY = [
 
 # RHVAE has a vectorial latent — PatchedVAE is incompatible.
 # For RHVAE we crop/pad the volume to a fixed size and do a single forward pass.
-RHVAE_VOLUME_SIZE = (128, 128, 80)
+RHVAE_VOLUME_SIZE = (128, 128, 128)
 PATCH_SIZE = (112, 128, 80)
 PATCH_OVERLAP = 0.25
 
