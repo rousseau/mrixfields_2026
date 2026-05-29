@@ -379,8 +379,16 @@ def train(
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 recon, z_mu, z_sigma = raw_model(images)
                 recon_loss = F.l1_loss(recon, images)
-                kl_loss = 0.5 * torch.mean(z_mu.pow(2) + z_sigma.exp() - z_sigma - 1.0)
+                # Clamp log-variance to avoid numerical explosion (KL → inf/NaN)
+                z_sigma_clamped = z_sigma.clamp(-30.0, 20.0)
+                kl_loss = 0.5 * torch.mean(z_mu.pow(2) + z_sigma_clamped.exp() - z_sigma_clamped - 1.0)
                 loss = recon_loss + effective_kl * kl_loss
+
+            # Skip batch if loss is non-finite (guard against NaN cascade)
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)

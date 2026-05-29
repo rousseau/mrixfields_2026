@@ -136,12 +136,26 @@ echo "======================================================================="
 MASTER_PORT=$(( 29500 + SLURM_JOB_ID % 1000 ))
 
 # Routing vers le script d'entraînement selon le type de VAE
-if [[ "$VAE_TYPE" == "pythae_vae" ]]; then
-    TRAIN_SCRIPT="src/vae3d/train_pythae_vae.py"
-elif [[ "$VAE_TYPE" == "pythae_vqvae" ]]; then
-    TRAIN_SCRIPT="src/vae3d/train_pythae_vqvae.py"
-elif [[ "$VAE_TYPE" == "pythae_rhvae" ]]; then
-    TRAIN_SCRIPT="src/vae3d/train_pythae_rhvae.py"
+if [[ "$VAE_TYPE" == "pythae_vae" || "$VAE_TYPE" == "pythae_vqvae" || "$VAE_TYPE" == "pythae_rhvae" ]]; then
+    # Pour les VAE Pythae, total_epochs est défini dans le YAML — ne pas passer --steps
+    if [[ "$VAE_TYPE" == "pythae_vae" ]];    then TRAIN_SCRIPT="src/vae3d/train_pythae_vae.py"
+    elif [[ "$VAE_TYPE" == "pythae_vqvae" ]]; then TRAIN_SCRIPT="src/vae3d/train_pythae_vqvae.py"
+    else                                          TRAIN_SCRIPT="src/vae3d/train_pythae_rhvae.py"
+    fi
+    torchrun \
+        --nproc_per_node=4 \
+        --nnodes=1 \
+        --node_rank=0 \
+        --master_addr=localhost \
+        --master_port="$MASTER_PORT" \
+        "$TRAIN_SCRIPT" \
+        --config "$CONFIG" \
+        --env remote \
+        --run-name "$RUN_NAME" \
+        --batch-size "$BATCH_SIZE" \
+        --lr "$LR" \
+        ${RESUME:+--resume "$RESUME"}
+    exit $?
 elif [[ "$VAE_TYPE" == "medvae_finetune" ]]; then
     # train_maisi_finetune.py n'accepte pas --run-name ni --steps
     torchrun \
