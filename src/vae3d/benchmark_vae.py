@@ -56,8 +56,8 @@ VAE_REGISTRY = [
                 "vae_config": "configs/vae3d_multimodal.yaml",
             }
         },
-        True,   # partial: stopped at ~ep100/200
-        "ep~100",
+        False,  # updated checkpoint
+        "ep~200",
     ),
     (
         "Pythae_VAE",
@@ -69,7 +69,7 @@ VAE_REGISTRY = [
                 "vae_config": "configs/pythae_vae_multimodal.yaml",
             }
         },
-        True,   # partial: ep100/200
+        False,  # updated checkpoint
         "ep100",
     ),
     (
@@ -82,7 +82,7 @@ VAE_REGISTRY = [
                 "vae_config": "configs/pythae_vqvae_multimodal.yaml",
             }
         },
-        True,   # partial: ep90/200
+        False,  # updated checkpoint
         "ep90",
     ),
     (
@@ -95,8 +95,8 @@ VAE_REGISTRY = [
                 "vae_config": "configs/pythae_rhvae_multimodal.yaml",
             }
         },
-        True,   # partial: in progress on Jean Zay
-        "partial",
+        False,  # updated checkpoint
+        "epoch100",
     ),
     (
         "MedVAE_frozen",
