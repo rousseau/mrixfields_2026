@@ -30,7 +30,7 @@ class PatchedVAE(nn.Module):
         patch_size: Tuple[int, int, int] = (112, 128, 80),
         stride: Optional[Tuple[int, int, int]] = None,
         overlap: float = 0.25,
-        blend_mode: str = "gaussian",
+        blend_mode: str = "ones",
     ):
         """
         Args:
@@ -54,6 +54,9 @@ class PatchedVAE(nn.Module):
         self.register_buffer(
             "blend_weights", self._create_blend_weights(patch_size, blend_mode)
         )
+
+        # Store blend mode for reference
+        self.blend_mode = blend_mode
 
     def _create_blend_weights(
         self, size: Tuple[int, int, int], mode: str
@@ -110,7 +113,7 @@ class PatchedVAE(nn.Module):
         # Handle boundaries with padding
         # Right/bottom/depth boundaries
         for i in range(0, h - ph + 1, sh):
-            for j in range(0, w - ph + 1, sw):
+            for j in range(0, w - pw + 1, sw):
                 if d + pd > x.shape[4]:  # depth boundary
                     i_start = max(0, h - ph)
                     j_start = max(0, w - pw)

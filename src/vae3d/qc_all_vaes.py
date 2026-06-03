@@ -85,24 +85,26 @@ def reconstruct_volume(
 def make_qc_figure(
     subject: str,
     modality: str,
-    originals: Dict[str, Optional[np.ndarray]],   # field → vol
-    reconstructions: Dict[str, Dict[str, Optional[np.ndarray]]],  # vae → {field → recon}
+    originals: Dict[str, Optional[np.ndarray]],
+    reconstructions: Dict[str, Dict[str, Optional[np.ndarray]]],
     output_path: Path,
 ) -> None:
     """Generate and save a QC figure."""
     vae_names = list(reconstructions.keys())
     fields = list(DOMAINS)
 
-    n_rows = 1 + len(vae_names)   # first row = originals, then one row per VAE
+    n_rows = 1 + len(vae_names)
     n_cols = len(fields)
 
-    fig_w = max(16, n_cols * 2.2)
-    fig_h = max(10, n_rows * 2.2)
+    fig_w = max(18, n_cols * 2.2 + 3)
+    fig_h = max(12, n_rows * 2.2)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h))
     if n_rows == 1:
         axes = axes[np.newaxis, :]
 
-    fig.suptitle(f"VAE Reconstruction QC — {modality} sub-{subject}", fontsize=13, y=1.0)
+    fig.suptitle(f"VAE Reconstruction QC — {modality} sub-{subject}", fontsize=13, y=0.98)
+
+    row_labels = ["Original"] + [v.replace("_", " ") for v in vae_names]
 
     def _show(ax: plt.Axes, vol: Optional[np.ndarray], title: str = "") -> None:
         if vol is None:
@@ -117,21 +119,26 @@ def make_qc_figure(
         ax.axis("off")
 
     # Row 0 — originals
-    axes[0, 0].set_ylabel("Original", fontsize=8, rotation=0, labelpad=40, va="center")
     for j, field in enumerate(fields):
         _show(axes[0, j], originals.get(field), title=field)
 
     # Rows 1+ — reconstructions
     for i, vae_name in enumerate(vae_names):
         row = i + 1
-        axes[row, 0].set_ylabel(vae_name, fontsize=7, rotation=0, labelpad=40, va="center")
         recon_dict = reconstructions[vae_name]
         for j, field in enumerate(fields):
             _show(axes[row, j], recon_dict.get(field))
 
-    plt.tight_layout()
+    # Add row labels using fig.text (robust)
+    for row_idx, label in enumerate(row_labels):
+        y_pos = 1.0 - (row_idx + 0.5) / n_rows
+        fig.text(0.01, y_pos, label, fontsize=8, rotation=0,
+                 va="center", ha="left", fontweight="bold")
+
+    fig.subplots_adjust(left=0.18, right=0.98, bottom=0.02, top=0.92,
+                        wspace=0.05, hspace=0.15)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(output_path), dpi=120, bbox_inches="tight")
+    fig.savefig(str(output_path), dpi=120)
     plt.close(fig)
     print(f"  Saved: {output_path}")
 
