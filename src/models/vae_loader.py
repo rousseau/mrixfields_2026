@@ -480,9 +480,34 @@ def _load_medvae_disentangle(vae_cfg: dict, device: torch.device) -> MedVAEDisen
 # --------------------------------------------------------------------------- #
 
 
+def _resolve_pythae_vae_cfg(vae_cfg: dict, default_cfg_path: str) -> dict:
+    """Merge vae_cfg with YAML vae section when available.
+
+    Precedence: explicit keys in `vae_cfg` override YAML values.
+    """
+    merged = dict(vae_cfg)
+    cfg_path = vae_cfg.get("vae_config", default_cfg_path)
+    if not os.path.isabs(cfg_path):
+        project_root = Path(__file__).resolve().parents[2]
+        cfg_path = str(project_root / cfg_path)
+
+    if Path(cfg_path).exists():
+        with open(cfg_path) as f:
+            raw = yaml.safe_load(f) or {}
+        yaml_vae = raw.get("vae", {}) if isinstance(raw, dict) else {}
+        for k, v in yaml_vae.items():
+            merged.setdefault(k, v)
+    else:
+        print(f"  [WARN] Pythae config not found: {cfg_path} (using vae_cfg/defaults)")
+
+    return merged
+
+
 def _load_pythae_vae(vae_cfg: dict, device: torch.device):
     """Load a Pythae VAE 3D (PythaeVAE3D wrapper)."""
     from models.pythae_vae import build_pythae_vae_3d, PythaeVAE3D
+
+    vae_cfg = _resolve_pythae_vae_cfg(vae_cfg, "configs/pythae_vae_multimodal.yaml")
 
     latent_channels = int(vae_cfg.get("latent_channels", 8))
     base_channels = int(vae_cfg.get("base_channels", 32))
@@ -498,6 +523,8 @@ def _load_pythae_vae(vae_cfg: dict, device: torch.device):
     if ckpt_path and Path(ckpt_path).exists():
         state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state = state.get("model", state)
+        if state and all(k.startswith("module.") for k in state.keys()):
+            state = {k[len("module.") :]: v for k, v in state.items()}
         model.load_state_dict(state, strict=True)
         print(f"  Pythae VAE 3D loaded from {ckpt_path}")
     else:
@@ -514,6 +541,8 @@ def _load_pythae_vae(vae_cfg: dict, device: torch.device):
 def _load_pythae_vqvae(vae_cfg: dict, device: torch.device):
     """Load a Pythae VQ-VAE 3D (PythaeVQVAE3D wrapper)."""
     from models.pythae_vqvae import build_pythae_vqvae_3d, PythaeVQVAE3D
+
+    vae_cfg = _resolve_pythae_vae_cfg(vae_cfg, "configs/pythae_vqvae_multimodal.yaml")
 
     latent_channels = int(vae_cfg.get("latent_channels", 8))
     base_channels = int(vae_cfg.get("base_channels", 32))
@@ -539,6 +568,8 @@ def _load_pythae_vqvae(vae_cfg: dict, device: torch.device):
     if ckpt_path and Path(ckpt_path).exists():
         state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state = state.get("model", state)
+        if state and all(k.startswith("module.") for k in state.keys()):
+            state = {k[len("module.") :]: v for k, v in state.items()}
         model.load_state_dict(state, strict=True)
         print(f"  Pythae VQ-VAE 3D loaded from {ckpt_path}")
     else:
@@ -556,12 +587,14 @@ def _load_pythae_rhvae(vae_cfg: dict, device: torch.device):
     """Load a Pythae RHVAE 3D (PythaeRHVAE3D wrapper)."""
     from models.pythae_rhvae import build_pythae_rhvae_3d
 
+    vae_cfg = _resolve_pythae_vae_cfg(vae_cfg, "configs/pythae_rhvae_multimodal.yaml")
+
     latent_dim     = int(vae_cfg.get("latent_dim", 256))
     base_channels  = int(vae_cfg.get("base_channels", 32))
     num_groups     = int(vae_cfg.get("num_groups", 8))
     spatial_size   = int(vae_cfg.get("spatial_size", 16))
     n_lf           = int(vae_cfg.get("n_lf", 3))
-    eps_lf         = float(vae_cfg.get("eps_lf", 0.001))
+    eps_lf         = float(vae_cfg.get("eps_lf", 0.01))
     beta_zero      = float(vae_cfg.get("beta_zero", 0.3))
     temperature    = float(vae_cfg.get("temperature", 1.5))
     regularization = float(vae_cfg.get("regularization", 0.01))
@@ -582,6 +615,8 @@ def _load_pythae_rhvae(vae_cfg: dict, device: torch.device):
     if ckpt_path and Path(ckpt_path).exists():
         state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state = state.get("model", state)
+        if state and all(k.startswith("module.") for k in state.keys()):
+            state = {k[len("module.") :]: v for k, v in state.items()}
         model.load_state_dict(state, strict=True)
         print(f"  Pythae RHVAE 3D loaded from {ckpt_path}")
     else:

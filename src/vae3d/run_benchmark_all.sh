@@ -20,6 +20,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# Ajouter le dossier src au PYTHONPATH pour permettre les imports de 'common' et 'models'
+export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/src"
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 MAX_SAMPLES=2
 SKIP_MEDVAE_FROZEN=0
@@ -34,9 +37,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Paths (relatifs à la racine du projet) ────────────────────────────────────
-AEKL_CKPT="outputs/vae3d/runs/vae3d_T1W_jeanzay/weights/model_final.pth"
-VQVAE_CKPT="outputs/vqvae3d/runs/vqvae_final/weights/model_best.pth"
-MEDVAE_FT_CKPT="outputs/medvae/runs/medvae_finetune_all/weights/model_final.pth"
 OUT_DIR="results/benchmark"
 
 SCRIPT="src/vae3d/benchmark_vae.py"
@@ -44,14 +44,16 @@ SCRIPT="src/vae3d/benchmark_vae.py"
 mkdir -p "$OUT_DIR"
 
 # ── Common args ───────────────────────────────────────────────────────────────
-COMMON_ARGS="--aekl-ckpt $AEKL_CKPT \
-             --vqvae-ckpt $VQVAE_CKPT \
-             --medvae-finetuned-ckpt $MEDVAE_FT_CKPT \
-             --output-dir $OUT_DIR \
-             --max-samples $MAX_SAMPLES"
+# benchmark_vae.py ne prend pas de checkpoints en CLI : ils sont définis dans
+# son VAE_REGISTRY. On garde --samples via sous-sélection des sujets.
+SUBJECTS=(0006 0007 0009)
+if [[ "$MAX_SAMPLES" =~ ^[0-9]+$ ]] && [[ "$MAX_SAMPLES" -gt 0 ]]; then
+    SUBJECTS=("${SUBJECTS[@]:0:$MAX_SAMPLES}")
+fi
+COMMON_ARGS="--output-dir $OUT_DIR --subjects ${SUBJECTS[*]}"
 
 if [[ $SKIP_MEDVAE_FROZEN -eq 1 ]]; then
-    COMMON_ARGS="$COMMON_ARGS --skip-medvae"
+    COMMON_ARGS="$COMMON_ARGS --vae AEKL_multimodal Pythae_VAE Pythae_VQVAE Pythae_RHVAE MedVAE_finetuned NV_Generate"
 fi
 
 echo "============================================================"
@@ -65,7 +67,7 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 for FIELD in 0.1T 1.5T 3T 5T 7T; do
     echo "──── T1W / $FIELD ────────────────────────────────────────────"
-    python $SCRIPT --modality T1W --field $FIELD $COMMON_ARGS
+    python $SCRIPT --modalities T1W --fields $FIELD $COMMON_ARGS
     echo ""
 done
 
@@ -73,14 +75,14 @@ done
 # T2W — champ 3T représentatif (skip AEKL : non entraîné sur T2W)
 # ─────────────────────────────────────────────────────────────────────────────
 echo "──── T2W / 3T ────────────────────────────────────────────────"
-python $SCRIPT --modality T2W --field 3T --skip-aekl $COMMON_ARGS
+python $SCRIPT --modalities T2W --fields 3T $COMMON_ARGS
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # T2FLAIR — champ 3T représentatif (skip AEKL : non entraîné sur T2FLAIR)
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────
 echo "──── T2FLAIR / 3T ────────────────────────────────────────────"
-python $SCRIPT --modality T2FLAIR --field 3T --skip-aekl $COMMON_ARGS
+python $SCRIPT --modalities T2FLAIR --fields 3T $COMMON_ARGS
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ Evaluates encode-decode cycle for all VAE architectures on Training_prospective
 subjects (0006, 0007, 0009) across all modalities and field strengths.
 
 Metrics : MAE, MSE, SSIM (slice-wise axial), nRMSE, LPIPS (slice-wise axial)
-Output  : results/benchmark_prospective/benchmark_results.csv
+Output  : results/benchmark_vae/metrics/benchmark_results.csv
           one row per (vae, modality, field, subject)
 
 Usage:
@@ -23,128 +23,32 @@ import warnings
 from pathlib import Path
 from typing import Dict, List, Optional
 
-warnings.filterwarnings("ignore")
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+
+# Ensure project-local imports work when running:
+#   python src/vae3d/benchmark_vae.py
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from common.io import DOMAINS, MODALITIES, normalize_volume
 from common.metrics import compute_nrmse, compute_ssim, compute_lpips
 from models.vae_loader import load_vae
 from utils.patched_vae import PatchedVAE
+from models.registry import VAE_REGISTRY, PROSPECTIVE_SUBJECTS, RHVAE_VOLUME_SIZE, PATCH_SIZE, PATCH_OVERLAP
 
-# ---------------------------------------------------------------------------
-# VAE registry
-# Each entry: (display_name, vae_cfg_dict, partial_flag, epoch_info)
-# partial=True means the checkpoint is from an unfinished training run.
-# ---------------------------------------------------------------------------
+# VAE Registry moved to src/models/registry.py
+
+# RHVAE has a vectorial latent — PatchedVAE is incompatible.
+# For RHVAE we crop/pad the volume to a fixed size and do a single forward pass.
+# These constants are now managed in src/models/registry.py
 
 DATA_ROOT_DEFAULT = "/home/rousseau/Data/MRIxFields_20260414"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-VAE_REGISTRY = [
-    # name, cfg, partial, epoch
-    (
-        "AEKL_multimodal",
-        {
-            "vae": {
-                "vae_type": "aekl",
-                "source": "local",
-                "checkpoint": "outputs/vae3d/runs/vae3d_multimodal/weights/model_best.pth",
-                "vae_config": "configs/vae3d_multimodal.yaml",
-            }
-        },
-        False,  # updated checkpoint
-        "ep~200",
-    ),
-    (
-        "Pythae_VAE",
-        {
-            "vae": {
-                "vae_type": "pythae_vae",
-                "source": "local",
-                "checkpoint": "outputs/pythae_vae3d/runs/pythae_vae3d_multimodal/weights/model_best.pth",
-                "vae_config": "configs/pythae_vae_multimodal.yaml",
-            }
-        },
-        False,  # updated checkpoint
-        "ep100",
-    ),
-    (
-        "Pythae_VQVAE",
-        {
-            "vae": {
-                "vae_type": "pythae_vqvae",
-                "source": "local",
-                "checkpoint": "outputs/pythae_vqvae3d/runs/pythae_vqvae3d_multimodal/weights/model_best.pth",
-                "vae_config": "configs/pythae_vqvae_multimodal.yaml",
-            }
-        },
-        False,  # updated checkpoint
-        "ep90",
-    ),
-    (
-        "Pythae_RHVAE",
-        {
-            "vae": {
-                "vae_type": "pythae_rhvae",
-                "source": "local",
-                "checkpoint": "outputs/pythae_rhvae3d/runs/pythae_rhvae3d_multimodal/weights/model_best.pth",
-                "vae_config": "configs/pythae_rhvae_multimodal.yaml",
-            }
-        },
-        False,  # updated checkpoint
-        "epoch100",
-    ),
-    (
-        "MedVAE_frozen",
-        {
-            "vae": {
-                "vae_type": "medvae",
-                "source": "frozen",
-                "model_name": "medvae_4_1_3d",
-            }
-        },
-        False,
-        "pretrained",
-    ),
-    (
-        "MedVAE_finetuned",
-        {
-            "vae": {
-                "vae_type": "medvae_finetune",
-                "source": "local",
-                "model_name": "medvae_4_1_3d",
-                "frozen": True,
-                "checkpoint": "outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth",
-            }
-        },
-        False,
-        "20k_steps",
-    ),
-    (
-        "NV_Generate",
-        {
-            "vae": {
-                "vae_type": "maisi",
-                "source": "nvgenerate",
-                "checkpoint": "outputs/nvgenerate/models/autoencoder_v2.pt",
-            }
-        },
-        False,
-        "ep351",
-    ),
-]
-
-# RHVAE has a vectorial latent — PatchedVAE is incompatible.
-# For RHVAE we crop/pad the volume to a fixed size and do a single forward pass.
-RHVAE_VOLUME_SIZE = (128, 128, 128)
-PATCH_SIZE = (112, 128, 80)
-PATCH_OVERLAP = 0.25
-
-PROSPECTIVE_SUBJECTS = ["0006", "0007", "0009"]
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +98,41 @@ def crop_or_pad(vol: np.ndarray, target: tuple) -> np.ndarray:
     return out
 
 
+def save_reconstruction_figure(
+    orig: np.ndarray,
+    recon: np.ndarray,
+    output_path: Path,
+    title: str,
+) -> None:
+    """Save an incremental qualitative figure (orig vs recon, 3 orthogonal views)."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    h, w, d = orig.shape
+    mh, mw, md = h // 2, w // 2, d // 2
+
+    fig, axes = plt.subplots(3, 2, figsize=(8, 10))
+    fig.suptitle(title, fontsize=11)
+
+    views = [
+        (orig[mh, :, :], recon[mh, :, :], "Axial"),
+        (orig[:, mw, :], recon[:, mw, :], "Coronal"),
+        (orig[:, :, md], recon[:, :, md], "Sagittal"),
+    ]
+
+    for i, (o_slice, r_slice, name) in enumerate(views):
+        axes[i, 0].imshow(o_slice, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[i, 0].set_title(f"{name} - original")
+        axes[i, 0].axis("off")
+
+        axes[i, 1].imshow(r_slice, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[i, 1].set_title(f"{name} - recon")
+        axes[i, 1].axis("off")
+
+    plt.tight_layout(rect=[0, 0.02, 1, 0.96])
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # Per-volume inference
 # ---------------------------------------------------------------------------
@@ -208,12 +147,12 @@ def encode_decode(
     if use_patched:
         vae_wrapped = PatchedVAE(vae, patch_size=PATCH_SIZE, overlap=PATCH_OVERLAP)
         vae_wrapped = vae_wrapped.to(device)
-        x = torch.from_numpy(vol).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W,D)
+        x = torch.from_numpy(vol).unsqueeze(0).unsqueeze(0).to(device)
         with torch.no_grad():
             result = vae_wrapped.forward(x, encode_only=False, batch_size=1)
         xhat = result["reconstruction"].squeeze().cpu().numpy()
     else:
-        # RHVAE: crop to fixed size, single forward pass
+        # Single forward pass for all non-patched inference (spatial + vector latents)
         vol_crop = crop_or_pad(vol, RHVAE_VOLUME_SIZE)
         x = torch.from_numpy(vol_crop).unsqueeze(0).unsqueeze(0).to(device)
         with torch.no_grad():
@@ -308,9 +247,13 @@ def run_benchmark(
         for modality in modalities:
             for field in fields:
                 for subject in subjects:
+                    # --- Visual check: skip if image already exists ---
+                    visual_dir = output_dir.parent / "benchmark_visuals" / vae_name / modality / field
+                    visual_path = visual_dir / f"{subject}.png"
+                    
                     key = (vae_name, modality, field, subject)
-                    if key in existing_keys:
-                        print(f"  skip {modality}/{field}/sub{subject} (already in CSV)")
+                    if key in existing_keys and visual_path.exists():
+                        print(f"  skip {modality}/{field}/sub{subject} (already processed)")
                         continue
 
                     vol = load_prospective_volume(data_root, modality, field, subject)
@@ -322,12 +265,17 @@ def run_benchmark(
                     try:
                         orig, recon = encode_decode(vae, vol, device, use_patched)
                         elapsed = time.time() - t0
+                        
+                        # --- Generate and save figure immediately ---
+                        title = f"{vae_name} | {modality} | {field} | Sub {subject}"
+                        save_reconstruction_figure(orig, recon, visual_path, title)
+                        
                         m = compute_all_metrics(orig, recon, device, skip_lpips)
                         print(
                             f"  {modality}/{field}/sub{subject}: "
                             f"MAE={m['mae']:.4f} SSIM={m['ssim']:.4f} "
                             f"nRMSE={m['nrmse']:.4f} LPIPS={m['lpips']:.4f} "
-                            f"t={elapsed:.1f}s"
+                            f"t={elapsed:.1f}s | Image saved"
                         )
                         writer.writerow({
                             "vae": vae_name,
@@ -401,7 +349,7 @@ def main():
     parser.add_argument("--modalities", nargs="+", default=list(MODALITIES))
     parser.add_argument("--fields", nargs="+", default=list(DOMAINS))
     parser.add_argument("--subjects", nargs="+", default=PROSPECTIVE_SUBJECTS)
-    parser.add_argument("--output-dir", default="results/benchmark_prospective")
+    parser.add_argument("--output-dir", default="results/benchmark_vae/metrics")
     parser.add_argument("--device", default=None)
     parser.add_argument("--skip-lpips", action="store_true",
                         help="Skip LPIPS computation (fast debug mode)")

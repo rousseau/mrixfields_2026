@@ -20,7 +20,7 @@ Usage :
   python src/cfm/run_inference_viz_cfm3d.py \\
       --config   configs/cfm3d_T1W_medvae_0p1T_7T.yaml \\
       --checkpoint outputs/cfm3d/runs/cfm3d_T1W_medvae_0p1T_7T/weights/model_final.pth \\
-      --output   results/qc/cfm3d_0p1T_7T \\
+      --output   results/cfm/visuals/cfm3d_0p1T_7T \\
       --n-steps  50
 """
 
@@ -531,7 +531,7 @@ def main():
         "--input-7t",
         default="/home/rousseau/Data/MRIxFields_20260414/Training_prospective/T1W/7T",
     )
-    parser.add_argument("--output", default="results/qc/cfm3d_0p1T_7T")
+    parser.add_argument("--output", default="results/cfm/visuals/cfm3d_0p1T_7T")
     parser.add_argument("--n-steps", type=int, default=50)
     parser.add_argument("--n-subjects", type=int, default=3)
     args = parser.parse_args()

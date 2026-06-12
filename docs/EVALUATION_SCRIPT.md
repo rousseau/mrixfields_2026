@@ -118,8 +118,8 @@ Résultats — aekl_cfm3d (15 sujets)
 ============================================================
 
 Résultats sauvegardés: results/evaluation_table.csv
-Résumé JSON sauvegardé: results/qc/aekl_cfm3d_summary.json
-Détails sauvegardés: results/qc/aekl_cfm3d_results.csv
+Résumé JSON sauvegardé: results/cfm/visuals/aekl_cfm3d_summary.json
+Détails sauvegardés: results/cfm/visuals/aekl_cfm3d_results.csv
 
 ✅ Évaluation terminée.
 ```

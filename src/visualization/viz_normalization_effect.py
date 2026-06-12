@@ -9,7 +9,7 @@ prospectifs 0006, 0007, 0009 — Training_prospective.
   - Annotation dans chaque case : valeurs p0.5 et p99.5 brutes,
     et dynamique (p99.5 − p0.5)
 
-Sortie : results/qc/normalization_effect/norm_{T1W,T2W,T2FLAIR}.png
+Sortie : results/benchmark_vae/analysis/normalization_effect/norm_{T1W,T2W,T2FLAIR}.png
 
 Usage :
   python src/visualization/viz_normalization_effect.py
@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 
 # ── Chemins ─────────────────────────────────────────────────────────────────
 ROOT = Path("/home/rousseau/Data/MRIxFields_20260414/Training_prospective")
-OUT = Path("results/qc/normalization_effect")
+OUT = Path("results/benchmark_vae/analysis/normalization_effect")
 OUT.mkdir(parents=True, exist_ok=True)
 
 # ── Paramètres ───────────────────────────────────────────────────────────────

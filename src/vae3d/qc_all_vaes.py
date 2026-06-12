@@ -10,7 +10,7 @@ Layout per figure:
   cols = fields (0.1T, 1.5T, 3T, 5T, 7T) × 2 (original | recon)
   Top header row shows originals only.
 
-Output: results/qc/qc_{modality}_{subject}.png
+Output: results/benchmark_vae/visuals/qc_{modality}_{subject}.png
 
 Usage:
     PYTHONPATH=src python src/vae3d/qc_all_vaes.py [--device cuda] [--modalities T1W]
@@ -211,7 +211,7 @@ def main() -> None:
     parser.add_argument("--data-root", default=DATA_ROOT_DEFAULT)
     parser.add_argument("--modalities", nargs="+", default=list(MODALITIES))
     parser.add_argument("--subjects", nargs="+", default=PROSPECTIVE_SUBJECTS)
-    parser.add_argument("--output-dir", default="results/qc")
+    parser.add_argument("--output-dir", default="results/benchmark_vae/visuals")
     parser.add_argument("--device", default=None)
     parser.add_argument("--vae", nargs="+", default=None,
                         help="Run only these VAEs")

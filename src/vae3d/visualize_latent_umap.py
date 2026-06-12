@@ -11,12 +11,12 @@ Usage:
         --checkpoint outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth \\
         --config configs/vae3d_multimodal.yaml \\
         --env local \\
-        --output results/qc/umap_aekl_multimodal.png \\
+        --output results/benchmark_vae/analysis/umap_aekl_multimodal.png \\
         [--n-per-combo 1]   # volumes per (modality, field) combo
 
     python src/vae3d/visualize_latent_umap.py \\
         --vae-type medvae \\
-        --output results/qc/umap_medvae_frozen.png
+        --output results/benchmark_vae/analysis/umap_medvae_frozen.png
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ def main():
                         help="Path to YAML config used during training")
     parser.add_argument("--env", default="local",
                         help="Environment: local | remote")
-    parser.add_argument("--output", default="results/qc/umap_latent.png",
+    parser.add_argument("--output", default="results/benchmark_vae/analysis/umap_latent.png",
                         help="Output PNG path")
     parser.add_argument("--data-root", default=None,
                         help="Override data root directory")

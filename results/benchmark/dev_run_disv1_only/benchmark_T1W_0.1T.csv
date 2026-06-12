@@ -1,2 +1,0 @@
-VAE,MAE,MSE,SSIM,Time(s),N_Samples,Status
-MedVAE disentanglement v1,0.8842,0.9334,0.1170,249.35,1,OK

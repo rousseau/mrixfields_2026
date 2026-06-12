@@ -9,7 +9,7 @@
 #   sbatch src/slurm/train_vae_jeanzay.slurm <VAE_TYPE> [CONFIG] [RUN_NAME]
 #
 # Arguments :
-#   VAE_TYPE  : aekl | medvae | medvae_finetune | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae  (obligatoire)
+#   VAE_TYPE  : aekl | medvae | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae  (obligatoire)
 #   CONFIG    : chemin config YAML       (défaut : configs/vae3d_multimodal.yaml)
 #   RUN_NAME  : sous-répertoire de sortie (défaut : {VAE_TYPE}_multimodal_remote)
 #
@@ -55,9 +55,9 @@ if [[ -z "$VAE_TYPE" ]]; then
     exit 1
 fi
 case "$VAE_TYPE" in
-    aekl|medvae|medvae_finetune|vqvae|pythae_vae|pythae_vqvae|pythae_rhvae) ;;
+    aekl|medvae|vqvae|pythae_vae|pythae_vqvae|pythae_rhvae) ;;
     *)
-        echo "[ERREUR] VAE_TYPE invalide : $VAE_TYPE  (aekl | medvae | medvae_finetune | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae)"
+        echo "[ERREUR] VAE_TYPE invalide : $VAE_TYPE  (aekl | medvae | vqvae | pythae_vae | pythae_vqvae | pythae_rhvae)"
         exit 1
         ;;
 esac
@@ -102,7 +102,7 @@ case "$VAE_TYPE" in
     pythae_vae|pythae_vqvae|pythae_rhvae)
         _check_import pythae pythae
         ;;
-    medvae|medvae_finetune)
+    medvae)
         _check_import medvae medvae
         # Vérifier que les poids MedVAE sont en cache HuggingFace local
         python3 -c "
@@ -155,18 +155,6 @@ if [[ "$VAE_TYPE" == "pythae_vae" || "$VAE_TYPE" == "pythae_vqvae" || "$VAE_TYPE
         --batch-size "$BATCH_SIZE" \
         --lr "$LR" \
         ${RESUME:+--resume "$RESUME"}
-    exit $?
-elif [[ "$VAE_TYPE" == "medvae_finetune" ]]; then
-    # train_maisi_finetune.py n'accepte pas --run-name ni --steps
-    torchrun \
-        --nproc_per_node=4 \
-        --nnodes=1 \
-        --node_rank=0 \
-        --master_addr=localhost \
-        --master_port="$MASTER_PORT" \
-        src/vae3d/train_maisi_finetune.py \
-        --config "$CONFIG" \
-        --env remote
     exit $?
 else
     TRAIN_SCRIPT="src/vae3d/train_vae_3d.py"

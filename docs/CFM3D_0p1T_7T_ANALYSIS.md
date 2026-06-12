@@ -260,8 +260,8 @@
 
 ### Inference
 - **Script**: `src/cfm/run_inference_viz_cfm3d.py`
-- **Predictions**: `results/qc/cfm3d_0p1T_7T/predictions/`
-- **Visuals**: `results/qc/cfm3d_0p1T_7T/figures/`
+- **Predictions**: `results/cfm/visuals/cfm3d_0p1T_7T/predictions/`
+- **Visuals**: `results/cfm/visuals/cfm3d_0p1T_7T/figures/`
 
 ### VAE Weights
 - **Checkpoint**: `outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth`

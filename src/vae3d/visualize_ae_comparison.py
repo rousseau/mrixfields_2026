@@ -396,7 +396,7 @@ def main():
         default="outputs/medvae/runs/medvae_finetune_all/weights/model_final.pth",
     )
     parser.add_argument("--medvae-model-name", default="medvae_4_1_3d")
-    parser.add_argument("--output-dir", default="results/qc/ae_comparison")
+    parser.add_argument("--output-dir", default="results/benchmark_vae/comparisons")
     parser.add_argument("--device", default=None)
     parser.add_argument(
         "--dpi",

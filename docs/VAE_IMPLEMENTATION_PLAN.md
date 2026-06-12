@@ -172,8 +172,8 @@ docs/VAE_IMPLEMENTATION_PLAN.md         ← Phase E done
 ```
 src/models/maisi_vae.py                     ← NEW: MedVAEFineTuneWrapper + build_medvae_wrapper()
 src/models/vae_loader.py                    ← MODIFIED: _load_medvae_finetune, routing medvae_finetune
-configs/medvae_finetune_multimodal.yaml     ← NEW: patch (112,128,80), decoder_only freeze mode
-src/vae3d/train_maisi_finetune.py           ← NEW: train/val loop, eval frozen, CLI --frozen/--lr
+configs/medvae_finetune_multimodal.yaml     ← ABANDONNÉ (remplacé par medvae_finetune_all, fine-tuning complet)
+src/vae3d/train_maisi_finetune.py           ← ABANDONNÉ (remplacé par finetune_medvae.py)
 src/slurm/train_vae_jeanzay.slurm          ← MODIFIED: routing medvae_finetune + _pip_install
 src/slurm/finetune_medvae_jeanzay.slurm    ← MODIFIED: _pip_install migration
 src/slurm/cfm_3d_jeanzay.slurm             ← MODIFIED: _pip_install migration

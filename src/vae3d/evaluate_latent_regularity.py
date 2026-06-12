@@ -19,7 +19,7 @@ Usage:
         --checkpoint outputs/vae3d/runs/vae3d_T1W/weights/model_best.pth \\
         --config configs/vae3d_multimodal.yaml \\
         --env local \\
-        --output results/benchmark_comparison/latent_regularity_aekl.csv
+        --output results/benchmark_vae/analysis/latent_regularity_aekl.csv
 """
 
 from __future__ import annotations
@@ -180,7 +180,7 @@ def main():
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--config", default=None)
     parser.add_argument("--env", default="local")
-    parser.add_argument("--output", default="results/benchmark_comparison/latent_regularity.csv")
+    parser.add_argument("--output", default="results/benchmark_vae/analysis/latent_regularity.csv")
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--patch-size", type=int, nargs=3, default=[128, 128, 128],
                         metavar=("H", "W", "D"))

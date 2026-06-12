@@ -263,7 +263,7 @@ python src/evaluation/evaluate.py --method stargan2d \
 python src/evaluation/evaluate.py --help
 ```
 
-Les figures sont sauvegardées dans `results/qc/<methode>_<sujet>_<modalite>.png` et montrent la traduction entre les 5 champs pour les 3 vues (axiale, coronale, sagittale).
+Les figures sont sauvegardées dans `results/{stargan,cfm,mmfm}/visuals/<methode>_<sujet>_<modalite>.png` et montrent la traduction entre les 5 champs pour les 3 vues (axiale, coronale, sagittale).
 
 ### Évaluation quantitative
 
@@ -450,7 +450,7 @@ mrixfields_2026/
 | 2 | VQ-VAE NeuroQuant (T1W) | ✅ Smoke tests | `vqvae3d/runs/smoke_*` |
 | 2 | MedVAE frozen | ⏳ À évaluer | poids HuggingFace |
 | 2 | MedVAE fine-tuné | ⏳ À lancer | — |
-| 2 | Benchmark VAE | ✅ Partiel | `results/benchmark_comparison/` (3T max) |
+| 2 | Benchmark VAE | ✅ Partiel | `results/benchmark_vae/metrics/` |
 | 3 | OT-CFM 3D + MedVAE (T1W) | ⏳ À lancer | `cfm3d_T1W_medvae/weights/` |
 | 3 | OT-CFM 3D + AEKL (T1W) | ⏳ Comparatif | `cfm3d_T1W_aekl/weights/` |
 | 3 | OT-CFM 3D + VQ-VAE (T1W) | ⏳ Comparatif | `cfm3d_T1W_vqvae/weights/` |
