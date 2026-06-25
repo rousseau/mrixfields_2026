@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Unified metrics computation for MRIxFields.
+"""Internal/QC metrics for MRIxFields (mirror of official evaluator).
+
+⚠️ IMPORTANT — This module is intended for **internal development and QC only**.
+The functions below are line-for-line mirrors of the official challenge evaluator:
+
+    ~/Code/MRIxFields2026/Evaluation/evaluate.py
+
+For any submission / paper / final evaluation, ALWAYS use the official evaluator
+through the wrapper:
+
+    python src/evaluation/evaluate.py --method <method> --task <task>
+
+Do NOT use this module to compute metrics that will be reported as challenge
+results, as it may silently diverge from the official script in the future.
 
 Consolidated from:
   - src/evaluation/evaluate.py (nRMSE, SSIM, LPIPS, Dice, Volume)

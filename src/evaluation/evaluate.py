@@ -362,17 +362,11 @@ Exemples:
     parser.add_argument("--metrics", type=str, default="nrmse,ssim,lpips")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--output-csv", type=str, default=None)
-    parser.add_argument("--list-available", action="store_true")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
-    if args.list_available:
-        from utils import scan_available_methods, print_available_methods
-        print_available_methods(scan_available_methods())
-        sys.exit(0)
 
     # Resolve paths
     data_root = Path(args.data_root) if args.data_root else \
