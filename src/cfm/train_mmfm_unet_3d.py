@@ -83,6 +83,7 @@ from common.io import (
     resample_volume,
 )
 from models.vae_loader import load_vae
+from models.factorized_attention_3d import FactorizedAttention3D
 
 try:
     from monai.networks.nets import DiffusionModelUNet
@@ -158,12 +159,11 @@ def _remap_monai_attention_keys(state_dict: dict) -> dict:
 # ===========================================================================
 
 
-def build_unet_3d(cfg: dict, latent_channels: int, n_classes: int) -> DiffusionModelUNet:
+def build_unet_3d(cfg: dict, latent_channels: int, n_classes: int) -> nn.Module:
     """UNet 3D conditionné sur le temps et la classe (modalité, champ) cible.
 
-    Identique à train_cfm_3d.py::build_unet_3d, mais :
-      - num_class_embeds = n_classes (15 pour 3 mod × 5 champs)
-      - lu depuis cfg["model"]["num_class_embeds"] si présent
+    V1 : standard DiffusionModelUNet
+    V2 : HybridUNetTransformer avec attention factorisée au bottleneck
     """
     m = cfg["model"]
     channel_mult = tuple(m.get("channel_mult", [1, 2, 4]))
@@ -176,10 +176,10 @@ def build_unet_3d(cfg: dict, latent_channels: int, n_classes: int) -> DiffusionM
 
     num_class_embeds = int(m.get("num_class_embeds", n_classes))
 
-    return DiffusionModelUNet(
+    unet = DiffusionModelUNet(
         spatial_dims=3,
-        in_channels=2 * latent_channels,      # cat(z_t, z_src)
-        out_channels=latent_channels,          # champ de vitesse spatial
+        in_channels=2 * latent_channels,
+        out_channels=latent_channels,
         **{_ch_kwarg: channels},
         attention_levels=tuple(m.get("attention_levels", [False, True, True])),
         num_res_blocks=m.get("num_res_blocks", 2),
@@ -190,6 +190,20 @@ def build_unet_3d(cfg: dict, latent_channels: int, n_classes: int) -> DiffusionM
         with_conditioning=False,
         resblock_updown=True,
     )
+
+    use_factorized = m.get("use_factorized_attention", False)
+    if use_factorized:
+        from models.hybrid_unet_transformer import HybridUNetTransformer
+        bottleneck_ch = base_channels * max(channel_mult)
+        return HybridUNetTransformer(
+            unet=unet,
+            bottleneck_channels=bottleneck_ch,
+            use_factorized_attention=True,
+            num_attn_heads=m.get("factorized_attn_heads", 8),
+            attn_dropout=m.get("factorized_attn_dropout", 0.0),
+        )
+
+    return unet
 
 
 # ===========================================================================

@@ -1,420 +1,428 @@
 #!/usr/bin/env python3
-"""Script d'évaluation UNIFIÉ — MRIxFields 2026
+"""MRIxFields 2026 — Orchestrateur d'évaluation multi-tâches
 
-Évalue toutes les méthodes avec le même protocole, garantissant la cohérence
-des comparaisons entre StarGAN (Étape 1), VAE (Étape 2), et CFM (Étape 3).
+Wrapper qui appelle l'évaluateur officiel du challenge (~/Code/MRIxFields2026/Evaluation/evaluate.py)
+une fois par paire source→cible, puis agrège les résultats.
 
-Refactored to use common infrastructure.
+Usage:
+    # Task 2 (0.1T → 1.5T/3T/5T/7T) — auto-découverte
+    python src/evaluation/evaluate.py --method mmfm_unet --task task2
+
+    # Task 1 (Any → 7T) — avec dossier de prédiction spécifique
+    python src/evaluation/evaluate.py --method mmfm_unet --task task1 --pred-dir results/task1/...
 """
 
 import argparse
 import csv
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-import nibabel as nib
 import numpy as np
-import torch
+import nibabel as nib
+import nibabel.processing as nib_proc
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.io import (
-    DOMAINS,
-    MODALITIES,
-    extract_subject_id,
-    load_nifti_volume,
-)
-from common.metrics import (
-    compute_dice,
-    compute_lpips,
-    compute_nrmse,
-    compute_ssim,
-    compute_volume_consistency,
-    DGM_LABELS,
-)
+# --------------------------------------------------------------------------- #
+#  Challenge constants
+# --------------------------------------------------------------------------- #
+
+DOMAINS = ["0.1T", "1.5T", "3T", "5T", "7T"]
+
+# Paires par tâche (selon Submission/README.md du challenge)
+TASK_PAIRS = {
+    "task1": [("0.1T", "7T"), ("1.5T", "7T"), ("3T", "7T"), ("5T", "7T")],
+    "task2": [("0.1T", "1.5T"), ("0.1T", "3T"), ("0.1T", "5T"), ("0.1T", "7T")],
+    "task3": [(s, t) for s in DOMAINS for t in DOMAINS if s != t],  # 20 paires
+}
+
+PROSPECTIVE_SUBJECTS = ["0006", "0007", "0009"]
+
+# --------------------------------------------------------------------------- #
+#  Registry & Auto-discovery
+# --------------------------------------------------------------------------- #
+
+VAE_REG = {
+    "aekl":        {"path": "outputs/vae3d/runs/vae3d_multimodal/weights/model_best.pth"},
+    "vqvae":       {"path": "outputs/pythae_vqvae3d/runs/pythae_vqvae3d_multimodal/weights/model_best.pth"},
+    "medvae_frozen": {"path": None},
+    "medvae_ft":   {"path": "outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth"},
+}
+
+CFM_REG = {
+    "cfm":         {"path": "outputs/cfm3d/runs/cfm3d_T1W_medvae_0p1T_7T/weights/model_final.pth"},
+    "mmfm":        {"path": "outputs/cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1/weights/model_final.pth"},
+    "mmfm_unet":   {"path": "outputs/cfm3d/runs/mmfm3d_unet_medvae_multimodal/weights/model_final.pth"},
+}
 
 
-# ---------------------------------------------------------------------- #
-#  Helpers matching
-# ---------------------------------------------------------------------- #
+def _parse_iter(name: str) -> int:
+    m = re.search(r"[\W_](\d+)(k?)", name)
+    if not m:
+        return 0
+    n, k = m.group(1), m.group(2)
+    return int(n) * (1000 if k else 1)
 
 
-def match_by_subject_prefix(
-    pred_dir: Path, target_dir: Path
-) -> list:
-    """Match prediction files with ground truth by subject ID."""
-    target_lookup = {}
-    for f in target_dir.rglob("*.nii.gz"):
-        sid = extract_subject_id(f.name)
-        target_lookup[sid] = f
+def discover_pred_dir(method: str) -> Optional[Path]:
+    if method == "mmfm_unet":
+        root, pattern = Path("results/mmfm/visuals"), "mmfm_unet_*"
+    elif method == "mmfm":
+        root, pattern = Path("results/mmfm/visuals"), "mmfm_mlp_*"
+    elif method == "cfm":
+        root = Path("results/cfm/visuals")
+        if root.exists():
+            candidates = [d for d in root.rglob("*") if d.is_dir() and any(d.glob("*.nii*"))]
+            if candidates:
+                for c in candidates:
+                    if c.name.startswith("predictions"):
+                        return c
+                return sorted(candidates, key=lambda p: len(list(p.glob("*.nii*"))), reverse=True)[0]
+        return None
+    elif method == "stargan2d":
+        root = Path("outputs/stargan2d/runs")
+        if root.exists():
+            candidates = [d for d in root.rglob("predictions") if d.is_dir()]
+            if candidates:
+                return max(candidates, key=lambda p: p.stat().st_mtime)
+        return None
+    else:
+        return None
 
-    pairs = []
-    for pred_path in sorted(pred_dir.rglob("*.nii.gz")):
-        sid = extract_subject_id(pred_path.name)
-        if sid in target_lookup:
-            pairs.append((pred_path, target_lookup[sid]))
-
-    return pairs
-
-
-# ---------------------------------------------------------------------- #
-#  Pipeline d'évaluation par méthode
-# ---------------------------------------------------------------------- #
-
-
-def evaluate_stargan2d(
-    checkpoint: Path,
-    subjects: str,
-    data_root: Path,
-    modalities: List[str] = None,
-    device: str = "cuda",
-) -> Dict:
-    """Évaluer StarGAN v2 2D (Étape 1)."""
-    raise NotImplementedError(
-        "evaluate_stargan2d() à implémenter.\n"
-        "Utiliser le code officiel du challenge:\n"
-        "  python ~/Code/MRIxFields2026/Baseline/mrixfields/inference.py"
-    )
+    if not root.exists():
+        return None
+    dirs = [d for d in root.glob(pattern) if d.is_dir()]
+    if not dirs:
+        return None
+    return sorted(dirs, key=lambda p: _parse_iter(p.name), reverse=True)[0]
 
 
-def evaluate_vae_cfm(
-    vae_checkpoint: Path,
-    cfm_checkpoint: Path,
-    subjects: str,
-    data_root: Path,
-    vae_type: str,
-    modalities: List[str] = None,
-    device: str = "cuda",
-) -> Dict:
-    """Évaluer VAE + CFM (Étapes 2+3)."""
-    raise NotImplementedError(
-        "evaluate_vae_cfm() à implémenter.\n"
-        "Voir src/cfm/train_cfm_3d.py pour l'inférence CFM."
-    )
+# --------------------------------------------------------------------------- #
+#  Parsing prediction files
+# --------------------------------------------------------------------------- #
+
+def parse_mmfm_filename(name: str) -> Optional[Dict]:
+    pattern = re.compile(r"^P_([A-Z0-9]+)_([\d\.]+T)_(\d{4})_([A-Z0-9]+)_([\d\.]+T)_.*\.nii.*$")
+    m = pattern.match(name)
+    if m:
+        return {
+            "modality": m.group(1), "src_field": m.group(2), "subject": m.group(3),
+            "tgt_field": m.group(5),
+        }
+    return None
 
 
-def evaluate_pair(
-    pred_path: Path,
-    target_path: Path,
+def parse_generic_filename(name: str) -> Optional[Dict]:
+    pattern = re.compile(r"^P_([A-Z0-9]+)_([\d\.]+T)_(\d{4})\.nii.*$")
+    m = pattern.match(name)
+    if m:
+        return {"modality": m.group(1), "tgt_field": m.group(2), "subject": m.group(3)}
+    return None
+
+
+def build_prediction_matrix(pred_dir: Path) -> Dict[str, Dict[str, Dict[str, Path]]]:
+    """Build matrix: {src_field: {subject: {tgt_field: pred_path}}}"""
+    matrix = {}
+    for pred_path in pred_dir.rglob("*.nii*"):
+        info = parse_mmfm_filename(pred_path.name) or parse_generic_filename(pred_path.name)
+        if not info:
+            continue
+        sid, src, tgt = info.get("subject"), info.get("src_field", "0.1T"), info.get("tgt_field")
+        if sid and src and tgt:
+            if src not in matrix:
+                matrix[src] = {}
+            if sid not in matrix[src]:
+                matrix[src][sid] = {}
+            matrix[src][sid][tgt] = pred_path
+    return matrix
+
+
+def print_matrix(matrix: Dict, task_pairs: List[Tuple[str, str]], method: str, task: str):
+    """Print ASCII matrix. matrix: {src_field: {subject: {tgt_field: path}}}"""
+    # Collect all target fields actually needed for this task
+    tgt_fields = sorted({t for _, t in task_pairs})
+    src_fields = sorted({s for s, _ in task_pairs})
+    print(f"\n{'=' * 70}")
+    print(f"MATRICE DE COMPLÉTUDE — {method} | {task}")
+    print(f"{'=' * 70}")
+    header = "Source | Sujet  | " + " | ".join(f"{t:6s}" for t in tgt_fields)
+    print(header)
+    print("-" * len(header))
+    total = 0
+    expected = len(PROSPECTIVE_SUBJECTS) * len(task_pairs)
+    for src in src_fields:
+        for sid in PROSPECTIVE_SUBJECTS:
+            row = f"{src:6s} | {sid}  |"
+            for tgt in tgt_fields:
+                # Check if this specific src→tgt pair exists in task
+                if (src, tgt) not in task_pairs:
+                    row += "   -   |"
+                elif tgt in matrix.get(src, {}).get(sid, {}):
+                    row += "   ✅  |"
+                    total += 1
+                else:
+                    row += "   ❌  |"
+            print(row)
+    print(f"\nTotal: {total}/{expected} prédictions trouvées")
+    print(f"{'=' * 70}\n")
+    return total, expected
+
+
+# --------------------------------------------------------------------------- #
+#  Official evaluator wrapper (per pair)
+# --------------------------------------------------------------------------- #
+
+def prepare_pair_dir(
+    matrix: Dict,
+    src_field: str,
+    tgt_field: str,
+    target_dir: Path,
+    tmpbase: Path,
+    modality: str = "T1W",
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """Create official pred/target dirs for ONE pair, with resampling."""
+    pred_out = tmpbase / f"{src_field}_to_{tgt_field}" / "pred"
+    tgt_out = tmpbase / f"{src_field}_to_{tgt_field}" / "gt"
+    pred_out.mkdir(parents=True, exist_ok=True)
+    tgt_out.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    for sid in PROSPECTIVE_SUBJECTS:
+        if tgt_field not in matrix.get(sid, {}):
+            continue
+
+        pred_src = matrix[sid][tgt_field]
+        official_name = f"P_{modality}_{tgt_field}_{sid}.nii.gz"
+        gt_src = target_dir / tgt_field / official_name
+
+        if not gt_src.exists():
+            print(f"⚠️  GT manquant: {gt_src}")
+            continue
+
+        # Load & resample if needed
+        pred_nii = nib.load(str(pred_src))
+        gt_nii = nib.load(str(gt_src))
+        pred_data = pred_nii.get_fdata(dtype=np.float32)
+        gt_data = gt_nii.get_fdata(dtype=np.float32)
+
+        if pred_data.shape != gt_data.shape or not np.allclose(pred_nii.affine, gt_nii.affine, atol=1e-3):
+            pred_img = nib.Nifti1Image(pred_data, pred_nii.affine)
+            gt_img = nib.Nifti1Image(gt_data, gt_nii.affine)
+            pred_resampled = nib_proc.resample_from_to(pred_img, gt_img, order=3, mode="constant", cval=0.0)
+            pred_data = pred_resampled.get_fdata(dtype=np.float32)
+
+        nib.save(nib.Nifti1Image(pred_data, gt_nii.affine, gt_nii.header), str(pred_out / official_name))
+        shutil.copy2(gt_src, tgt_out / official_name)
+        count += 1
+
+    if count == 0:
+        return None, None
+    return pred_out, tgt_out
+
+
+def run_official_eval(
+    pred_dir: Path,
+    target_dir: Path,
     metrics: List[str],
-    pred_seg_path: Optional[Path] = None,
-    target_seg_path: Optional[Path] = None,
-    device: str = "cuda",
+    device: str,
+    output_json: Path,
 ) -> Dict:
-    """Compute all metrics for a single prediction-target pair."""
-    pred, _ = load_nifti_volume(pred_path, normalize=False)
-    target, _ = load_nifti_volume(target_path, normalize=False)
+    official_script = Path.home() / "Code" / "MRIxFields2026" / "Evaluation" / "evaluate.py"
+    if not official_script.exists():
+        raise FileNotFoundError(f"Script officiel non trouvé: {official_script}")
 
-    # Normalize to [0, 1] for metrics
-    pred_n = (pred - pred.min()) / max(pred.ptp(), 1e-8)
-    target_n = (target - target.min()) / max(target.ptp(), 1e-8)
-
-    results = {}
-
-    if "nrmse" in metrics:
-        results["nrmse"] = compute_nrmse(pred_n, target_n)
-    if "ssim" in metrics:
-        results["ssim"] = compute_ssim(pred_n, target_n)
-    if "lpips" in metrics:
-        results["lpips"] = compute_lpips(pred_n, target_n, device=device)
-
-    if "dice" in metrics or "volume" in metrics:
-        if pred_seg_path is None or target_seg_path is None:
-            raise ValueError(
-                "Dice/Volume metrics require --pred_seg_dir and --target_seg_dir."
-            )
-
-        seg_pred = nib.load(str(pred_seg_path)).get_fdata().astype(np.int32)
-        seg_target = nib.load(str(target_seg_path)).get_fdata().astype(np.int32)
-
-        if "dice" in metrics:
-            scores = compute_dice(seg_pred, seg_target)
-            results["dice"] = float(np.mean(list(scores.values())))
-
-        if "volume" in metrics:
-            voxel_size = tuple(nib.load(str(target_seg_path)).header.get_zooms()[:3])
-            voxel_vol = float(np.prod(voxel_size))
-            scores = compute_volume_consistency(seg_pred, seg_target, voxel_vol)
-            results["volume"] = float(np.mean(list(scores.values())))
-
-    return results
-
-
-# ---------------------------------------------------------------------- #
-#  Pipeline complet
-# ---------------------------------------------------------------------- #
-
-
-def run_evaluation(
-    method: str,
-    checkpoint: Optional[Path] = None,
-    vae_checkpoint: Optional[Path] = None,
-    cfm_checkpoint: Optional[Path] = None,
-    subjects: str = "prospective_5fields",
-    data_root: Optional[Path] = None,
-    pred_dir: Optional[Path] = None,
-    target_dir: Optional[Path] = None,
-    pred_seg_dir: Optional[Path] = None,
-    target_seg_dir: Optional[Path] = None,
-    modalities: Optional[List[str]] = None,
-    metrics: Optional[List[str]] = None,
-    device: str = "cuda",
-    output_dir: Optional[Path] = None,
-    output_csv: Optional[Path] = None,
-) -> Dict:
-    if metrics is None:
-        metrics = ["nrmse", "ssim", "lpips"]
-
-    if data_root is None:
-        data_root = Path(
-            os.environ.get("MRIXFIELDS_DATA", "/home/rousseau/Data/MRIxFields_20260414")
-        )
-
-    if modalities is None:
-        modalities = ["T1W"]
-
-    all_results = []
-
-    for modality in modalities:
-        if pred_dir is None or target_dir is None:
-            if subjects == "prospective_5fields":
-                subject_ids = ["0006", "0007", "0009"]
-            else:
-                subject_ids = subjects.split(",")
-
-            if method == "stargan2d":
-                src_field = "0.1T"
-                fields = list(DOMAINS)
-            elif method in ["aekl_cfm3d", "vqvae_cfm3d", "medvae_frozen_cfm", "medvae_ft_cfm"]:
-                src_field = "0.1T"
-                fields = ["7T"]
-            else:
-                raise ValueError(f"Méthode inconnue: {method}")
-
-            for tgt_field in fields:
-                if src_field == tgt_field:
-                    continue
-
-                for sid in subject_ids:
-                    pred_path = pred_dir / f"{sid}.nii.gz" if pred_dir else None
-                    target_path = (
-                        data_root
-                        / "Training_prospective"
-                        / modality
-                        / tgt_field
-                        / f"P_{modality}_{tgt_field}_{sid}.nii.gz"
-                        if target_dir is None
-                        else None
-                    )
-
-                    if pred_path is None or not pred_path.exists():
-                        print(f"⚠️  Prediction non trouvée: {pred_path}")
-                        continue
-
-                    if target_path is None or not target_path.exists():
-                        print(f"⚠️  Ground truth non trouvé: {target_path}")
-                        continue
-
-                    pred_seg_path = target_seg_path = None
-                    if "dice" in metrics or "volume" in metrics:
-                        if pred_seg_dir is None or target_seg_dir is None:
-                            print(f"⚠️  Segmentation requise pour Dice/Volume")
-                            continue
-                        pred_seg_path = pred_seg_dir / f"{sid}_seg.nii.gz"
-                        target_seg_path = target_seg_dir / f"P_{modality}_{tgt_field}_{sid}_seg.nii.gz"
-
-                    result = evaluate_pair(
-                        pred_path,
-                        target_path,
-                        metrics,
-                        pred_seg_path=pred_seg_path,
-                        target_seg_path=target_seg_path,
-                        device=device,
-                    )
-                    result["subject"] = sid
-                    result["modality"] = modality
-                    result["src_field"] = src_field
-                    result["tgt_field"] = tgt_field
-                    result["method"] = method
-                    all_results.append(result)
-
-        else:
-            pairs = match_by_subject_prefix(pred_dir, target_dir)
-            if not pairs:
-                print("Aucune paire trouvée entre pred_dir et target_dir")
-                return {}
-
-            for pred_path, target_path in pairs:
-                sid = extract_subject_id(pred_path.name)
-
-                pred_seg_path = target_seg_path = None
-                if pred_seg_dir is not None and target_seg_dir is not None:
-                    pred_seg_path = pred_seg_dir / f"{sid}_seg.nii.gz"
-                    target_seg_path = target_seg_dir / f"{sid}_seg.nii.gz"
-
-                result = evaluate_pair(
-                    pred_path,
-                    target_path,
-                    metrics,
-                    pred_seg_path=pred_seg_path,
-                    target_seg_path=target_seg_path,
-                    device=device,
-                )
-                result["subject"] = sid
-                result["modality"] = modality
-                result["method"] = method
-                all_results.append(result)
-
-    if not all_results:
-        print("Aucun résultat calculé.")
-        return {}
-
-    summary = {}
-    metric_keys = [
-        k for k in all_results[0]
-        if k not in ["subject", "modality", "method", "src_field", "tgt_field"]
+    cmd = [
+        sys.executable, str(official_script),
+        "--pred_dir", str(pred_dir),
+        "--target_dir", str(target_dir),
+        "--metrics", *metrics,
+        "--device", device,
+        "--output_json", str(output_json),
     ]
 
-    for k in metric_keys:
-        vals = [r[k] for r in all_results]
-        summary[f"{k}_mean"] = float(np.mean(vals))
-        summary[f"{k}_std"] = float(np.std(vals))
-        summary[f"{k}_min"] = float(np.min(vals))
-        summary[f"{k}_max"] = float(np.max(vals))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr, file=sys.stderr)
+        raise RuntimeError(f"Évaluateur officiel a échoué (code {result.returncode})")
 
-    print(f"\n{'=' * 60}")
-    print(f"Résultats — {method} ({len(all_results)} sujets)")
-    print(f"{'=' * 60}")
+    with open(output_json) as f:
+        return json.load(f)
 
-    for k in metric_keys:
-        direction = "↓ (lower is better)" if k in ["nrmse", "lpips"] else "↑ (higher is better)"
-        print(f"  {k:>10s}: {summary[f'{k}_mean']:.4f} ± {summary[f'{k}_std']:.4f}  {direction}")
-    print(f"{'=' * 60}")
 
-    if output_csv is not None:
+# --------------------------------------------------------------------------- #
+#  Task evaluation
+# --------------------------------------------------------------------------- #
+
+def evaluate_task(
+    task: str,
+    method: str,
+    pred_dir: Path,
+    target_dir: Path,
+    metrics: List[str],
+    device: str,
+    output_csv: Path,
+) -> List[Dict]:
+    """Evaluate all pairs for a given task."""
+    pairs = TASK_PAIRS[task]
+    matrix = build_prediction_matrix(pred_dir)
+    total, expected = print_matrix(matrix, pairs, method, task)
+
+    if total < expected:
+        print(f"❌ Évaluation impossible: {total}/{expected} prédictions manquantes")
+        return []
+
+    print(f"✅ Cohorte complète pour {task}: {total}/{expected} prédictions")
+
+    all_results = []
+    with tempfile.TemporaryDirectory(prefix=f"mrix_eval_{method}_{task}_") as tmpdir:
+        tmpbase = Path(tmpdir)
+
+        for src_field, tgt_field in pairs:
+            print(f"\n--- Pair: {src_field} → {tgt_field} ---")
+            # Pass only the sub-matrix for this specific source
+            src_matrix = matrix.get(src_field, {})
+            pair_pred, pair_tgt = prepare_pair_dir(src_matrix, src_field, tgt_field, target_dir, tmpbase)
+
+            if pair_pred is None:
+                print(f"⚠️  Aucune prédiction pour {src_field}→{tgt_field}, SKIP")
+                continue
+
+            json_path = tmpbase / f"{src_field}_to_{tgt_field}.json"
+            try:
+                summary = run_official_eval(pair_pred, pair_tgt, metrics, device, json_path)
+                # Expand per-subject results if available in future versions of official script,
+                # otherwise use summary
+                row = {
+                    "method": method,
+                    "task": task,
+                    "pair": f"{src_field}_to_{tgt_field}",
+                    "n_subjects": len(list(pair_pred.glob("*.nii*"))),
+                }
+                for k in metrics:
+                    row[f"{k}_mean"] = summary.get(f"{k}_mean", float("nan"))
+                    row[f"{k}_std"] = summary.get(f"{k}_std", float("nan"))
+                all_results.append(row)
+
+                print(f"  nRMSE: {row['nrmse_mean']:.4f} ± {row['nrmse_std']:.4f}")
+                print(f"  SSIM : {row['ssim_mean']:.4f} ± {row['ssim_std']:.4f}")
+                print(f"  LPIPS: {row['lpips_mean']:.4f} ± {row['lpips_std']:.4f}")
+
+            except Exception as e:
+                print(f"❌ Erreur pour {src_field}→{tgt_field}: {e}")
+                continue
+
+    # Save aggregated CSV
+    if all_results:
         output_csv.parent.mkdir(parents=True, exist_ok=True)
-
-        existing_rows = []
-        if output_csv.exists():
-            with open(output_csv, "r", newline="") as f:
-                reader = csv.DictReader(f)
-                existing_rows = list(reader)
-
-        fieldnames = [
-            "method", "modality", "subject", "src_field", "tgt_field",
-        ] + metric_keys
-        for r in all_results:
-            row = {k: r.get(k, "") for k in fieldnames}
-            existing_rows.append(row)
+        fieldnames = ["method", "task", "pair", "n_subjects"] + \
+                     [f"{k}_mean" for k in metrics] + [f"{k}_std" for k in metrics]
 
         with open(output_csv, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(existing_rows)
+            writer.writerows(all_results)
+        print(f"\n✅ Résultats sauvegardés: {output_csv}")
 
-        print(f"\nRésultats sauvegardés: {output_csv}")
-
-    if output_dir is not None:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        summary_path = output_dir / f"{method}_summary.json"
-        with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"Résumé JSON sauvegardé: {summary_path}")
-
-    return summary
+    return all_results
 
 
-# ---------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
 #  CLI
-# ---------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
 
-SUPPORTED_METHODS = [
-    "stargan2d",
-    "aekl_cfm3d",
-    "vqvae_cfm3d",
-    "medvae_frozen_cfm",
-    "medvae_ft_cfm",
-]
-
-ALL_METRICS = ["nrmse", "ssim", "lpips", "dice", "volume"]
+SUPPORTED_METHODS = ["stargan2d", "cfm", "mmfm", "mmfm_unet"]
+SUPPORTED_TASKS = ["task1", "task2", "task3"]
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="MRIxFields2026 Evaluation (unifié)")
+    parser = argparse.ArgumentParser(
+        description="MRIxFields2026 — Évaluation multi-tâches (wrapper officiel)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemples:
+  python src/evaluation/evaluate.py --method mmfm_unet --task task2
+  python src/evaluation/evaluate.py --method mmfm_unet --task task1 --pred-dir results/task1/...
+"""
+    )
     parser.add_argument("--method", required=True, choices=SUPPORTED_METHODS)
-    parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--vae-checkpoint", type=str, default=None)
-    parser.add_argument("--cfm-checkpoint", type=str, default=None)
-    parser.add_argument("--subjects", type=str, default="prospective_5fields")
-    parser.add_argument("--data-root", type=str, default=None)
+    parser.add_argument("--task", required=True, choices=SUPPORTED_TASKS)
+    parser.add_argument("--vae-type", type=str, default="aekl",
+                        choices=["aekl", "vqvae", "medvae_frozen", "medvae_ft"])
     parser.add_argument("--pred-dir", type=str, default=None)
     parser.add_argument("--target-dir", type=str, default=None)
-    parser.add_argument("--pred-seg-dir", type=str, default=None)
-    parser.add_argument("--target-seg-dir", type=str, default=None)
-    parser.add_argument("--modalities", type=str, default="T1W")
+    parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--metrics", type=str, default="nrmse,ssim,lpips")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
-    parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--output-csv", type=str, default="results/evaluation_table.csv")
+    parser.add_argument("--output-csv", type=str, default=None)
+    parser.add_argument("--list-available", action="store_true")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    checkpoint = Path(args.checkpoint) if args.checkpoint else None
-    vae_checkpoint = Path(args.vae_checkpoint) if args.vae_checkpoint else None
-    cfm_checkpoint = Path(args.cfm_checkpoint) if args.cfm_checkpoint else None
-    data_root = Path(args.data_root) if args.data_root else None
-    pred_dir = Path(args.pred_dir) if args.pred_dir else None
-    target_dir = Path(args.target_dir) if args.target_dir else None
-    pred_seg_dir = Path(args.pred_seg_dir) if args.pred_seg_dir else None
-    target_seg_dir = Path(args.target_seg_dir) if args.target_seg_dir else None
-    output_dir = Path(args.output_dir) if args.output_dir else None
-    output_csv = Path(args.output_csv)
-    modalities = [m.strip() for m in args.modalities.split(",")]
+    if args.list_available:
+        from utils import scan_available_methods, print_available_methods
+        print_available_methods(scan_available_methods())
+        sys.exit(0)
+
+    # Resolve paths
+    data_root = Path(args.data_root) if args.data_root else \
+                Path(os.environ.get("MRIXFIELDS_DATA", "/home/rousseau/Data/MRIxFields_20260414"))
+
+    pred_dir = Path(args.pred_dir) if args.pred_dir else discover_pred_dir(args.method)
+    target_dir = Path(args.target_dir) if args.target_dir else data_root / "Training_prospective" / "T1W"
     metrics = [m.strip() for m in args.metrics.split(",")]
 
-    if args.method == "stargan2d" and checkpoint is None:
-        print("ERREUR: --checkpoint requis pour stargan2d")
+    if pred_dir is None:
+        print(f"❌ Aucune prédiction trouvée pour {args.method}")
         sys.exit(1)
 
-    print(f"\n{'=' * 60}")
-    print(f"MRIxFields2026 Evaluation")
-    print(f"{'=' * 60}")
-    print(f"Méthode       : {args.method}")
-    print(f"Modalités     : {modalities}")
-    print(f"Métriques     : {metrics}")
-    print(f"Sujets        : {args.subjects}")
-    print(f"Device        : {args.device}")
-    print()
+    print(f"[Auto] pred_dir:  {pred_dir}")
+    print(f"[Auto] target_dir: {target_dir}")
 
-    summary = run_evaluation(
+    # Output CSV
+    if args.output_csv:
+        output_csv = Path(args.output_csv)
+    else:
+        output_csv = Path(f"results/{args.task}_{args.method}.csv")
+
+    # Run evaluation
+    results = evaluate_task(
+        task=args.task,
         method=args.method,
-        checkpoint=checkpoint,
-        vae_checkpoint=vae_checkpoint,
-        cfm_checkpoint=cfm_checkpoint,
-        subjects=args.subjects,
-        data_root=data_root,
         pred_dir=pred_dir,
         target_dir=target_dir,
-        pred_seg_dir=pred_seg_dir,
-        target_seg_dir=target_seg_dir,
-        modalities=modalities,
         metrics=metrics,
         device=args.device,
-        output_dir=output_dir,
         output_csv=output_csv,
     )
 
-    if summary:
-        print(f"\n✅ Évaluation terminée.")
+    if results:
+        # Print final summary table
+        print(f"\n{'=' * 70}")
+        print(f"RÉSULTATS AGRÉGÉS — {args.method} | {args.task}")
+        print(f"{'=' * 70}")
+        for r in results:
+            print(f"\n{r['pair']}:")
+            for k in metrics:
+                mean_v = r.get(f"{k}_mean", float("nan"))
+                std_v = r.get(f"{k}_std", float("nan"))
+                direction = "↓" if k in ["nrmse", "lpips"] else "↑"
+                print(f"  {k:>8s}: {mean_v:.4f} ± {std_v:.4f}  {direction}")
+        print(f"{'=' * 70}")
+        print(f"\n✅ Évaluation terminée. CSV: {output_csv}")
         sys.exit(0)
     else:
-        print(f"\n❌ Évaluation incomplète.")
+        print("\n❌ Évaluation incomplète.")
         sys.exit(1)
 
 
