@@ -71,11 +71,22 @@ def _parse_iter(name: str) -> int:
     return int(n) * (1000 if k else 1)
 
 
-def discover_pred_dir(method: str) -> Optional[Path]:
-    if method == "mmfm_unet":
-        root, pattern = Path("results/mmfm/visuals"), "mmfm_unet_*"
-    elif method == "mmfm":
-        root, pattern = Path("results/mmfm/visuals"), "mmfm_mlp_*"
+def discover_pred_dir(method: str, modality: str = "T1W", task: str = "task3") -> Optional[Path]:
+    # New structured full-resolution output: outputs/predictions/{method}/{task}/{modality}
+    if method in ("mmfm_unet", "mmfm"):
+        fullres_candidate = Path("outputs/predictions") / method / task / modality
+        if fullres_candidate.exists() and any(fullres_candidate.rglob("*.nii*")):
+            return fullres_candidate
+
+        # Legacy low-resolution fallback (will be removed once full-res is default)
+        root, pattern = Path("results/mmfm/visuals"), f"{method}_*"
+        if not root.exists():
+            return None
+        dirs = [d for d in root.glob(pattern) if d.is_dir()]
+        if not dirs:
+            return None
+        return sorted(dirs, key=lambda p: _parse_iter(p.name), reverse=True)[0]
+
     elif method == "cfm":
         root = Path("results/cfm/visuals")
         if root.exists():
@@ -86,6 +97,7 @@ def discover_pred_dir(method: str) -> Optional[Path]:
                         return c
                 return sorted(candidates, key=lambda p: len(list(p.glob("*.nii*"))), reverse=True)[0]
         return None
+
     elif method == "stargan2d":
         root = Path("outputs/stargan2d/runs")
         if root.exists():
@@ -93,15 +105,8 @@ def discover_pred_dir(method: str) -> Optional[Path]:
             if candidates:
                 return max(candidates, key=lambda p: p.stat().st_mtime)
         return None
-    else:
-        return None
 
-    if not root.exists():
-        return None
-    dirs = [d for d in root.glob(pattern) if d.is_dir()]
-    if not dirs:
-        return None
-    return sorted(dirs, key=lambda p: _parse_iter(p.name), reverse=True)[0]
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -127,14 +132,36 @@ def parse_generic_filename(name: str) -> Optional[Dict]:
     return None
 
 
-def build_prediction_matrix(pred_dir: Path) -> Dict[str, Dict[str, Dict[str, Path]]]:
-    """Build matrix: {src_field: {subject: {tgt_field: pred_path}}}"""
+def parse_pair_dir_name(name: str) -> Optional[Tuple[str, str]]:
+    """Parse parent directory name like '0.1T_to_7T' -> (src, tgt)."""
+    m = re.match(r"^([\d\.]+T)_to_([\d\.]+T)$", name)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def build_prediction_matrix(pred_dir: Path, modality: str = "T1W") -> Dict[str, Dict[str, Dict[str, Path]]]:
+    """Build matrix: {src_field: {subject: {tgt_field: pred_path}}}."""
     matrix = {}
     for pred_path in pred_dir.rglob("*.nii*"):
         info = parse_mmfm_filename(pred_path.name) or parse_generic_filename(pred_path.name)
         if not info:
             continue
-        sid, src, tgt = info.get("subject"), info.get("src_field", "0.1T"), info.get("tgt_field")
+
+        # Modality filter
+        if info.get("modality") != modality:
+            continue
+
+        # Source/target fields: prefer parent dir name (official structured output),
+        # fallback to filename parsing.
+        pair = parse_pair_dir_name(pred_path.parent.name)
+        if pair:
+            src, tgt = pair
+        else:
+            src = info.get("src_field", "0.1T")
+            tgt = info.get("tgt_field")
+
+        sid = info.get("subject")
         if sid and src and tgt:
             if src not in matrix:
                 matrix[src] = {}
@@ -144,13 +171,13 @@ def build_prediction_matrix(pred_dir: Path) -> Dict[str, Dict[str, Dict[str, Pat
     return matrix
 
 
-def print_matrix(matrix: Dict, task_pairs: List[Tuple[str, str]], method: str, task: str):
+def print_matrix(matrix: Dict, task_pairs: List[Tuple[str, str]], method: str, task: str, modality: str = "T1W"):
     """Print ASCII matrix. matrix: {src_field: {subject: {tgt_field: path}}}"""
     # Collect all target fields actually needed for this task
     tgt_fields = sorted({t for _, t in task_pairs})
     src_fields = sorted({s for s, _ in task_pairs})
     print(f"\n{'=' * 70}")
-    print(f"MATRICE DE COMPLÉTUDE — {method} | {task}")
+    print(f"MATRICE DE COMPLÉTUDE — {method} | {task} | {modality}")
     print(f"{'=' * 70}")
     header = "Source | Sujet  | " + " | ".join(f"{t:6s}" for t in tgt_fields)
     print(header)
@@ -185,9 +212,13 @@ def prepare_pair_dir(
     tgt_field: str,
     target_dir: Path,
     tmpbase: Path,
-    modality: str = "T1W",
+    modality: str,
 ) -> Tuple[Optional[Path], Optional[Path]]:
-    """Create official pred/target dirs for ONE pair, with resampling."""
+    """Create official pred/target dirs for ONE pair, with resampling.
+
+    Args:
+        matrix: {subject: {tgt_field: pred_path}} for a fixed source field.
+    """
     pred_out = tmpbase / f"{src_field}_to_{tgt_field}" / "pred"
     tgt_out = tmpbase / f"{src_field}_to_{tgt_field}" / "gt"
     pred_out.mkdir(parents=True, exist_ok=True)
@@ -266,14 +297,15 @@ def evaluate_task(
     method: str,
     pred_dir: Path,
     target_dir: Path,
+    modality: str,
     metrics: List[str],
     device: str,
     output_csv: Path,
 ) -> List[Dict]:
     """Evaluate all pairs for a given task."""
     pairs = TASK_PAIRS[task]
-    matrix = build_prediction_matrix(pred_dir)
-    total, expected = print_matrix(matrix, pairs, method, task)
+    matrix = build_prediction_matrix(pred_dir, modality=modality)
+    total, expected = print_matrix(matrix, pairs, method, task, modality)
 
     if total < expected:
         print(f"❌ Évaluation impossible: {total}/{expected} prédictions manquantes")
@@ -289,7 +321,7 @@ def evaluate_task(
             print(f"\n--- Pair: {src_field} → {tgt_field} ---")
             # Pass only the sub-matrix for this specific source
             src_matrix = matrix.get(src_field, {})
-            pair_pred, pair_tgt = prepare_pair_dir(src_matrix, src_field, tgt_field, target_dir, tmpbase)
+            pair_pred, pair_tgt = prepare_pair_dir(src_matrix, src_field, tgt_field, target_dir, tmpbase, modality)
 
             if pair_pred is None:
                 print(f"⚠️  Aucune prédiction pour {src_field}→{tgt_field}, SKIP")
@@ -354,6 +386,8 @@ Exemples:
     )
     parser.add_argument("--method", required=True, choices=SUPPORTED_METHODS)
     parser.add_argument("--task", required=True, choices=SUPPORTED_TASKS)
+    parser.add_argument("--modality", type=str, default="T1W",
+                        choices=["T1W", "T2W", "T2FLAIR"])
     parser.add_argument("--vae-type", type=str, default="aekl",
                         choices=["aekl", "vqvae", "medvae_frozen", "medvae_ft"])
     parser.add_argument("--pred-dir", type=str, default=None)
@@ -372,8 +406,8 @@ def main():
     data_root = Path(args.data_root) if args.data_root else \
                 Path(os.environ.get("MRIXFIELDS_DATA", "/home/rousseau/Data/MRIxFields_20260414"))
 
-    pred_dir = Path(args.pred_dir) if args.pred_dir else discover_pred_dir(args.method)
-    target_dir = Path(args.target_dir) if args.target_dir else data_root / "Training_prospective" / "T1W"
+    pred_dir = Path(args.pred_dir) if args.pred_dir else discover_pred_dir(args.method, modality=args.modality, task=args.task)
+    target_dir = Path(args.target_dir) if args.target_dir else data_root / "Training_prospective" / args.modality
     metrics = [m.strip() for m in args.metrics.split(",")]
 
     if pred_dir is None:
@@ -382,12 +416,13 @@ def main():
 
     print(f"[Auto] pred_dir:  {pred_dir}")
     print(f"[Auto] target_dir: {target_dir}")
+    print(f"[Auto] modality:   {args.modality}")
 
     # Output CSV
     if args.output_csv:
         output_csv = Path(args.output_csv)
     else:
-        output_csv = Path(f"results/{args.task}_{args.method}.csv")
+        output_csv = Path(f"results/{args.task}_{args.method}_{args.modality}.csv")
 
     # Run evaluation
     results = evaluate_task(
@@ -395,6 +430,7 @@ def main():
         method=args.method,
         pred_dir=pred_dir,
         target_dir=target_dir,
+        modality=args.modality,
         metrics=metrics,
         device=args.device,
         output_csv=output_csv,
@@ -403,7 +439,7 @@ def main():
     if results:
         # Print final summary table
         print(f"\n{'=' * 70}")
-        print(f"RÉSULTATS AGRÉGÉS — {args.method} | {args.task}")
+        print(f"RÉSULTATS AGRÉGÉS — {args.method} | {args.task} | {args.modality}")
         print(f"{'=' * 70}")
         for r in results:
             print(f"\n{r['pair']}:")
