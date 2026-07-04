@@ -17,8 +17,11 @@
 #   # Baseline MMFM v1 vectorisée sur latent MedVAE aplati
 #   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm T1W configs/mmfm3d_medvae_multimodal.yaml
 #
-#   # MMFM-UNet 3D spatial sur latent MedVAE
+#   # MMFM-UNet 3D spatial V1 sur latent MedVAE
 #   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm_unet T1W configs/mmfm3d_unet_medvae_multimodal.yaml
+#
+#   # MMFM-UNet 3D spatial V2 (random crop, full brain) — recommandé
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm_unet MULTI configs/mmfm3d_unet_v2_medvae_multimodal.yaml
 #
 # Prérequis (via setup_jeanzay.sh) :
 #   $WORK/MRIX/mrixfields_2026/   ← ce repo
@@ -131,16 +134,6 @@ _requeue_handler() {
 }
 trap '_requeue_handler' USR1
 
-# ─── Vérification des données NIfTI ─────────────────────────────────────────
-DATA_PATH="$WORK/MRIX/data/Training_retrospective/${MODALITY}"
-if [ ! -d "$DATA_PATH" ]; then
-    echo "[ERREUR] Données NIfTI introuvables : $DATA_PATH"
-    exit 1
-fi
-N_NIFTI=$(find "$DATA_PATH" -name "*.nii.gz" | wc -l)
-echo "Données NIfTI  : OK ($N_NIFTI volumes dans $DATA_PATH)"
-echo "GPU            : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
-
 # ─── Sélection de la config ───────────────────────────────────────────────────
 cd "$CODE_DIR"
 
@@ -184,6 +177,32 @@ fi
 
 echo "Script         : $SCRIPT"
 echo "Config         : $CONFIG"
+
+# ─── Vérification des données NIfTI ─────────────────────────────────────────
+# La vraie racine des données vient de la config (data.data_root) ; ici on fait
+# une vérification grossière du split d'entraînement.
+DATA_ROOT=$(python3 -c "
+import yaml, sys
+with open('$CONFIG') as f:
+    c = yaml.safe_load(f)
+print(c.get('data', {}).get('data_root', '$WORK/MRIX/data'))
+" 2>/dev/null || echo "$WORK/MRIX/data")
+
+# Support ancien : si MODALITY est mono-modalité, on peut vérifier le sous-répertoire
+if [ -n "$MODALITY" ] && [ "$MODALITY" != "MULTI" ] && [ -d "$DATA_ROOT/Training_retrospective/${MODALITY}" ]; then
+    DATA_PATH="$DATA_ROOT/Training_retrospective/${MODALITY}"
+    N_NIFTI=$(find "$DATA_PATH" -name "*.nii.gz" | wc -l)
+    echo "Données NIfTI  : OK ($N_NIFTI volumes dans $DATA_PATH)"
+else
+    DATA_PATH="$DATA_ROOT/Training_retrospective"
+    if [ -d "$DATA_PATH" ]; then
+        N_NIFTI=$(find "$DATA_PATH" -name "*.nii.gz" | wc -l)
+        echo "Données NIfTI  : OK ($N_NIFTI volumes sous $DATA_PATH)"
+    else
+        echo "[AVERTISSEMENT] Répertoire de données non trouvé : $DATA_PATH"
+    fi
+fi
+echo "GPU            : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
 
 # ─── Détection du dernier checkpoint pour reprise ────────────────────────────
 # Lire output_subdir depuis la config YAML
