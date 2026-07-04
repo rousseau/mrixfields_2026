@@ -156,6 +156,7 @@ def train(
     p_lo = cfg["data"].get("percentile_lower", 0.5)
     p_hi = cfg["data"].get("percentile_upper", 99.5)
     max_per_dom = cfg["data"].get("max_volumes_per_domain", None)
+    random_crop_prob = float(cfg["data"].get("random_crop_prob", 0.0))
     raw_vs = cfg["data"].get("volume_size", None)
     volume_size = tuple(int(v) for v in raw_vs) if raw_vs else None
     raw_ts = cfg["data"].get("target_spacing", None)
@@ -215,6 +216,7 @@ def train(
         max_per_domain=max_per_dom,
         target_spacing=target_spacing,
         volume_size=volume_size,
+        random_crop_prob=random_crop_prob,
     )
 
     # Pour chaque domaine, un loader infini séparé

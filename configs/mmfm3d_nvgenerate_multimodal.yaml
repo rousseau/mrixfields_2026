@@ -39,8 +39,9 @@ data:
   percentile_upper: 99.5
   target_spacing: [1.0, 1.0, 1.0]
   volume_size: [128, 128, 80]
-  max_volumes_per_class: null
+  max_volumes_per_class:
 
+  random_crop_prob: 0.8
 train:
   batch_size: 1
   num_workers: 4

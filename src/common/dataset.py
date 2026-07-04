@@ -138,6 +138,7 @@ class NIfTIVolumeDataset(MRIxFieldsBaseDataset):
         target_spacing: Optional[Tuple[float, float, float]] = None,
         volume_size: Optional[Tuple[int, int, int]] = None,
         max_per_class: Optional[int] = None,
+        random_crop_prob: float = 0.0,
     ):
         super().__init__(
             data_root=data_root,
@@ -149,6 +150,7 @@ class NIfTIVolumeDataset(MRIxFieldsBaseDataset):
             target_spacing=target_spacing,
             volume_size=volume_size,
             max_per_class=max_per_class,
+            random_crop_prob=random_crop_prob,
         )
 
     def __getitem__(self, idx: int) -> torch.Tensor:
@@ -178,6 +180,7 @@ class NIfTILatentDataset(MRIxFieldsBaseDataset):
         target_spacing: Optional[Tuple[float, float, float]] = None,
         volume_size: Optional[Tuple[int, int, int]] = None,
         max_per_domain: Optional[int] = None,
+        random_crop_prob: float = 0.0,
     ):
         super().__init__(
             data_root=data_root,
@@ -189,6 +192,7 @@ class NIfTILatentDataset(MRIxFieldsBaseDataset):
             target_spacing=target_spacing,
             volume_size=volume_size,
             max_per_class=max_per_domain,
+            random_crop_prob=random_crop_prob,
         )
         # Override: use domain index (field) as the label
         self.samples = [(p, self.field_to_idx[self.fields[f_idx]]) for p, _, f_idx in self.samples]

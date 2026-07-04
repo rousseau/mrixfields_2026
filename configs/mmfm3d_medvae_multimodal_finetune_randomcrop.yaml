@@ -1,17 +1,11 @@
-# MMFM v1 vectorized baseline
+# MMFM v1 vectorized — fine-tuning avec random crop
 #
-# Baseline intended to stay close to the original MMFM idea while keeping the
-# MedVAE encoder/decoder unchanged:
-#   volume 3D -> MedVAE latent tensor -> flatten -> vector MMFM -> unflatten ->
-#   MedVAE decode.
-#
-# The MMFM core is vectorized on the flattened latent. The dataset still uses
-# the existing 15 domain classes (3 modalities x 5 fields) as discrete target
-# conditions, so the baseline remains directly comparable with the previous
-# multimodal prototype.
+# Reprend les poids du modèle baseline mmfm3d_medvae_multimodal_vectorized_v1
+# (30k iters, crop centré) et fine-tune avec 80 % de crops aléatoires pour
+# améliorer la généralisation full-brain.
 
 method: mmfm3d_vectorized_v1
-task_name: mmfm3d_medvae_multimodal_vectorized_v1
+task_name: mmfm3d_medvae_multimodal_finetune_randomcrop
 
 vae:
   vae_type: medvae_finetune
@@ -31,18 +25,18 @@ data:
   split: retro_train
   modalities: [T1W, T2W, T2FLAIR]
   fields: [0.1T, 1.5T, 3T, 5T, 7T]
-  output_subdir: cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1
+  output_subdir: cfm3d/runs/mmfm3d_medvae_multimodal_finetune_randomcrop
   percentile_lower: 0.5
   percentile_upper: 99.5
   target_spacing: [1.0, 1.0, 1.0]
   volume_size: [128, 128, 80]
   max_volumes_per_class:
-
   random_crop_prob: 0.8
+
 train:
   batch_size: 1
   num_workers: 4
-  total_iters: 30000
+  total_iters: 60000
   lr: 1.0e-4
   sigma: 0.0
   ot_method: exact
