@@ -1,38 +1,42 @@
 #!/usr/bin/env python3
-"""Inférence batch MMFM-UNet V2 — Task 3 full-resolution (0.5 mm).
+"""Inférence MMFM-UNet V2 — Task 3 full-resolution (0.5 mm).
 
-Ce script génère des prédictions pleine résolution compatibles avec la soumission
-MRIxFields 2026 :
+Modes :
+  1. Batch : génère toutes les prédictions pour un split donné.
+  2. Single : 1 image source → 1 prédiction cible, avec évaluation et figure optionnelles.
+
+Prédictions pleine résolution compatibles avec la soumission MRIxFields 2026 :
   - shape (364, 436, 364)
   - spacing 0.5 mm isotrope
   - affine/header identiques à la source
   - nom officiel P_{MOD}_{TARGET_FIELD}_{ID}.nii.gz
   - fond masqué avec le masque source (> 1e-6)
 
-Pipeline par volume :
-  1. Charger source à 0.5 mm.
-  2. Rééchantillonner en 1 mm.
-  3. Normaliser globalement (percentile 0.5/99.5 → [-1,1]).
-  4. Extraire des patches (128,128,80) avec recouvrement 50 %.
-  5. Pour chaque patch : encoder (VAE) → flow (UNet) → décoder.
-  6. Recombiner par mélange à fenêtre (Hann) avec padding de bordure.
-  7. Rééchantillonner 1 mm → 0.5 mm.
-  8. Appliquer le masque source.
-  9. Sauvegarder au format officiel.
-
-Usage:
+Usage batch:
   PYTHONPATH=src python scripts/infer_mmfm_unet_v2_batch.py \
       --config configs/mmfm3d_unet_v2_medvae_multimodal.yaml \
       --checkpoint outputs/cfm3d/runs/mmfm3d_unet_v2_medvae_multimodal/weights/checkpoint_20000.pth \
       --output_dir outputs/predictions/mmfm_unet/task3 \
       --split Training_prospective \
       --n_steps 50
+
+Usage single:
+  PYTHONPATH=src python scripts/infer_mmfm_unet_v2_batch.py \
+      --config configs/mmfm3d_unet_v2_medvae_multimodal.yaml \
+      --checkpoint outputs/cfm3d/runs/mmfm3d_unet_v2_medvae_multimodal/weights/checkpoint_20000.pth \
+      --input P_T1W_0.1T_0006.nii.gz \
+      --tgt-field 7T \
+      --output P_T1W_7T_0006_pred.nii.gz \
+      --gt P_T1W_7T_0006.nii.gz
 """
 
 import argparse
+import re
+import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Dict, Optional
 
 import nibabel as nib
 import nibabel.processing as nib_proc
@@ -162,6 +166,14 @@ def _infer_patch(patch_tensor, vae, unet, tgt_class, n_steps, device, use_amp, a
     return (np.clip(pred, -1.0, 1.0) + 1.0) / 2.0
 
 
+def _normalize_with_params(vol, lo, hi):
+    """Apply (vol - lo) / (hi - lo) -> [0,1] -> [-1,1]."""
+    if hi <= lo:
+        return np.zeros_like(vol, dtype=np.float32)
+    vol = np.clip((vol - lo) / (hi - lo), 0.0, 1.0)
+    return (vol * 2.0 - 1.0).astype(np.float32)
+
+
 def process_volume(
     nii_path: Path,
     vae,
@@ -176,6 +188,8 @@ def process_volume(
     device,
     use_amp: bool,
     amp_dtype,
+    norm_mode: str = "global",
+    center_crop_only: bool = False,
 ):
     """Generate a full-resolution prediction from a source NIfTI."""
     img_src = nib.load(str(nii_path))
@@ -186,25 +200,52 @@ def process_volume(
     img_src_1mm = nib_proc.resample_to_output(img_src, voxel_sizes=(1.0, 1.0, 1.0), order=1)
     vol_1mm = img_src_1mm.get_fdata(dtype=np.float32)
 
-    # 2. Global normalization in 1 mm space
-    vol_1mm_norm = _normalize_global(vol_1mm, p_lo, p_hi)
+    # 2. Normalization in 1 mm space
+    if norm_mode == "crop_percentile":
+        # Use central crop percentiles (closest to training) and apply globally
+        h, w, d = vol_1mm.shape
+        ph, pw, pd = patch_size
+        sh, sw, sd = max(0, (h - ph) // 2), max(0, (w - pw) // 2), max(0, (d - pd) // 2)
+        crop = vol_1mm[sh:sh + ph, sw:sw + pw, sd:sd + pd]
+        lo, hi = np.percentile(crop, p_lo), np.percentile(crop, p_hi)
+        vol_1mm_norm = _normalize_with_params(vol_1mm, lo, hi)
+    elif norm_mode == "per_patch":
+        # Defer normalization to each patch
+        vol_1mm_norm = vol_1mm.astype(np.float32)
+        lo, hi = None, None
+    else:  # global
+        vol_1mm_norm = _normalize_global(vol_1mm, p_lo, p_hi)
+        lo, hi = None, None
 
-    # 3. Extract patches
-    patches, positions, padded_shape = _extract_patches(vol_1mm_norm, patch_size, stride, pad=pad)
-    blend_weights = _create_blend_weights(patch_size, mode="hann")
+    if center_crop_only:
+        # DEBUG: process a single central crop only (like low-res inference)
+        h, w, d = vol_1mm_norm.shape
+        ph, pw, pd = patch_size
+        sh, sw, sd = max(0, (h - ph) // 2), max(0, (w - pw) // 2), max(0, (d - pd) // 2)
+        crop = vol_1mm_norm[sh:sh + ph, sw:sw + pw, sd:sd + pd]
+        crop_tensor = torch.from_numpy(crop).unsqueeze(0).unsqueeze(0).to(device)
+        pred_crop = _infer_patch(crop_tensor, vae, unet, tgt_class, n_steps, device, use_amp, amp_dtype)
+        pred_1mm = np.zeros(vol_1mm_norm.shape, dtype=np.float32)
+        pred_1mm[sh:sh + ph, sw:sw + pw, sd:sd + pd] = pred_crop
+    else:
+        # 3. Extract patches
+        patches, positions, padded_shape = _extract_patches(vol_1mm_norm, patch_size, stride, pad=pad)
+        blend_weights = _create_blend_weights(patch_size, mode="hann")
 
-    # 4. Process each patch
-    patch_outputs = []
-    for patch in patches:
-        patch_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(device)
-        pred_patch = _infer_patch(patch_tensor, vae, unet, tgt_class, n_steps, device, use_amp, amp_dtype)
-        pred_patch_tensor = torch.from_numpy(pred_patch).unsqueeze(0).unsqueeze(0).float()
-        patch_outputs.append(pred_patch_tensor)
+        # 4. Process each patch
+        patch_outputs = []
+        for patch in patches:
+            if norm_mode == "per_patch":
+                patch = _normalize_global(patch, p_lo, p_hi)
+            patch_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(device)
+            pred_patch = _infer_patch(patch_tensor, vae, unet, tgt_class, n_steps, device, use_amp, amp_dtype)
+            pred_patch_tensor = torch.from_numpy(pred_patch).unsqueeze(0).unsqueeze(0).float()
+            patch_outputs.append(pred_patch_tensor)
 
-    # 5. Blend into full 1 mm prediction
-    pred_1mm = _blend_patches(
-        patch_outputs, positions, blend_weights, padded_shape, vol_1mm_norm.shape, pad
-    )
+        # 5. Blend into full 1 mm prediction
+        pred_1mm = _blend_patches(
+            patch_outputs, positions, blend_weights, padded_shape, vol_1mm_norm.shape, pad
+        )
 
     # 6. Resample prediction back to 0.5 mm source space
     img_pred_1mm = nib.Nifti1Image(pred_1mm.astype(np.float32), img_src_1mm.affine)
@@ -220,6 +261,249 @@ def process_volume(
 
 
 # --------------------------------------------------------------------------- #
+#  Single-image inference
+# --------------------------------------------------------------------------- #
+
+
+def _parse_official_filename(name: str) -> Optional[Dict]:
+    """Parse P_T1W_0.1T_0006.nii.gz -> modality, field, subject."""
+    pattern = re.compile(r"^P_([A-Z0-9]+)_([\d\.]+T)_(\d{4})\.nii.*$")
+    m = pattern.match(name)
+    if m:
+        return {"modality": m.group(1), "field": m.group(2), "subject": m.group(3)}
+    return None
+
+
+def _eval_single(pred_path: Path, gt_path: Path, device: str = "cuda") -> Dict:
+    """Call official challenge evaluator for a single pair of images."""
+    import subprocess
+    import json
+    import tempfile
+
+    official_script = Path.home() / "Code" / "MRIxFields2026" / "Evaluation" / "evaluate.py"
+    if not official_script.exists():
+        raise FileNotFoundError(f"Official evaluator not found: {official_script}")
+
+    with tempfile.TemporaryDirectory(prefix="mrix_eval_single_") as tmpdir:
+        tmpbase = Path(tmpdir)
+        pred_dir = tmpbase / "pred"
+        gt_dir = tmpbase / "gt"
+        pred_dir.mkdir()
+        gt_dir.mkdir()
+
+        official_name = pred_path.name
+        shutil.copy2(pred_path, pred_dir / official_name)
+        shutil.copy2(gt_path, gt_dir / official_name)
+
+        json_path = tmpbase / "result.json"
+        cmd = [
+            sys.executable, str(official_script),
+            "--pred_dir", str(pred_dir),
+            "--target_dir", str(gt_dir),
+            "--metrics", "nrmse", "ssim", "lpips",
+            "--device", device,
+            "--output_json", str(json_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(result.stdout)
+            print(result.stderr, file=sys.stderr)
+            raise RuntimeError(f"Official evaluator failed (code {result.returncode})")
+
+        with open(json_path) as f:
+            summary = json.load(f)
+
+    print("\n  === Official metrics ===")
+    for k in ["nrmse", "ssim", "lpips"]:
+        print(f"    {k:>8s}: {summary.get(f'{k}_mean', float('nan')):.4f}")
+    return summary
+
+
+def _generate_single_figure(
+    src_path: Path,
+    pred_path: Path,
+    gt_path: Optional[Path],
+    out_fig_path: Path,
+):
+    """Generate a 3-view comparison figure [source | prediction | GT]."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    def _load_for_viz(path: Path):
+        img = nib.load(str(path))
+        data = img.get_fdata(dtype=np.float32)
+        lo, hi = np.percentile(data, 0.5), np.percentile(data, 99.5)
+        return np.clip((data - lo) / max(hi - lo, 1e-8), 0.0, 1.0)
+
+    def _mid_slices(vol):
+        h, w, d = vol.shape
+        return vol[:, :, d // 2], vol[:, w // 2, :], vol[h // 2, :, :]
+
+    src_vol = _load_for_viz(src_path)
+    pred_vol = _load_for_viz(pred_path)
+    volumes = [src_vol, pred_vol]
+    titles = ["Source", "Prediction"]
+
+    if gt_path and gt_path.exists():
+        gt_vol = _load_for_viz(gt_path)
+        volumes.append(gt_vol)
+        titles.append("GT")
+
+    views = ["Axial", "Coronal", "Sagittal"]
+    n_rows = 3
+    n_cols = len(volumes)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4.5), dpi=120)
+    if n_cols == 1:
+        axes = axes[:, None]
+
+    for col, (vol, title) in enumerate(zip(volumes, titles)):
+        slices = _mid_slices(vol)
+        for row, (sl, view) in enumerate(zip(slices, views)):
+            ax = axes[row, col]
+            ax.imshow(np.rot90(sl), cmap="gray", vmin=0, vmax=1)
+            ax.axis("off")
+            if row == 0:
+                ax.set_title(title, fontsize=12, fontweight="bold")
+            if col == 0:
+                ax.text(
+                    -0.12, 0.5, view, rotation=90, transform=ax.transAxes,
+                    va="center", ha="center", fontsize=10
+                )
+
+    plt.tight_layout()
+    out_fig_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(out_fig_path), dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  Figure saved: {out_fig_path}")
+
+
+def infer_single(
+    cfg_path: str,
+    checkpoint: str,
+    input_path: str,
+    tgt_field: str,
+    output_path: Optional[str] = None,
+    src_field: Optional[str] = None,
+    modality: Optional[str] = None,
+    gt_path: Optional[str] = None,
+    env_path=None,
+    n_steps: int = 50,
+    patch_size=None,
+    stride=None,
+    pad: int = 16,
+    norm_mode: str = "global",
+    center_crop_only: bool = False,
+    use_ema: bool = True,
+    device: str = "cuda",
+):
+    """Single-image inference: source NIfTI -> predicted target NIfTI."""
+    input_path = Path(input_path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input not found: {input_path}")
+
+    parsed = _parse_official_filename(input_path.name)
+    if parsed is None:
+        raise ValueError(f"Filename does not match official format: {input_path.name}")
+
+    mod = modality or parsed["modality"]
+    src = src_field or parsed["field"]
+    sid = parsed["subject"]
+
+    if tgt_field is None:
+        raise ValueError("--tgt-field is required for single-image inference")
+
+    cfg = load_yaml_with_include(cfg_path)
+    cfg = resolve_paths(cfg, load_env(env_path))
+
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    data_cfg = cfg["data"]
+    train_cfg = cfg["train"]
+
+    amp_dtype_name = train_cfg.get("amp_dtype", "bf16")
+    use_amp = bool(train_cfg.get("use_amp", True))
+    amp_dtype = torch.bfloat16 if amp_dtype_name == "bf16" else torch.float16
+
+    p_lo = data_cfg.get("percentile_lower", 0.5)
+    p_hi = data_cfg.get("percentile_upper", 99.5)
+    patch_size = tuple(patch_size) if patch_size else (128, 128, 80)
+    stride = tuple(stride) if stride else (64, 64, 40)
+
+    all_modalities = data_cfg.get("modalities", MODALITIES)
+    fields = data_cfg.get("fields", DOMAINS)
+    n_fields = len(fields)
+    n_classes = len(all_modalities) * n_fields
+
+    if mod not in all_modalities:
+        raise ValueError(f"Unknown modality '{mod}'. Config has {all_modalities}")
+    if src not in fields:
+        raise ValueError(f"Unknown source field '{src}'. Config has {fields}")
+    if tgt_field not in fields:
+        raise ValueError(f"Unknown target field '{tgt_field}'. Config has {fields}")
+
+    mod_idx = all_modalities.index(mod)
+    tgt_idx = _flat_class(mod_idx, fields.index(tgt_field), n_fields)
+
+    print("Loading VAE...")
+    vae = load_vae(cfg, dev)
+    print("Loading UNet...")
+    unet = build_unet_3d(cfg, vae.latent_channels, n_classes).to(dev)
+    ckpt = torch.load(checkpoint, map_location=dev, weights_only=False)
+    if use_ema and "ema" in ckpt and ckpt["ema"]:
+        ema_state = ckpt["ema"]
+        if isinstance(ema_state, dict) and "shadow_params" in ema_state:
+            state = ema_state["shadow_params"]
+        elif isinstance(ema_state, dict):
+            # EMAModel.state_dict() returns a flat shadow state dict
+            state = ema_state
+        else:
+            state = ckpt["model"]
+    else:
+        state = ckpt["model"]
+    unet.load_state_dict(_remap_monai_attention_keys(state))
+    unet.eval()
+
+    print(f"\n[{mod}] {src} → {tgt_field} | subject {sid}")
+    t0 = time.time()
+    pred_vol, affine, header = process_volume(
+        input_path,
+        vae,
+        unet,
+        tgt_class=tgt_idx,
+        n_steps=n_steps,
+        patch_size=patch_size,
+        stride=stride,
+        pad=pad,
+        p_lo=p_lo,
+        p_hi=p_hi,
+        device=dev,
+        use_amp=use_amp,
+        amp_dtype=amp_dtype,
+        norm_mode=norm_mode,
+        center_crop_only=center_crop_only,
+    )
+
+    if output_path:
+        out_path = Path(output_path)
+    else:
+        out_path = Path(f"P_{mod}_{tgt_field}_{sid}.nii.gz")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    nib.save(nib.Nifti1Image(pred_vol, affine, header), str(out_path))
+    print(f"  {input_path.name} → {out_path}  ({time.time() - t0:.1f}s)")
+
+    if gt_path:
+        gt_path = Path(gt_path)
+        _eval_single(out_path, gt_path, device=device)
+
+        fig_path = out_path.parent / (out_path.stem + "_fig.png")
+        _generate_single_figure(input_path, out_path, gt_path, fig_path)
+
+    return out_path
+
+
+# --------------------------------------------------------------------------- #
 #  Batch orchestration
 # --------------------------------------------------------------------------- #
 
@@ -230,11 +514,14 @@ def infer_batch(
     output_dir: str,
     split: str = "Training_prospective",
     modalities=None,
+    pairs_filter=None,
     env_path=None,
     n_steps: int = 50,
     patch_size=None,
     stride=None,
     pad: int = 16,
+    norm_mode: str = "global",
+    center_crop_only: bool = False,
     use_ema: bool = True,
     skip_existing: bool = False,
 ):
@@ -280,10 +567,13 @@ def infer_batch(
     loaded_from = "model"
     if use_ema and "ema" in ckpt and ckpt["ema"]:
         ema_state = ckpt["ema"]
-        shadow = ema_state.get("shadow_params", None)
-        if shadow is not None:
-            unet.load_state_dict(_remap_monai_attention_keys(shadow))
+        if isinstance(ema_state, dict) and "shadow_params" in ema_state:
+            unet.load_state_dict(_remap_monai_attention_keys(ema_state["shadow_params"]))
             loaded_from = "ema.shadow_params"
+        elif isinstance(ema_state, dict):
+            # EMAModel.state_dict() returns a flat shadow state dict
+            unet.load_state_dict(_remap_monai_attention_keys(ema_state))
+            loaded_from = "ema"
         else:
             unet.load_state_dict(_remap_monai_attention_keys(ckpt["model"]))
     else:
@@ -297,8 +587,11 @@ def infer_batch(
     out_root = Path(output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # Task 3: all directed pairs
-    task_pairs = [(s, t) for s in fields for t in fields if s != t]
+    # Task 3: all directed pairs (or subset from --pairs)
+    if pairs_filter is not None:
+        task_pairs = pairs_filter
+    else:
+        task_pairs = [(s, t) for s in fields for t in fields if s != t]
 
     total_volumes = len(modalities) * len(task_pairs)  # per subject
     start_all = time.time()
@@ -342,6 +635,8 @@ def infer_batch(
                     device=device,
                     use_amp=use_amp,
                     amp_dtype=amp_dtype,
+                    norm_mode=norm_mode,
+                    center_crop_only=center_crop_only,
                 )
 
                 nib.save(nib.Nifti1Image(pred_vol, affine, header), str(out_path))
@@ -358,37 +653,99 @@ def infer_batch(
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Batch full-resolution MMFM-UNet V2 inference (Task 3)")
+    p = argparse.ArgumentParser(description="MMFM-UNet V2 inference — batch or single image")
     p.add_argument("--config", required=True)
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--output_dir", required=True)
+
+    # Single-image mode
+    p.add_argument("--input", default=None,
+                   help="Single input NIfTI path (activates single-image mode)")
+    p.add_argument("--tgt-field", default=None,
+                   help="Target field for single-image mode, e.g. 7T")
+    p.add_argument("--src-field", default=None,
+                   help="Source field for single-image mode (default: parsed from filename)")
+    p.add_argument("--modality", default=None,
+                   help="Modality for single-image mode (default: parsed from filename)")
+    p.add_argument("--output", default=None,
+                   help="Output path for single-image mode (default: P_MOD_TGT_ID.nii.gz)")
+    p.add_argument("--gt", default=None,
+                   help="Optional GT path for single-image evaluation + figure")
+
+    # Batch mode
+    p.add_argument("--output_dir", default=None,
+                   help="Output root directory for batch mode")
     p.add_argument("--split", default="Training_prospective",
                    choices=["Training_prospective", "Validating_prospective", "Testing_prospective"])
     p.add_argument("--modalities", nargs="+", default=None,
                    help="Subset of modalities to process (default: all from config)")
+    p.add_argument("--pairs", default=None,
+                   help="Subset of pairs to process, e.g. '0.1T_to_7T,1.5T_to_3T'")
+
     p.add_argument("--env", default="local")
     p.add_argument("--n_steps", type=int, default=50)
     p.add_argument("--patch_size", type=int, nargs=3, default=[128, 128, 80])
     p.add_argument("--stride", type=int, nargs=3, default=[64, 64, 40])
     p.add_argument("--pad", type=int, default=16)
+    p.add_argument("--norm_mode", default="global",
+                   choices=["global", "crop_percentile", "per_patch"],
+                   help="Normalization strategy for 1mm inference")
+    p.add_argument("--center_crop_only", action="store_true",
+                   help="DEBUG: process a single central crop only")
     p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--no_ema", action="store_true")
+    p.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    infer_batch(
-        cfg_path=args.config,
-        checkpoint=args.checkpoint,
-        output_dir=args.output_dir,
-        split=args.split,
-        modalities=args.modalities,
-        env_path=args.env,
-        n_steps=args.n_steps,
-        patch_size=args.patch_size,
-        stride=args.stride,
-        pad=args.pad,
-        use_ema=not args.no_ema,
-        skip_existing=args.skip_existing,
-    )
+
+    if args.input:
+        # Single-image mode
+        infer_single(
+            cfg_path=args.config,
+            checkpoint=args.checkpoint,
+            input_path=args.input,
+            tgt_field=args.tgt_field,
+            output_path=args.output,
+            src_field=args.src_field,
+            modality=args.modality,
+            gt_path=args.gt,
+            env_path=args.env,
+            n_steps=args.n_steps,
+            patch_size=args.patch_size,
+            stride=args.stride,
+            pad=args.pad,
+            norm_mode=args.norm_mode,
+            center_crop_only=args.center_crop_only,
+            use_ema=not args.no_ema,
+            device=args.device,
+        )
+    else:
+        # Batch mode
+        if not args.output_dir:
+            print("ERROR: --output_dir is required in batch mode", file=sys.stderr)
+            sys.exit(2)
+        pairs_filter = None
+        if args.pairs:
+            pairs_filter = []
+            for pair_str in args.pairs.split(","):
+                src, tgt = pair_str.strip().split("_to_")
+                pairs_filter.append((src, tgt))
+        infer_batch(
+            cfg_path=args.config,
+            checkpoint=args.checkpoint,
+            output_dir=args.output_dir,
+            split=args.split,
+            modalities=args.modalities,
+            pairs_filter=pairs_filter,
+            env_path=args.env,
+            n_steps=args.n_steps,
+            patch_size=args.patch_size,
+            stride=args.stride,
+            pad=args.pad,
+            norm_mode=args.norm_mode,
+            center_crop_only=args.center_crop_only,
+            use_ema=not args.no_ema,
+            skip_existing=args.skip_existing,
+        )
