@@ -43,7 +43,7 @@
 
 #SBATCH --partition=gpu_p6
 #SBATCH --qos=qos_gpu_h100-t4
-#SBATCH --time=100:00:00
+#SBATCH --time=24:00:00
 
 #SBATCH --output=logs/cfm3d_%x_%j.out
 #SBATCH --error=logs/cfm3d_%x_%j.err

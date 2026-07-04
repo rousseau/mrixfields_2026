@@ -95,20 +95,26 @@ if [[ -n "$OUTPUT_ROOT" && -d "$OUTPUT_ROOT/weights" ]]; then
     fi
 fi
 
-# ── Lancement ────────────────────────────────────────────────────────────────
+# ── Lancement avec limite de 24h ─────────────────────────────────────────────
+MAX_HOURS="${MAX_HOURS:-24}"
+MAX_SECONDS=$((MAX_HOURS * 3600))
+echo "  Durée max : ${MAX_HOURS}h (MAX_HOURS=${MAX_HOURS})"
+
 if [[ "$N_GPUS" -gt 1 ]]; then
     echo "  torchrun --nproc_per_node=$N_GPUS $SCRIPT"
-    torchrun \
-        --nproc_per_node="$N_GPUS" \
-        --master_port=$(( RANDOM % 10000 + 29500 )) \
-        "$SCRIPT" \
-        --config "$CONFIG" \
-        --env local \
-        $RESUME_ARG
+    timeout --signal=TERM --kill-after=120s "${MAX_SECONDS}s" \
+        torchrun \
+            --nproc_per_node="$N_GPUS" \
+            --master_port=$(( RANDOM % 10000 + 29500 )) \
+            "$SCRIPT" \
+            --config "$CONFIG" \
+            --env local \
+            $RESUME_ARG
 else
     echo "  $PYTHON $SCRIPT (single-GPU)"
-    $PYTHON "$SCRIPT" \
-        --config "$CONFIG" \
-        --env local \
-        $RESUME_ARG
+    timeout --signal=TERM --kill-after=120s "${MAX_SECONDS}s" \
+        $PYTHON "$SCRIPT" \
+            --config "$CONFIG" \
+            --env local \
+            $RESUME_ARG
 fi
