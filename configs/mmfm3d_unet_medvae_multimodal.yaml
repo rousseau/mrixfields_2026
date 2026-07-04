@@ -75,7 +75,7 @@ data:
   output_subdir: cfm3d/runs/mmfm3d_unet_medvae_multimodal
   percentile_lower: 0.5
   percentile_upper: 99.5
-  max_volumes_per_class: null
+  max_volumes_per_class:
   num_workers: 4
 
 train:
@@ -95,3 +95,4 @@ train:
 inference:
   n_steps: 50
   ode_solver: euler
+  norm_mode: global

@@ -58,6 +58,68 @@ from common.io import DOMAINS, MODALITIES
 
 
 # --------------------------------------------------------------------------- #
+#  Default resolution from config
+# --------------------------------------------------------------------------- #
+
+
+def _resolve_checkpoint(cfg: dict) -> Path:
+    """Auto-resolve the best checkpoint from cfg['data']['output_dir']/weights.
+
+    Priority:
+        1. checkpoint_XXXXX.pth with the highest iteration number
+        2. model_final.pth
+        3. model_best.pth
+    """
+    output_dir = cfg.get("data", {}).get("output_dir")
+    if not output_dir:
+        raise ValueError("Config has no data.output_dir; cannot auto-resolve checkpoint")
+
+    task_name = cfg.get("task_name", "")
+    output_dir = output_dir.replace("{{TASK_NAME}}", task_name)
+    weights_dir = Path(output_dir) / "weights"
+    if not weights_dir.exists():
+        raise FileNotFoundError(f"Weights directory not found: {weights_dir}")
+
+    candidates = []
+
+    # Latest checkpoint by iteration
+    ckpts = sorted(weights_dir.glob("checkpoint_*.pth"))
+    if ckpts:
+        def _iter_number(p: Path) -> int:
+            try:
+                return int(p.stem.split("_")[1])
+            except (ValueError, IndexError):
+                return -1
+        candidates.append(max(ckpts, key=_iter_number))
+
+    # Final / best models
+    candidates.extend([
+        weights_dir / "model_final.pth",
+        weights_dir / "model_best.pth",
+    ])
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError(f"No checkpoint found in {weights_dir}")
+
+
+def _resolve_n_steps(cfg: dict, n_steps: Optional[int]) -> int:
+    """Return explicit n_steps, else cfg.inference.n_steps, else 50."""
+    if n_steps is not None:
+        return n_steps
+    return cfg.get("inference", {}).get("n_steps", 50)
+
+
+def _resolve_norm_mode(cfg: dict, norm_mode: Optional[str]) -> str:
+    """Return explicit norm_mode, else cfg.inference.norm_mode, else 'global'."""
+    if norm_mode is not None:
+        return norm_mode
+    return cfg.get("inference", {}).get("norm_mode", "global")
+
+
+# --------------------------------------------------------------------------- #
 #  Patch extraction / blending
 # --------------------------------------------------------------------------- #
 
@@ -381,7 +443,7 @@ def _generate_single_figure(
 
 def infer_single(
     cfg_path: str,
-    checkpoint: str,
+    checkpoint: Optional[str],
     input_path: str,
     tgt_field: str,
     output_path: Optional[str] = None,
@@ -389,11 +451,11 @@ def infer_single(
     modality: Optional[str] = None,
     gt_path: Optional[str] = None,
     env_path=None,
-    n_steps: int = 50,
+    n_steps: Optional[int] = None,
     patch_size=None,
     stride=None,
     pad: int = 16,
-    norm_mode: str = "global",
+    norm_mode: Optional[str] = None,
     center_crop_only: bool = False,
     use_ema: bool = True,
     device: str = "cuda",
@@ -416,6 +478,12 @@ def infer_single(
 
     cfg = load_yaml_with_include(cfg_path)
     cfg = resolve_paths(cfg, load_env(env_path))
+
+    checkpoint = str(_resolve_checkpoint(cfg)) if checkpoint is None else checkpoint
+    n_steps = _resolve_n_steps(cfg, n_steps)
+    norm_mode = _resolve_norm_mode(cfg, norm_mode)
+    print(f"  Resolved checkpoint: {checkpoint}")
+    print(f"  Resolved n_steps: {n_steps}, norm_mode: {norm_mode}")
 
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
     data_cfg = cfg["data"]
@@ -510,23 +578,30 @@ def infer_single(
 
 def infer_batch(
     cfg_path: str,
-    checkpoint: str,
+    checkpoint: Optional[str],
     output_dir: str,
     split: str = "Training_prospective",
     modalities=None,
     pairs_filter=None,
     env_path=None,
-    n_steps: int = 50,
+    n_steps: Optional[int] = None,
     patch_size=None,
     stride=None,
     pad: int = 16,
-    norm_mode: str = "global",
+    norm_mode: Optional[str] = None,
     center_crop_only: bool = False,
     use_ema: bool = True,
     skip_existing: bool = False,
+    device: str = "cuda",
 ):
     cfg = load_yaml_with_include(cfg_path)
     cfg = resolve_paths(cfg, load_env(env_path))
+
+    checkpoint = str(_resolve_checkpoint(cfg)) if checkpoint is None else checkpoint
+    n_steps = _resolve_n_steps(cfg, n_steps)
+    norm_mode = _resolve_norm_mode(cfg, norm_mode)
+    print(f"  Resolved checkpoint: {checkpoint}")
+    print(f"  Resolved n_steps: {n_steps}, norm_mode: {norm_mode}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data_cfg = cfg["data"]
@@ -655,7 +730,8 @@ def infer_batch(
 def parse_args():
     p = argparse.ArgumentParser(description="MMFM-UNet V2 inference — batch or single image")
     p.add_argument("--config", required=True)
-    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--checkpoint", default=None,
+                   help="Path to checkpoint (default: auto-resolve from config output_dir)")
 
     # Single-image mode
     p.add_argument("--input", default=None,
@@ -682,13 +758,14 @@ def parse_args():
                    help="Subset of pairs to process, e.g. '0.1T_to_7T,1.5T_to_3T'")
 
     p.add_argument("--env", default="local")
-    p.add_argument("--n_steps", type=int, default=50)
+    p.add_argument("--n_steps", type=int, default=None,
+                   help="Number of ODE steps (default: cfg.inference.n_steps)")
     p.add_argument("--patch_size", type=int, nargs=3, default=[128, 128, 80])
     p.add_argument("--stride", type=int, nargs=3, default=[64, 64, 40])
     p.add_argument("--pad", type=int, default=16)
-    p.add_argument("--norm_mode", default="global",
+    p.add_argument("--norm_mode", default=None,
                    choices=["global", "crop_percentile", "per_patch"],
-                   help="Normalization strategy for 1mm inference")
+                   help="Normalization strategy for 1mm inference (default: cfg.inference.norm_mode)")
     p.add_argument("--center_crop_only", action="store_true",
                    help="DEBUG: process a single central crop only")
     p.add_argument("--skip_existing", action="store_true")

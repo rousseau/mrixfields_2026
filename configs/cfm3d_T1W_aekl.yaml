@@ -42,7 +42,7 @@ data:
   - 112
   - 128
   - 80
-  max_volumes_per_domain: null
+  max_volumes_per_domain:
 train:
   batch_size: 2
   num_workers: 4
@@ -64,4 +64,5 @@ inference:
   - 64
   - 64
   vae_decode_overlap: 0.25
+  norm_mode: global
 task_name: cfm3d_T1W_aekl

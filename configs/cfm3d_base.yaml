@@ -34,16 +34,16 @@ data:
   split: retro_train          # retro_train | pro_train | pro_val
   output_subdir: cfm3d/runs/cfm3d_{{TASK_NAME}}  # Will be replaced with task_name
   domains:
-    - 0.1T
-    - 1.5T
-    - 3T
-    - 5T
-    - 7T
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
   percentile_lower: 0.5
   percentile_upper: 99.5
   target_spacing: [1.0, 1.0, 1.0]   # mm, null pour conserver le spacing original
   volume_size: [112, 128, 80]       # [512, 512, 192] pour volumes complets
-  max_volumes_per_domain: null      # null = tous les volumes disponibles
+  max_volumes_per_domain:           # null = tous les volumes disponibles
 
 # ─── Entraînement ─────────────────────────────────────────────────────────────
 train:
@@ -66,3 +66,4 @@ inference:
   source_domain: 0.1T         # Domaine source par défaut
   vae_decode_patch_size: [64, 64, 64]   # Pour volumes complets
   vae_decode_overlap: 0.25
+  norm_mode: global

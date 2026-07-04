@@ -1,7 +1,8 @@
 method: cfm3d
 vae:
   vae_type: pythae_vae
-  checkpoint: outputs/pythae_vae/runs/pythae_vae_multimodal/weights/model_best.pth
+  checkpoint: 
+    outputs/pythae_vae/runs/pythae_vae_multimodal/weights/model_best.pth
   vae_config: configs/pythae_vae_multimodal.yaml
 model:
   spatial_dims: 3
@@ -39,7 +40,7 @@ data:
   - 128
   - 128
   - 128
-  max_volumes_per_domain: null
+  max_volumes_per_domain:
 train:
   batch_size: 1
   num_workers: 4
@@ -56,4 +57,5 @@ inference:
   n_steps: 50
   ode_solver: euler
   source_domain: 0.1T
+  norm_mode: global
 task_name: cfm3d_T1W_pythae_vae
