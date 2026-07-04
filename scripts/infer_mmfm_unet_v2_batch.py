@@ -149,8 +149,13 @@ def _normalize_global(vol, p_lo=0.5, p_hi=99.5):
     return (vol * 2.0 - 1.0).astype(np.float32)
 
 
-def _extract_patches(vol, patch_size, stride, pad=16):
+def _extract_patches(vol, patch_size, stride, pad=16, center_aligned=False):
     """Extract overlapping patches with boundary padding.
+
+    Args:
+        center_aligned: if True, center the patch grid on the volume so that
+            the brain center is closer to patch centers (better for models
+            trained on centered crops).
 
     Returns:
         patches: list of (ph, pw, pd) arrays
@@ -164,18 +169,42 @@ def _extract_patches(vol, patch_size, stride, pad=16):
     pad_hw = [(pad, pad), (pad, pad), (pad, pad)]
     vol_padded = np.pad(vol, pad_hw, mode="reflect")
 
-    positions = set()
+    def _grid_positions(length, patch_len, stride_len):
+        if length <= patch_len:
+            return [0]
+        n = int(np.ceil((length - patch_len) / stride_len)) + 1
+        total_span = (n - 1) * stride_len + patch_len
+        if center_aligned:
+            start = max(0, (length - total_span) // 2)
+        else:
+            start = 0
+        positions = []
+        for idx in range(n):
+            pos = start + idx * stride_len
+            # Clip to valid range
+            pos = min(pos, length - patch_len)
+            positions.append(pos)
+        # Deduplicate while preserving order
+        seen = set()
+        unique_positions = []
+        for pos in positions:
+            if pos not in seen:
+                seen.add(pos)
+                unique_positions.append(pos)
+        return unique_positions
+
     hp, wp, dp = vol_padded.shape
-    for i in range(0, hp, sh):
-        i0 = min(i, max(0, hp - ph)) if hp >= ph else 0
-        for j in range(0, wp, sw):
-            j0 = min(j, max(0, wp - pw)) if wp >= pw else 0
-            for k in range(0, dp, sd):
-                k0 = min(k, max(0, dp - pd)) if dp >= pd else 0
-                positions.add((i0, j0, k0))
+    i_positions = _grid_positions(hp, ph, sh)
+    j_positions = _grid_positions(wp, pw, sw)
+    k_positions = _grid_positions(dp, pd, sd)
+
+    positions = []
+    for i0 in i_positions:
+        for j0 in j_positions:
+            for k0 in k_positions:
+                positions.append((i0, j0, k0))
 
     patches = []
-    positions = list(positions)
     for (i0, j0, k0) in positions:
         patch = vol_padded[i0:i0 + ph, j0:j0 + pw, k0:k0 + pd]
         if patch.shape != (ph, pw, pd):
@@ -252,6 +281,8 @@ def process_volume(
     amp_dtype,
     norm_mode: str = "global",
     center_crop_only: bool = False,
+    blend_mode: str = "hann",
+    center_aligned: bool = False,
 ):
     """Generate a full-resolution prediction from a source NIfTI."""
     img_src = nib.load(str(nii_path))
@@ -291,8 +322,10 @@ def process_volume(
         pred_1mm[sh:sh + ph, sw:sw + pw, sd:sd + pd] = pred_crop
     else:
         # 3. Extract patches
-        patches, positions, padded_shape = _extract_patches(vol_1mm_norm, patch_size, stride, pad=pad)
-        blend_weights = _create_blend_weights(patch_size, mode="hann")
+        patches, positions, padded_shape = _extract_patches(
+            vol_1mm_norm, patch_size, stride, pad=pad, center_aligned=center_aligned
+        )
+        blend_weights = _create_blend_weights(patch_size, mode=blend_mode)
 
         # 4. Process each patch
         patch_outputs = []
@@ -457,6 +490,8 @@ def infer_single(
     pad: int = 16,
     norm_mode: Optional[str] = None,
     center_crop_only: bool = False,
+    blend_mode: str = "hann",
+    center_aligned: bool = False,
     use_ema: bool = True,
     device: str = "cuda",
 ):
@@ -550,6 +585,8 @@ def infer_single(
         amp_dtype=amp_dtype,
         norm_mode=norm_mode,
         center_crop_only=center_crop_only,
+        blend_mode=blend_mode,
+        center_aligned=center_aligned,
     )
 
     if output_path:
@@ -590,6 +627,8 @@ def infer_batch(
     pad: int = 16,
     norm_mode: Optional[str] = None,
     center_crop_only: bool = False,
+    blend_mode: str = "hann",
+    center_aligned: bool = False,
     use_ema: bool = True,
     skip_existing: bool = False,
     device: str = "cuda",
@@ -712,6 +751,8 @@ def infer_batch(
                     amp_dtype=amp_dtype,
                     norm_mode=norm_mode,
                     center_crop_only=center_crop_only,
+                    blend_mode=blend_mode,
+                    center_aligned=center_aligned,
                 )
 
                 nib.save(nib.Nifti1Image(pred_vol, affine, header), str(out_path))
@@ -766,6 +807,11 @@ def parse_args():
     p.add_argument("--norm_mode", default=None,
                    choices=["global", "crop_percentile", "per_patch"],
                    help="Normalization strategy for 1mm inference (default: cfg.inference.norm_mode)")
+    p.add_argument("--blend_mode", default="hann",
+                   choices=["hann", "uniform"],
+                   help="Patch blending weights (default: hann)")
+    p.add_argument("--center_aligned", action="store_true",
+                   help="Center the patch grid on the volume (recommended for full brain)")
     p.add_argument("--center_crop_only", action="store_true",
                    help="DEBUG: process a single central crop only")
     p.add_argument("--skip_existing", action="store_true")
@@ -795,6 +841,8 @@ if __name__ == "__main__":
             pad=args.pad,
             norm_mode=args.norm_mode,
             center_crop_only=args.center_crop_only,
+            blend_mode=args.blend_mode,
+            center_aligned=args.center_aligned,
             use_ema=not args.no_ema,
             device=args.device,
         )
@@ -823,6 +871,8 @@ if __name__ == "__main__":
             pad=args.pad,
             norm_mode=args.norm_mode,
             center_crop_only=args.center_crop_only,
+            blend_mode=args.blend_mode,
+            center_aligned=args.center_aligned,
             use_ema=not args.no_ema,
             skip_existing=args.skip_existing,
         )
