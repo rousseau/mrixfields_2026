@@ -39,6 +39,7 @@ data:
   - 128
   - 80
   max_volumes_per_domain:
+  random_crop_prob: 0.8
 train:
   batch_size: 2
   num_workers: 4

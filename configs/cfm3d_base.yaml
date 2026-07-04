@@ -46,6 +46,7 @@ data:
   max_volumes_per_domain:           # null = tous les volumes disponibles
 
 # ─── Entraînement ─────────────────────────────────────────────────────────────
+  random_crop_prob: 0.8
 train:
   batch_size: 2               # Reduce to 1 for VQ-VAE (latent 64ch)
   num_workers: 4

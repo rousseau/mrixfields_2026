@@ -78,6 +78,7 @@ data:
   max_volumes_per_class:
   num_workers: 4
 
+  random_crop_prob: 0.8
 train:
   batch_size: 2
   total_iters: 150000

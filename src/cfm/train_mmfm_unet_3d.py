@@ -238,6 +238,7 @@ def train(
     p_lo = data_cfg.get("percentile_lower", 0.5)
     p_hi = data_cfg.get("percentile_upper", 99.5)
     max_per_class = data_cfg.get("max_volumes_per_class", None)
+    random_crop_prob = float(data_cfg.get("random_crop_prob", 0.0))
 
     raw_vs = data_cfg.get("volume_size", None)
     if raw_vs is None:
@@ -307,6 +308,7 @@ def train(
         max_per_class=max_per_class,
         target_spacing=target_spacing,
         volume_size=volume_size,
+        random_crop_prob=random_crop_prob,
     )
 
     class_loaders: Dict[int, any] = {}

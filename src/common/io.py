@@ -127,6 +127,47 @@ def center_crop_or_pad_np(
     return vol[sh : sh + th, sw : sw + tw, sd : sd + td]
 
 
+def random_crop_or_pad_np(
+    vol: np.ndarray,
+    target_size: Tuple[int, int, int],
+    mode: str = "reflect",
+) -> np.ndarray:
+    """Random-crop ou pad un volume 3D NumPy vers target_size (H, W, D).
+
+    Le coin supérieur-gauche du crop est tiré aléatoirement dans les limites
+    valides. Si le volume est plus petit que target_size dans une dimension,
+    on pad centré comme dans center_crop_or_pad_np.
+
+    Args:
+        vol: Input volume (H, W, D).
+        target_size: Target shape (th, tw, td).
+        mode: Padding mode for np.pad.
+
+    Returns:
+        Volume of shape target_size.
+    """
+    th, tw, td = target_size
+    h, w, d = vol.shape[:3]
+
+    # Pad si le volume est trop petit (centré, pour garder tout le contenu)
+    ph = max(0, th - h)
+    pw = max(0, tw - w)
+    pd = max(0, td - d)
+    if ph > 0 or pw > 0 or pd > 0:
+        vol = np.pad(
+            vol,
+            [(ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (pd // 2, pd - pd // 2)],
+            mode=mode,
+        )
+        h, w, d = vol.shape[:3]
+
+    # Tirage aléatoire des offsets de crop
+    sh = np.random.randint(0, h - th + 1) if h > th else 0
+    sw = np.random.randint(0, w - tw + 1) if w > tw else 0
+    sd = np.random.randint(0, d - td + 1) if d > td else 0
+    return vol[sh : sh + th, sw : sw + tw, sd : sd + td]
+
+
 def center_crop_or_pad_tensor(
     tensor: torch.Tensor,
     target_size: Tuple[int, int, int],

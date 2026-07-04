@@ -28,6 +28,7 @@ from common.io import (
     center_crop_or_pad_np,
     load_nifti_volume,
     normalize_volume,
+    random_crop_or_pad_np,
     resample_volume,
 )
 
@@ -54,6 +55,7 @@ class MRIxFieldsBaseDataset(Dataset):
         target_spacing: Optional[Tuple[float, float, float]] = None,
         volume_size: Optional[Tuple[int, int, int]] = None,
         max_per_class: Optional[int] = None,
+        random_crop_prob: float = 0.0,
     ):
         self.data_root = Path(data_root)
         self.split = split
@@ -63,6 +65,7 @@ class MRIxFieldsBaseDataset(Dataset):
         self.percentile_upper = percentile_upper
         self.target_spacing = target_spacing
         self.volume_size = volume_size
+        self.random_crop_prob = random_crop_prob
 
         self.mod_to_idx = {m: i for i, m in enumerate(self.modalities)}
         self.field_to_idx = {f: i for i, f in enumerate(self.fields)}
@@ -97,11 +100,16 @@ class MRIxFieldsBaseDataset(Dataset):
         vol, _ = load_nifti_volume(
             path,
             target_spacing=self.target_spacing,
-            volume_size=self.volume_size,
             normalize=True,
             lo_pct=self.percentile_lower,
             hi_pct=self.percentile_upper,
         )
+        # Optional random crop for training diversity
+        if self.volume_size is not None:
+            if self.random_crop_prob > 0 and random.random() < self.random_crop_prob:
+                vol = random_crop_or_pad_np(vol, self.volume_size)
+            else:
+                vol = center_crop_or_pad_np(vol, self.volume_size)
         return torch.from_numpy(vol).unsqueeze(0)  # (1, H, W, D)
 
     def __len__(self) -> int:
@@ -213,6 +221,7 @@ class MultiModalNIfTILatentDataset(MRIxFieldsBaseDataset):
         target_spacing: Optional[Tuple[float, float, float]] = None,
         volume_size: Optional[Tuple[int, int, int]] = None,
         max_per_class: Optional[int] = None,
+        random_crop_prob: float = 0.0,
     ):
         super().__init__(
             data_root=data_root,
@@ -224,6 +233,7 @@ class MultiModalNIfTILatentDataset(MRIxFieldsBaseDataset):
             target_spacing=target_spacing,
             volume_size=volume_size,
             max_per_class=max_per_class,
+            random_crop_prob=random_crop_prob,
         )
         # Rebuild samples with flat class index
         self.samples = []
