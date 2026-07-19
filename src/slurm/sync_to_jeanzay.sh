@@ -45,14 +45,25 @@ rsync -avz --progress \
   outputs/medvae/runs/medvae_finetune_all/weights/ \
   "${JZ_HOST}:MRIX/mrixfields_2026/outputs/medvae/runs/medvae_finetune_all/weights/"
 
+# 4. Cache latent (1939 volumes, ~395 MB) — évite ~5h de pré-encodage sur Jean Zay
+echo "=== Sync cache latent (run 1) ==="
+rsync -avz --progress \
+  outputs/latent_cache/medvae_finetune_34ed8334/ \
+  "${JZ_HOST}:MRIX/mrixfields_2026/outputs/latent_cache/medvae_finetune_34ed8334/"
+
 cat <<EOF
 
 === Sync terminée ===
 
 Pour se connecter :  ssh jeanzay
 
-Sur Jean Zay, lancer l'inférence Task 3 :
+Sur Jean Zay, lancer l'entraînement Run 2 (reprise depuis Run 1) :
   cd \$WORK/MRIX/mrixfields_2026
+  sbatch src/slurm/train_mmfm_multimarginal_jeanzay.slurm \\
+    configs/mmfm3d_multimarginal_medvae_run2.yaml \\
+    outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/model_final.pth
+
+Ou l'inférence Task 3 (soumission validation) :
   sbatch src/slurm/infer_mmfm_jeanzay.slurm \\
     configs/mmfm3d_multimarginal_medvae_run1.yaml \\
     outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/model_final.pth \\

@@ -367,10 +367,11 @@ mrixfields_2026/
 │   │
 │   └── slurm/                          #   Jobs SLURM (Jean Zay uniquement)
 │       ├── setup_jeanzay.sh
-│       ├── sync_to_jeanzay.sh         #     Sync code + poids vers Jean Zay
+│       ├── sync_to_jeanzay.sh         #     Sync code + poids + cache vers Jean Zay
 │       ├── train_vae_jeanzay.slurm
 │       ├── train_vqvae_jeanzay.slurm
 │       ├── cfm_3d_jeanzay.slurm
+│       ├── train_mmfm_multimarginal_jeanzay.slurm  #   Run 2 multi-marginal (DDP 4×H100)
 │       ├── infer_mmfm_jeanzay.slurm   #     Inférence multi-GPU Task 3
 │       ├── stargan_jeanzay.slurm
 │       ├── benchmark_vae_jeanzay.slurm
