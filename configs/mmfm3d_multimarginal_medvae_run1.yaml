@@ -1,0 +1,91 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM multi-marginal Run 1 — UNet V1 whole-volume, 12h budget
+#
+# Basé sur configs/mmfm3d_multimarginal_medvae.yaml
+#   - UNet V1 [1,2,4] (178M params), 3 embeddings de contraste
+#   - Cache latents entiers (1, 44, 54, 44) pré-encodés
+#   - Batch 1 / targets_per_step 1 (volume entier = coûteux)
+#   - 12 000 iters ≈ 12h sur DGX GB10
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_unet
+task_name: mmfm3d_multimarginal_medvae_run1
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint: outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth
+  latent_channels: 1
+
+model:
+  model_channels: 128
+  channel_mult:
+  - 1
+  - 2
+  - 4
+  num_res_blocks: 2
+  attention_levels:
+  - false
+  - true
+  - true
+  num_head_channels: 64
+  norm_num_groups: 32
+  use_flash_attention: false
+  use_gradient_checkpointing: false
+  num_class_embeds: 3
+  use_factorized_attention: false
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 128
+  - 128
+  - 80
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  split: retro_train
+  output_subdir: cfm3d/runs/mmfm3d_multimarginal_medvae_run1
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/latent_cache
+  latent_cache_dir: outputs/latent_cache/medvae_finetune_34ed8334/retro_train
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  batch_size: 1
+  total_iters: 12000
+  num_targets_per_step: 1
+  lr: 1.0e-4
+  sigma: 0.0
+  ot_method: exact
+  adjacent_only: true
+  identity_prob: 0.15
+  save_every: 2000
+  print_every: 50
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 50
+  ode_solver: euler
+  norm_mode: global

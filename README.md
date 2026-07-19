@@ -33,6 +33,14 @@ conda activate mrixfields2026   # environnement dédié
 | Task 2 | Enhancement bas champ (0.1T → 1.5T/3T/5T/7T) |
 | Task 3 | Traduction any-to-any (modèle unifié) |
 
+## Méthodes principales
+
+| Méthode | Description | Doc |
+|---------|-------------|-----|
+| StarGAN 2D | Baseline any-to-any du challenge | `AGENTS.md` |
+| MMFM v1 vectorisé | Baseline MMFM sur latent aplati | `docs/MMFM_V1_VECTORIZED.md` |
+| **MMFM-UNet multi-marginal** | UNet 3D + formulation multi-marginale continue | `docs/MMFM3D_UNET_MULTIMARGINAL.md` |
+
 ## Évaluation
 
 Script d'évaluation unifié (nRMSE, SSIM, LPIPS, Dice, VolumeConsistency) :

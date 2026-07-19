@@ -9,7 +9,8 @@ Différences clés vs MMFM-MLP (train_mmfm_3d.py) :
   - Architecture : DiffusionModelUNet 3D (pas de flatten du latent)
   - Input : cat(z_t, z_src) → (B, 2*C_lat, H', W', D')  [comme CFM]
   - Output : champ vectoriel spatial (B, C_lat, H', W', D')
-  - Conditioning : AdaGN à chaque résolution (profond), num_class_embeds=15
+  - Conditioning : AdaGN à chaque résolution (profond), num_class_embeds configurable
+  - Multi-marginal : num_class_embeds = 3 contrastes, le temps = champ magnétique
   - Pas de LatentVectorizer — tout reste spatial
 
 Différences clés vs CFM 3D (train_cfm_3d.py) :
@@ -73,7 +74,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common.config import load_yaml_with_include, load_env, resolve_paths
-from common.dataset import MultiModalNIfTILatentDataset
+from common.dataset import MultiModalNIfTILatentDataset, LatentCacheDataset
 from common.distributed import is_main_process, EMAModel
 from common.io import (
     DOMAINS,
@@ -105,13 +106,55 @@ from torchcfm.conditional_flow_matching import (
 
 
 def _flat_class(mod_idx: int, field_idx: int, n_fields: int) -> int:
-    """Index de classe unique : mod_idx * n_fields + field_idx."""
+    """Index de classe unique : mod_idx * n_fields + field_idx.
+
+    NB : conservé pour rétro-compatibilité (loaders par (modalité, champ)).
+    Dans la formulation multi-marginal, la CLASSE conditionnante du réseau est
+    le CONTRASTE (mod_idx), et le CHAMP magnétique (field_idx) est mappé sur le
+    TEMPS via `_field_to_time`.
+    """
     return mod_idx * n_fields + field_idx
+
+
+def _unflat_class(flat: int, n_fields: int) -> Tuple[int, int]:
+    """Inverse de _flat_class : flat -> (mod_idx, field_idx)."""
+    return flat // n_fields, flat % n_fields
+
+
+def _field_to_time(field_idx: int, n_fields: int) -> float:
+    """Mappe un index de champ magnétique ordonné sur un temps uniforme [0,1].
+
+    Ex. 5 champs (0.1T,1.5T,3T,5T,7T) -> t = 0, 0.25, 0.5, 0.75, 1.0
+    """
+    if n_fields <= 1:
+        return 0.0
+    return field_idx / (n_fields - 1)
 
 
 def _make_infinite(loader: DataLoader):
     while True:
         yield from loader
+
+
+def _pad_to_multiple(z: torch.Tensor, mult: int = 4):
+    """Pad zéro les dims spatiales d'un tenseur (B, C, H, W, D) vers un multiple.
+
+    Retourne (z_padded, orig_spatial_shape) pour pouvoir cropper la sortie.
+    """
+    h, w, d = z.shape[-3:]
+    ph = (mult - h % mult) % mult
+    pw = (mult - w % mult) % mult
+    pd = (mult - d % mult) % mult
+    if ph or pw or pd:
+        # F.pad ordre : (d_l,d_r, w_l,w_r, h_l,h_r)
+        z = F.pad(z, (0, pd, 0, pw, 0, ph), mode="constant", value=0.0)
+    return z, (h, w, d)
+
+
+def _crop_to_shape(z: torch.Tensor, shape) -> torch.Tensor:
+    """Crop les dims spatiales d'un (B, C, H, W, D) vers `shape` (H,W,D)."""
+    h, w, d = shape
+    return z[..., :h, :w, :d]
 
 
 # ===========================================================================
@@ -221,6 +264,15 @@ def train(
     if resume is not None:
         cfg["resume"] = resume
 
+    # Réglages GPU : TF32 + cudnn autotune (accélère sur GB10, VRAM large)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
 
@@ -287,33 +339,65 @@ def train(
         print(f"World size : {world_size} | Device : {device}")
         print(f"Modalités  : {modalities}  |  Champs : {fields}  |  Classes : {n_classes}")
 
-    # ── VAE (frozen) ─────────────────────────────────────────────────────────
-    vae = load_vae(cfg, device)
-    if vae.latent_format != "spatial":
-        raise RuntimeError(
-            f"train_mmfm_unet_3d.py requiert un VAE spatial (latent_format='spatial'), "
-            f"mais '{cfg['vae'].get('vae_type', '?')}' a latent_format='{vae.latent_format}'. "
-            "Pour les VAE vectoriels (RHVAE), utilisez train_mmfm_3d.py."
+    # ── VAE (frozen) — chargé pour fallback encode & (toujours) métadonnées ───
+    use_latent_cache = bool(data_cfg.get("use_latent_cache", False))
+    flip_lr_prob = float(data_cfg.get("flip_lr_prob", 0.0))
+
+    vae = None
+    if not use_latent_cache:
+        vae = load_vae(cfg, device)
+        if vae.latent_format != "spatial":
+            raise RuntimeError(
+                f"train_mmfm_unet_3d.py requiert un VAE spatial (latent_format='spatial'), "
+                f"mais '{cfg['vae'].get('vae_type', '?')}' a latent_format='{vae.latent_format}'."
+            )
+        latent_channels = vae.latent_channels
+    else:
+        latent_channels = int(cfg["vae"].get("latent_channels", 1))
+
+    # ── Dataset : latents pré-encodés (cache) OU volumes à encoder à la volée ──
+    def _sample_class(sample):
+        """Retourne l'indice de classe d'un échantillon (tuple ou dict)."""
+        return sample["class_idx"] if isinstance(sample, dict) else sample[3]
+
+    if use_latent_cache:
+        cache_root = Path(data_cfg.get("latent_cache_root", "outputs/latent_cache"))
+        cache_dir = data_cfg.get("latent_cache_dir")
+        if cache_dir is None:
+            raise RuntimeError(
+                "use_latent_cache=True : renseignez data.latent_cache_dir "
+                "(ex. outputs/latent_cache/<vae_id>/retro_train)."
+            )
+        ds = LatentCacheDataset(
+            cache_dir=Path(cache_dir),
+            cache_root=cache_root,
+            preload_ram=bool(data_cfg.get("latent_preload_ram", True)),
+            flip_lr_prob=flip_lr_prob,
+            flip_axis=int(data_cfg.get("flip_axis", 0)),
         )
-    latent_channels = vae.latent_channels
+        if is_main_process():
+            print(f"  Cache latents : {cache_dir} | latent_shape={ds.latent_shape} "
+                  f"| flip_lr_prob={flip_lr_prob} | preload_ram={ds.preload_ram}")
+        if latent_channels != ds.latent_shape[0]:
+            latent_channels = ds.latent_shape[0]
+    else:
+        ds = MultiModalNIfTILatentDataset(
+            data_root=Path(data_root),
+            split=split,
+            modalities=modalities,
+            fields=fields,
+            percentile_lower=p_lo,
+            percentile_upper=p_hi,
+            max_per_class=max_per_class,
+            target_spacing=target_spacing,
+            volume_size=volume_size,
+            random_crop_prob=random_crop_prob,
+        )
 
-    # ── Dataset multimodal — 15 loaders (1 par classe) ───────────────────────
-    ds = MultiModalNIfTILatentDataset(
-        data_root=Path(data_root),
-        split=split,
-        modalities=modalities,
-        fields=fields,
-        percentile_lower=p_lo,
-        percentile_upper=p_hi,
-        max_per_class=max_per_class,
-        target_spacing=target_spacing,
-        volume_size=volume_size,
-        random_crop_prob=random_crop_prob,
-    )
-
+    persistent = num_workers > 0
     class_loaders: Dict[int, any] = {}
     for c_idx in range(n_classes):
-        class_indices = [i for i, (_, _, _, c) in enumerate(ds.samples) if c == c_idx]
+        class_indices = [i for i, s in enumerate(ds.samples) if _sample_class(s) == c_idx]
         if not class_indices:
             continue
         subset = torch.utils.data.Subset(ds, class_indices)
@@ -326,6 +410,8 @@ def train(
             num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
+            persistent_workers=persistent,
+            prefetch_factor=(4 if num_workers > 0 else None),
         )
         class_loaders[c_idx] = _make_infinite(loader)
 
@@ -333,9 +419,35 @@ def train(
     if len(available_classes) < 2:
         raise RuntimeError("Il faut au moins 2 classes (modalité, champ) non vides.")
 
+    # ── Multi-marginal : organiser les loaders par (contraste, champ) ──────────
+    # La CLASSE conditionnante du réseau est le CONTRASTE (mod_idx).
+    # Le CHAMP magnétique (field_idx) est un point temporel ordonné.
+    # contrast_fields[mod_idx] = liste triée des field_idx disponibles
+    contrast_fields: Dict[int, List[int]] = {}
+    for flat in available_classes:
+        m_idx, f_idx = _unflat_class(flat, n_fields)
+        contrast_fields.setdefault(m_idx, []).append(f_idx)
+    for m_idx in contrast_fields:
+        contrast_fields[m_idx] = sorted(contrast_fields[m_idx])
+
+    # Contrastes utilisables : ceux ayant >= 2 champs (pour définir une trajectoire)
+    usable_contrasts = [m for m, fs in contrast_fields.items() if len(fs) >= 2]
+    if not usable_contrasts:
+        raise RuntimeError(
+            "Aucun contraste n'a >= 2 champs disponibles ; impossible de définir "
+            "une trajectoire multi-marginal."
+        )
+
+    identity_prob = float(train_cfg.get("identity_prob", 0.1))
+    adjacent_only = bool(train_cfg.get("adjacent_only", True))
+
     if is_main_process():
         print(f"  Classes disponibles : {len(available_classes)}/{n_classes} "
               f"(volumes/classe min: 1, batch_size={batch_size})")
+        print(f"  Multi-marginal : contrastes utilisables={usable_contrasts} | "
+              f"champs/contraste={ {m: contrast_fields[m] for m in usable_contrasts} }")
+        print(f"  identity_prob={identity_prob} | adjacent_only={adjacent_only} | "
+              f"num_targets_per_step={num_targets_per_step}")
 
     # ── UNet 3D ───────────────────────────────────────────────────────────────
     unet = build_unet_3d(cfg, latent_channels, n_classes).to(device)
@@ -345,8 +457,11 @@ def train(
 
     if is_main_process():
         n_params = sum(p.numel() for p in raw_unet.parameters() if p.requires_grad)
+        # MONAI stocke l'embedding de classe sous class_embedding.weight (N, D)
+        n_cls = raw_unet.state_dict().get("class_embedding.weight", raw_unet.state_dict().get("class_embed.weight"))
+        n_cls = n_cls.shape[0] if n_cls is not None else n_classes
         print(f"UNet 3D MMFM : {n_params / 1e6:.1f}M params | "
-              f"latent_channels={latent_channels} | n_classes={n_classes}")
+              f"latent_channels={latent_channels} | n_class_embeds={n_cls}")
 
     ema = EMAModel(raw_unet, decay=ema_decay)
 
@@ -380,7 +495,7 @@ def train(
         raw_unet.load_state_dict(_remap_monai_attention_keys(state["model"]))
         optimizer.load_state_dict(state["optimizer"])
         if "ema" in state:
-            ema.load_state_dict(state["ema"])
+            ema.load_state_dict(_remap_monai_attention_keys(state["ema"]))
         if "scaler" in state and use_scaler and state["scaler"] is not None:
             scaler.load_state_dict(state["scaler"])
         start_iter = state.get("iter", 0) + 1
@@ -404,73 +519,120 @@ def train(
     recent_losses: deque = deque(maxlen=print_every)
 
     for step in range(start_iter, total_iters):
-        # Synchroniser le choix src/tgt entre tous les ranks DDP
+        # ── Échantillonnage multi-marginal ────────────────────────────────────
+        # On tire un CONTRASTE puis num_targets_per_step transitions de champ.
+        # Chaque transition = (field_i -> field_j) le long de l'axe temporel.
+        # rank 0 décide, puis broadcast en DDP.
+        def _sample_step_plan():
+            contrast = random.choice(usable_contrasts)
+            fields_avail = contrast_fields[contrast]
+            transitions = []
+            for _ in range(num_targets_per_step):
+                if random.random() < identity_prob:
+                    fi = random.choice(fields_avail)
+                    transitions.append((fi, fi))
+                    continue
+                if adjacent_only and len(fields_avail) >= 2:
+                    pos = random.randrange(len(fields_avail) - 1)
+                    fi, fj = fields_avail[pos], fields_avail[pos + 1]
+                    # sens aléatoire (montée/descente de champ)
+                    if random.random() < 0.5:
+                        fi, fj = fj, fi
+                else:
+                    fi, fj = random.sample(fields_avail, 2)
+                transitions.append((fi, fj))
+            return contrast, transitions
+
         if is_distributed:
             if dist.get_rank() == 0:
-                src_idx = torch.tensor(
-                    [random.randrange(len(available_classes))],
-                    dtype=torch.long, device=device,
-                )
-                tgt_candidates = [c for c in available_classes
-                                  if c != available_classes[src_idx.item()]]
-                k = min(num_targets_per_step, len(tgt_candidates))
-                tgt_idx_t = torch.tensor(
-                    random.sample(range(len(tgt_candidates)), k),
-                    dtype=torch.long, device=device,
-                )
-                # Broadcast : [src_idx, k, tgt_idx_0, tgt_idx_1, ...]
-                msg = torch.cat([src_idx, torch.tensor([k], device=device), tgt_idx_t])
+                contrast, transitions = _sample_step_plan()
+                flat = [contrast]
+                for (fi, fj) in transitions:
+                    flat += [fi, fj]
+                msg = torch.tensor(flat, dtype=torch.long, device=device)
             else:
-                # Taille max = 1 + 1 + num_targets_per_step
-                msg = torch.zeros(2 + num_targets_per_step, dtype=torch.long, device=device)
+                msg = torch.zeros(1 + 2 * num_targets_per_step, dtype=torch.long, device=device)
             dist.broadcast(msg, src=0)
-            src_class = available_classes[msg[0].item()]
-            k = int(msg[1].item())
-            tgt_candidates = [c for c in available_classes if c != src_class]
-            tgt_classes = [tgt_candidates[msg[2 + i].item()] for i in range(k)]
+            contrast = int(msg[0].item())
+            transitions = [
+                (int(msg[1 + 2 * i].item()), int(msg[2 + 2 * i].item()))
+                for i in range(num_targets_per_step)
+            ]
         else:
-            src_class = random.choice(available_classes)
-            tgt_candidates = [c for c in available_classes if c != src_class]
-            k = min(num_targets_per_step, len(tgt_candidates))
-            tgt_classes = random.sample(tgt_candidates, k=k)
-
-        src_batch = next(class_loaders[src_class])
-        src_x = src_batch[0].to(device)
+            contrast, transitions = _sample_step_plan()
 
         optimizer.zero_grad(set_to_none=True)
         step_losses = []
+        k = len(transitions)
 
-        for tgt_class in tgt_classes:
-            tgt_batch = next(class_loaders[tgt_class])
-            tgt_x = tgt_batch[0].to(device)
+        for (fi, fj) in transitions:
+            src_flat = _flat_class(contrast, fi, n_fields)
+            tgt_flat = _flat_class(contrast, fj, n_fields)
 
-            # Encode (VAE frozen, no grad)
-            with torch.no_grad(), torch.amp.autocast(
-                "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
-            ):
-                z_src = vae.encode(src_x)   # (B, C_lat, H', W', D')
-                z_tgt = vae.encode(tgt_x)
+            src_item = next(class_loaders[src_flat])[0].to(device)
+            if fi == fj:
+                tgt_item = src_item  # cas identité : même distribution
+            else:
+                tgt_item = next(class_loaders[tgt_flat])[0].to(device)
 
-            # OT-CFM en espace latent spatial
-            t_batch, z_t, ut = FM.sample_location_and_conditional_flow(z_src, z_tgt)
+            if use_latent_cache:
+                # Les items sont déjà des latents (C, H', W', D') → (B, C, H', W', D')
+                z_src = src_item.float()
+                z_tgt = z_src if fi == fj else tgt_item.float()
+            else:
+                # Encode (VAE frozen, no grad)
+                with torch.no_grad(), torch.amp.autocast(
+                    "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+                ):
+                    z_src = vae.encode(src_item)   # (B, C_lat, H', W', D')
+                    z_tgt = z_src if fi == fj else vae.encode(tgt_item)
 
-            z_in = torch.cat([z_t, z_src], dim=1)        # (B, 2*C_lat, H', W', D')
-            t_vec = t_batch.to(device).float()
+            # Pad zéro des dims spatiales vers multiple de 4 (contrainte UNet 3 niveaux)
+            z_src, _ = _pad_to_multiple(z_src, 4)
+            z_tgt, _ = _pad_to_multiple(z_tgt, 4)
+
+            # Temps globaux des deux marginales sur l'axe champ
+            t_i = _field_to_time(fi, n_fields)
+            t_j = _field_to_time(fj, n_fields)
+            dt_field = t_j - t_i  # peut être négatif (descente de champ)
+
+            if fi == fj:
+                # Cas identité : vitesse nulle, temps uniforme sur [0,1].
+                B = z_src.shape[0]
+                s = torch.rand(B, device=device)
+                t_global = s  # n'importe quel temps → vitesse nulle
+                z_t = z_src
+                ut_global = torch.zeros_like(z_src)
+                # z_cond = z_src (ancre l'anatomie)
+                z_cond = z_src
+            else:
+                # OT-CFM entre les deux marginales adjacentes (données non appariées)
+                t_local, z_t, ut_local = FM.sample_location_and_conditional_flow(z_src, z_tgt)
+                # t_local ~ U[0,1] : position dans l'intervalle [t_i, t_j]
+                t_global = t_i + t_local.to(device) * dt_field
+                # Vitesse en temps GLOBAL : dz/dt_global = (z_j - z_i)/(t_j - t_i)
+                ut_global = ut_local / dt_field
+                # Conditionnement anatomique : le point de départ de la trajectoire (z au champ source fi)
+                z_cond = z_src
+
+            z_in = torch.cat([z_t, z_cond], dim=1)  # (B, 2*C_lat, H', W', D')
+            t_vec = t_global.float()
             y = torch.full(
-                (z_src.shape[0],), tgt_class, dtype=torch.long, device=device
+                (z_src.shape[0],), contrast, dtype=torch.long, device=device
             )
 
             with torch.amp.autocast(
                 "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
             ):
                 vt = raw_unet(x=z_in, timesteps=t_vec, class_labels=y)
-                loss = F.mse_loss(vt, ut) / float(k)
+                loss = F.mse_loss(vt, ut_global) / float(k)
 
             if use_scaler:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
             step_losses.append(float(loss.item() * k))
+
 
         # Gradient step
         if use_scaler:
@@ -504,7 +666,7 @@ def train(
                 f"  loss={avg_recent:.4f}"
                 f"  grad={float(grad_norm):.2f}"
                 f"  lr={lr_cur:.2e}"
-                f"  src={src_class}→{tgt_classes}"
+                f"  contrast={contrast}→fields{transitions}"
                 f"  speed={it_s:.2f} it/s"
                 f"  eta={eta_s / 3600:.2f}h"
                 f"  t={elapsed / 60:.1f}min"
@@ -535,6 +697,7 @@ def train(
                     "scaler": scaler.state_dict() if use_scaler else None,
                     "cfg_path": str(cfg_path),
                     "n_classes": n_classes,
+                    "num_class_embeds": int(cfg["model"].get("num_class_embeds", len(modalities))),
                     "modalities": modalities,
                     "fields": fields,
                 },
@@ -553,6 +716,7 @@ def train(
                 "scaler": scaler.state_dict() if use_scaler else None,
                 "cfg_path": str(cfg_path),
                 "n_classes": n_classes,
+                "num_class_embeds": int(cfg["model"].get("num_class_embeds", len(modalities))),
                 "modalities": modalities,
                 "fields": fields,
             },
@@ -579,17 +743,11 @@ def _euler_integrate(
     use_amp: bool = False,
     amp_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Intégration Euler spatiale : z_src → z_tgt.
+    """[LEGACY] Intégration Euler spatiale sur [0,1] conditionnée par classe.
 
-    Args:
-        unet: DiffusionModelUNet chargé, en mode eval.
-        z_src: Latent source, shape (1, C_lat, H', W', D').
-        tgt_class: Indice de classe cible (mod_idx * n_fields + field_idx).
-        n_steps: Nombre de pas Euler.
-        device: Périphérique de calcul.
-
-    Returns:
-        Latent prédit, shape (1, C_lat, H', W', D').
+    Conservée pour compatibilité avec les scripts d'inférence hérités
+    (ex. scripts/infer_mmfm_unet_v2_batch.py). La formulation multi-marginal
+    utilise `_euler_integrate_mm`.
     """
     dt = 1.0 / n_steps
     z = z_src.clone().to(device)
@@ -604,6 +762,54 @@ def _euler_integrate(
         z = z + dt * vt.float()
 
     return z
+
+
+@torch.no_grad()
+def _euler_integrate_mm(
+    unet: DiffusionModelUNet,
+    z_src: torch.Tensor,
+    contrast_class: int,
+    t_start: float,
+    t_end: float,
+    n_steps: int,
+    device: torch.device,
+    use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Intégration multi-marginal : trajectoire continue de t_start à t_end.
+
+    Le CHAMP magnétique est l'axe temporel (t_start, t_end ∈ [0,1] donnés par
+    `_field_to_time`). Le CONTRASTE est la classe conditionnante. L'anatomie
+    source `z_src` est concaténée à chaque pas (ancre structurelle).
+
+    Intègre l'EDO globale dz/dt = v_θ(z, t, contraste) de t_start vers t_end en
+    `n_steps` pas Euler (passe par les champs intermédiaires : trajectoire unique).
+    Supporte la montée (t_end>t_start) et la descente (t_end<t_start) de champ.
+
+    Args:
+        z_src: Latent source au champ de départ, shape (1, C_lat, H', W', D').
+        contrast_class: indice de contraste (0=T1W, 1=T2W, 2=T2FLAIR).
+        t_start, t_end: temps globaux (champ source, champ cible).
+        n_steps: nombre de pas Euler sur l'intervalle [t_start, t_end].
+
+    Returns:
+        Latent prédit au champ cible, shape (1, C_lat, H', W', D').
+    """
+    z_anchor = z_src.clone().to(device)
+    z = z_src.clone().to(device)
+    y = torch.tensor([contrast_class], dtype=torch.long, device=device)
+
+    dt = (t_end - t_start) / n_steps  # signé (peut être négatif)
+    for step_i in range(n_steps):
+        t_val = t_start + step_i * dt
+        t_vec = torch.tensor([t_val], dtype=torch.float32, device=device)
+        z_in = torch.cat([z, z_anchor], dim=1)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            vt = unet(x=z_in, timesteps=t_vec, class_labels=y)
+        z = z + dt * vt.float()
+
+    return z
+
 
 
 def infer(
@@ -644,7 +850,8 @@ def infer(
     modalities: List[str] = data_cfg.get("modalities", MODALITIES)
     fields: List[str] = data_cfg.get("fields", DOMAINS)
     n_fields = len(fields)
-    n_classes = len(modalities) * n_fields
+    n_contrasts = len(modalities)
+    n_classes = n_contrasts  # multi-marginal : la classe conditionnante = contraste
 
     # Valider source/cible
     for name, val, lst in [
@@ -656,13 +863,23 @@ def infer(
         if val not in lst:
             raise ValueError(f"{name}='{val}' non présent dans la config ({lst})")
 
-    tgt_mod_idx = modalities.index(target_modality)
+    if source_modality != target_modality:
+        raise ValueError(
+            "MMFM multi-marginal : le contraste est invariant le long de la "
+            f"trajectoire de champ. source_modality={source_modality} doit égaler "
+            f"target_modality={target_modality}. (Task 3 = translation de champ.)"
+        )
+
+    contrast_class = modalities.index(source_modality)
+    src_field_idx = fields.index(source_field)
     tgt_field_idx = fields.index(target_field)
-    tgt_class = _flat_class(tgt_mod_idx, tgt_field_idx, n_fields)
+    t_start = _field_to_time(src_field_idx, n_fields)
+    t_end = _field_to_time(tgt_field_idx, n_fields)
 
     print(
-        f"Inférence MMFM-UNet : {source_modality}@{source_field} → "
-        f"{target_modality}@{target_field}  |  tgt_class={tgt_class}  |  {n_steps} steps Euler"
+        f"Inférence MMFM multi-marginal : {source_modality}@{source_field} → "
+        f"{target_modality}@{target_field}  |  contrast={contrast_class}  |  "
+        f"t:{t_start:.3f}→{t_end:.3f}  |  {n_steps} steps Euler (multi-pas)"
     )
 
     # ── VAE ───────────────────────────────────────────────────────────────────
@@ -677,12 +894,12 @@ def infer(
     unet = build_unet_3d(cfg, latent_channels, n_classes).to(device)
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
 
-    # Vérifier cohérence n_classes
-    saved_n_classes = ckpt.get("n_classes", None)
-    if saved_n_classes is not None and saved_n_classes != n_classes:
+    # Vérifier cohérence du nombre de classes conditionnantes (contrastes)
+    saved_nce = ckpt.get("num_class_embeds", None)
+    if saved_nce is not None and saved_nce != n_classes:
         raise RuntimeError(
-            f"Incohérence n_classes : checkpoint={saved_n_classes}, "
-            f"config courante={n_classes}. Utilisez la même config que lors de l'entraînement."
+            f"Incohérence num_class_embeds : checkpoint={saved_nce}, "
+            f"config courante={n_classes}. Utilisez la même config qu'à l'entraînement."
         )
 
     # Charger EMA si disponible
@@ -693,6 +910,10 @@ def infer(
         if shadow is not None:
             unet.load_state_dict(_remap_monai_attention_keys(shadow))
             loaded_from = "ema.shadow_params"
+        elif isinstance(ema_state, dict) and ema_state:
+            # EMAModel.state_dict() plat (OrderedDict de poids)
+            unet.load_state_dict(_remap_monai_attention_keys(ema_state))
+            loaded_from = "ema"
         else:
             unet.load_state_dict(_remap_monai_attention_keys(ckpt["model"]))
     else:
@@ -755,8 +976,16 @@ def infer(
         ):
             z_src = vae.encode(vol_tensor)
 
-        # Intégration Euler spatiale
-        z_tgt = _euler_integrate(unet, z_src, tgt_class, n_steps, device, use_amp, amp_dtype)
+        # Pad zéro des dims latentes vers multiple de 4 (contrainte UNet 3 niveaux),
+        # puis crop retour à la forme latente d'origine avant décodage.
+        z_src_p, lat_shape = _pad_to_multiple(z_src, 4)
+
+        # Intégration multi-marginal : trajectoire continue t_start → t_end
+        z_tgt_p = _euler_integrate_mm(
+            unet, z_src_p, contrast_class, t_start, t_end, n_steps,
+            device, use_amp, amp_dtype,
+        )
+        z_tgt = _crop_to_shape(z_tgt_p, lat_shape)
 
         # Decode
         with torch.no_grad(), torch.amp.autocast(
@@ -766,6 +995,10 @@ def infer(
 
         pred_vol = recon.squeeze().cpu().float().numpy()
         pred_vol = (np.clip(pred_vol, -1.0, 1.0) + 1.0) / 2.0  # [-1,1] → [0,1]
+
+        # Apply source brain mask (background normalized to -1 is excluded)
+        brain_mask = (vol > -0.99).astype(np.float32)
+        pred_vol = pred_vol * brain_mask
 
         stem = nii_path.name.replace(".nii.gz", "")
         out_name = f"{stem}_{target_modality}_{target_field}_mmfm_unet.nii.gz"

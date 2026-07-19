@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM multi-marginal — Task 3 (translation de champ magnétique)
+#
+# Reformulation Multi-Marginal Flow Matching :
+#   - CLASSE conditionnante  = CONTRASTE (T1W/T2W/T2FLAIR) → num_class_embeds: 3
+#   - TEMPS (axe du flow)     = CHAMP magnétique ordonné (0.1T<1.5T<3T<5T<7T)
+#                               mappé uniformément sur [0,1] : 0,.25,.5,.75,1
+#   - Couplage OT minibatch entre marginales ADJACENTES (adjacent_only: true)
+#   - Cas identité (champ cible = source ⇒ vitesse nulle) : identity_prob
+#   - Anatomie ancrée par concaténation de z_source à chaque pas
+#
+# Architecture : reprise de MMFM-UNet V1 [1,2,4] (contraste OK, pas d'attention
+# factorisée V2). Inférence = intégration multi-pas de t_source à t_cible.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_unet
+task_name: mmfm3d_multimarginal_medvae
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint: outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth
+  latent_channels: 1
+
+model:
+  model_channels: 128
+  channel_mult:
+  - 1
+  - 2
+  - 4
+  num_res_blocks: 2
+  attention_levels:
+  - false
+  - true
+  - true
+  num_head_channels: 64
+  norm_num_groups: 32
+  use_flash_attention: false
+  use_gradient_checkpointing: false
+  # Multi-marginal : la classe conditionnante est le CONTRASTE (3), pas 15.
+  num_class_embeds: 3
+  use_factorized_attention: false
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 128
+  - 128
+  - 80
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  split: retro_train
+  output_subdir: cfm3d/runs/mmfm3d_multimarginal_medvae
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 10
+  # Cache de latents pré-encodés (volume entier, pas de crop) → entraînement rapide
+  use_latent_cache: true
+  latent_cache_root: outputs/latent_cache
+  latent_cache_dir: outputs/latent_cache/medvae_finetune_34ed8334/retro_train
+  latent_preload_ram: true
+  # Augmentation : flip gauche/droite uniquement (axe latéral H du latent)
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  # (plus de random crop : on traite le volume entier)
+  random_crop_prob: 0.0
+
+train:
+  batch_size: 8
+  total_iters: 150000
+  num_targets_per_step: 2
+  lr: 1.0e-4
+  sigma: 0.0
+  ot_method: exact          # OT minibatch entre marginales adjacentes
+  adjacent_only: true       # ne coupler que des champs voisins sur l'axe
+  identity_prob: 0.15       # fraction de pas "identité" (ancre l'anatomie)
+  save_every: 5000
+  print_every: 200
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 50               # pas Euler sur toute la trajectoire t_src→t_tgt
+  ode_solver: euler
+  norm_mode: global

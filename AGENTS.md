@@ -337,6 +337,9 @@ mrixfields_2026/
 │   ├── cfm/                            #   Étape 3 : CFM
 │   │   ├── train_cfm_3d.py             #     OT-CFM 3D latent
 │   │   ├── train_mmfm_3d.py            #     MMFM vectorisé
+│   │   ├── train_mmfm_unet_3d.py       #     MMFM-UNet 3D (multi-marginal)
+│   │   ├── precompute_latents.py       #     Cache de latents pour MMFM-UNet
+│   │   ├── infer_mmfm_unified.py       #     Inférence any-to-any MMFM
 │   │   ├── test_mmfm_v1_smoke.py       #     Smoke test MMFM
 │   │   └── mmfm_vectorized.py          #     Briques vectorielles
 │   │
@@ -364,13 +367,16 @@ mrixfields_2026/
 │   │
 │   └── slurm/                          #   Jobs SLURM (Jean Zay uniquement)
 │       ├── setup_jeanzay.sh
+│       ├── sync_to_jeanzay.sh         #     Sync code + poids vers Jean Zay
 │       ├── train_vae_jeanzay.slurm
 │       ├── train_vqvae_jeanzay.slurm
 │       ├── cfm_3d_jeanzay.slurm
+│       ├── infer_mmfm_jeanzay.slurm   #     Inférence multi-GPU Task 3
 │       ├── stargan_jeanzay.slurm
 │       ├── benchmark_vae_jeanzay.slurm
 │       ├── submit_train_vae_jeanzay.sh
-│       └── launch_cfm3d_dgx.sh         #     Lancement multi-GPU local (DGX)
+│       ├── launch_cfm3d_dgx.sh         #     Lancement multi-GPU local (DGX)
+│       └── run_mmfm_multimarginal_night.sh  #     Pré-encode + entraîne MMFM-UNet
 │
 ├── outputs/                            # ── SORTIES LOURDES (gitignore) ──
 │   ├── vae3d/runs/vae3d_T1W/weights/   #   AEKL — 20 ckpts + model_best + model_final ✅
@@ -434,6 +440,8 @@ mrixfields_2026/
 | `vae3d_T1W.yaml` | AEKL 3D, T1W |
 | `cfm3d_T1W.yaml` | OT-CFM 3D latent, T1W |
 | `cfm2d_T1W_H100_B16.yaml` | OT-CFM 2D, T1W, H100, batch 16 |
+| `mmfm3d_multimarginal_medvae.yaml` | MMFM-UNet multi-marginal, config de base |
+| `mmfm3d_multimarginal_medvae_run1.yaml` | MMFM-UNet multi-marginal, run 1 (12h) |
 
 ### Logs
 
@@ -449,12 +457,13 @@ mrixfields_2026/
 | 2 | AEKL 3D (T1W) | ✅ Terminé | `vae3d_T1W/weights/model_best.pth` |
 | 2 | VQ-VAE NeuroQuant (T1W) | ✅ Smoke tests | `vqvae3d/runs/smoke_*` |
 | 2 | MedVAE frozen | ⏳ À évaluer | poids HuggingFace |
-| 2 | MedVAE fine-tuné | ⏳ À lancer | — |
+| 2 | MedVAE fine-tuné | ✅ Terminé | `outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth` |
 | 2 | Benchmark VAE | ✅ Partiel | `results/benchmark_vae/metrics/` |
 | 3 | OT-CFM 3D + MedVAE (T1W) | ⏳ À lancer | `cfm3d_T1W_medvae/weights/` |
 | 3 | OT-CFM 3D + AEKL (T1W) | ⏳ Comparatif | `cfm3d_T1W_aekl/weights/` |
 | 3 | OT-CFM 3D + VQ-VAE (T1W) | ⏳ Comparatif | `cfm3d_T1W_vqvae/weights/` |
 | 4 | MedVAE vectorisé + MMFM | ✅ Baseline v1 | `cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1/weights/` |
+| 4 | **MedVAE + MMFM-UNet multi-marginal** | ⏳ En cours (Run 1) | `cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/` |
 | — | Script évaluation unifié | ✅ Terminé | `src/evaluation/evaluate.py` (5 méthodes) |
 | — | Tableau métriques | ⏳ À initialiser | `results/evaluation_table.csv` |
 | — | Paper | ⬜ Vide | `paper/` |

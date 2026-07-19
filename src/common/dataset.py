@@ -386,3 +386,84 @@ class MRIxFieldsPairedDataset(Dataset):
             "tgt_field": torch.tensor(tgt_field_idx, dtype=torch.long),
             "is_paired": torch.tensor(1 if is_paired else 0, dtype=torch.float32),
         }
+
+
+# --------------------------------------------------------------------------- #
+# Latent cache dataset (MMFM multi-marginal, fast training)                   #
+# --------------------------------------------------------------------------- #
+
+import json as _json
+
+
+class LatentCacheDataset(Dataset):
+    """Dataset de latents MedVAE pré-encodés (volume ENTIER, pas de crop).
+
+    Lit un cache produit par src/cfm/precompute_latents.py. Les latents sont
+    chargés en RAM au démarrage (option) puis servis tels quels, avec une
+    augmentation optionnelle par flip gauche/droite (axe latéral).
+
+    Retourne (latent_tensor, mod_idx, field_idx, class_idx) où latent_tensor
+    est (C, H', W', D') en float32.
+
+    Args:
+        cache_dir: dossier contenant index.json (…/latent_cache/<vae_id>/<split>).
+        cache_root: racine relative aux chemins de l'index (…/latent_cache).
+        preload_ram: si True, charge tous les latents en RAM.
+        flip_lr_prob: probabilité de flip gauche/droite.
+        flip_axis: axe spatial du flip dans le latent (0=H,1=W,2=D). Défaut 0.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        cache_root: Path,
+        preload_ram: bool = True,
+        flip_lr_prob: float = 0.0,
+        flip_axis: int = 0,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.cache_root = Path(cache_root)
+        self.preload_ram = preload_ram
+        self.flip_lr_prob = flip_lr_prob
+        self.flip_axis = flip_axis
+
+        index_path = self.cache_dir / "index.json"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Index de cache introuvable : {index_path}")
+        with open(index_path) as f:
+            self.meta = _json.load(f)
+
+        self.samples = self.meta["samples"]
+        if not self.samples:
+            raise RuntimeError(f"Cache vide : {index_path}")
+        self.latent_shape = tuple(self.meta.get("latent_shape") or ())
+
+        self._ram: Dict[str, torch.Tensor] = {}
+        if self.preload_ram:
+            for s in self.samples:
+                self._ram[s["path"]] = self._load_disk(s["path"])
+
+    def _load_disk(self, rel_path: str) -> torch.Tensor:
+        z = torch.load(self.cache_root / rel_path, map_location="cpu")
+        return z.to(torch.float32)
+
+    def _get_latent(self, rel_path: str) -> torch.Tensor:
+        if self.preload_ram:
+            return self._ram[rel_path].clone()
+        return self._load_disk(rel_path)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        z = self._get_latent(s["path"])  # (C, H', W', D')
+        if self.flip_lr_prob > 0 and random.random() < self.flip_lr_prob:
+            # axe spatial +1 car dim0 = canaux
+            z = torch.flip(z, dims=[self.flip_axis + 1])
+        return (
+            z,
+            torch.tensor(s["mod_idx"], dtype=torch.long),
+            torch.tensor(s["field_idx"], dtype=torch.long),
+            torch.tensor(s["class_idx"], dtype=torch.long),
+        )
