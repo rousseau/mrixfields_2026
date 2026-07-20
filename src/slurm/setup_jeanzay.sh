@@ -97,7 +97,7 @@ fi
 # ─── 3. Installer les dépendances Python ─────────────────────────
 echo ""
 echo "[3/4] Installation des dépendances Python.."
-echo "      (nibabel, scipy, einops, torchcfm, pot, torchdiffeq, monai, pythae, medvae)"
+echo "      (nibabel, scipy, einops, matplotlib pandas, torchcfm, pot, torchdiffeq, monai, pythae, medvae)"
 
 module purge
 module load arch/h100
@@ -111,7 +111,7 @@ export HF_HOME="$WORK/.cache/huggingface"
 export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
 mkdir -p "$HF_HOME"
 
-pip install --user --no-cache-dir nibabel scipy einops
+pip install --user --no-cache-dir nibabel scipy einops matplotlib pandas
 pip install --user --no-cache-dir torchcfm pot torchdiffeq
 pip install --user --no-cache-dir "monai[all]>=1.3.0"
 pip install --user --no-cache-dir pythae
