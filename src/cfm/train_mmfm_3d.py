@@ -443,10 +443,14 @@ def train(
                 # If identity: ut_global = 0
                 if f_src == f_tgt:
                     ut = torch.zeros_like(z_src_vec)
-                else:
-                    ut = (z_tgt_vec - z_src_vec) / max(t_j - t_i, 1e-8)
-                    # Note: we actually use the flow matcher's ut if it handles the scaling,
-                    # but since we are manually calculating t_global, we must scale ut.
+                 else:
+                     # Use a larger epsilon to prevent numerical explosion when t_j approx t_i
+                     dt = max(t_j - t_i, 1e-4)
+                     ut = (z_tgt_vec - z_src_vec) / dt
+                     # Clamp ut to prevent extreme values from exploding the MSE loss
+                     ut = torch.clamp(ut, min=-1e6, max=1e6)
+                     # Note: we actually use the FM's ut if it handles the scaling,
+                     # but since we are manually calculating t_global, we must scale ut.
                     # In v1, we used FM.sample_location_and_conditional_flow.
                     # In v2, we bypass it for the global projection.
             else:
