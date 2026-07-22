@@ -1,0 +1,89 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM-UNet v1 — Fine-tuning depuis le modèle entraîné à 150k iters
+#
+# Reprend les poids de mmfm3d_unet_medvae_multimodal (150k iters, crop centré
+# puis random crop) et fine-tune avec random_crop 80% pendant ~24h.
+#
+# Lancement local DGX GB10 (Spark) :
+#   bash src/slurm/launch_cfm3d_dgx.sh mmfm_unet T1W 1 \
+#       configs/mmfm3d_unet_medvae_multimodal_finetune.yaml
+#
+# Ou directement avec resume explicite :
+#   python src/cfm/train_mmfm_unet_3d.py \
+#       --config configs/mmfm3d_unet_medvae_multimodal_finetune.yaml \
+#       --env local \
+#       --resume outputs/cfm3d/runs/mmfm3d_unet_medvae_multimodal/weights/model_final.pth
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_unet
+task_name: mmfm3d_unet_medvae_multimodal_finetune
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint: outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth
+
+model:
+  model_channels: 128
+  channel_mult:
+  - 1
+  - 2
+  - 4
+  num_res_blocks: 2
+  attention_levels:
+  - false
+  - true
+  - true
+  num_head_channels: 64
+  norm_num_groups: 32
+  use_flash_attention: false
+  use_gradient_checkpointing: true
+  num_class_embeds: 15
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 128
+  - 128
+  - 80
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  split: retro_train
+  output_subdir: cfm3d/runs/mmfm3d_unet_medvae_multimodal_finetune
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  random_crop_prob: 0.8
+
+train:
+  batch_size: 2
+  # ~24h de fine-tuning à ~0.08-0.12 it/s (UNet v1 DGX GB10)
+  total_iters: 160000
+  num_targets_per_step: 2
+  lr: 1.0e-4
+  sigma: 0.0
+  ot_method: exact
+  save_every: 5000
+  print_every: 200
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 50
+  ode_solver: euler
+  norm_mode: global

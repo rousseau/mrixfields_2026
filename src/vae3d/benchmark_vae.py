@@ -62,6 +62,7 @@ def load_prospective_volume(
     subject_id: str,
 ) -> Optional[np.ndarray]:
     """Load, normalize and return a prospective volume as float32 numpy in [0,1]."""
+    data_root = Path(data_root)
     vol_dir = data_root / "Training_prospective" / modality / field
     if not vol_dir.exists():
         return None

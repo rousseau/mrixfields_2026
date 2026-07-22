@@ -58,3 +58,4 @@ results/*.pdf
 
 # ── Scripts locaux (hors repo public, contient des identifiants) ──
 scripts/
+external/

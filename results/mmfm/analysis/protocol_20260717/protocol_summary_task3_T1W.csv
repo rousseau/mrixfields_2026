@@ -1,0 +1,4 @@
+model,global_nrmse_mean,global_ssim_mean,global_lpips_mean
+mmfm_vector_latest,1.264267,0.794855,0.213992
+mmfm_unet_v1_latest,2.098466,0.782719,0.240626
+mmfm_unet_v2_latest,1.432851,0.751419,0.231724

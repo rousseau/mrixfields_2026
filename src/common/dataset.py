@@ -266,6 +266,18 @@ class MultiModalNIfTILatentDataset(MRIxFieldsBaseDataset):
             torch.tensor(class_idx, dtype=torch.long),
         )
 
+    def check_coherence(self) -> Dict[str, any]:
+        """Verify indexing and cardinality for each modality and field."""
+        stats = {}
+        for m_idx, m_name in enumerate(self.modalities):
+            m_stats = {}
+            for f_idx, f_name in enumerate(self.fields):
+                count = sum(1 for s in self.samples if s[1] == m_idx and s[2] == f_idx)
+                m_stats[f_name] = count
+            stats[m_name] = m_stats
+        return stats
+
+
 
 # --------------------------------------------------------------------------- #
 # Paired dataset (for VQ-VAE / disentanglement)                               #

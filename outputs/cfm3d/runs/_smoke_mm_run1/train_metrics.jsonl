@@ -1,0 +1,6 @@
+{"iter": 1, "loss": 0.0, "grad_norm": 0.0, "lr": 0.0001, "speed_it_s": 0.054, "elapsed_s": 18.5, "mem_gb": 31.88}
+{"iter": 2, "loss": 1108.377441, "grad_norm": 220.4889, "lr": 5e-05, "speed_it_s": 0.18, "elapsed_s": 24.2, "mem_gb": 33.21}
+{"iter": 3, "loss": 1251.994629, "grad_norm": 375.8474, "lr": 0.0, "speed_it_s": 0.417, "elapsed_s": 26.6, "mem_gb": 33.21}
+{"iter": 1, "loss": 1389.500244, "grad_norm": 585.5813, "lr": 0.0001, "speed_it_s": 0.053, "elapsed_s": 18.8, "mem_gb": 31.88}
+{"iter": 2, "loss": 0.004069, "grad_norm": 2.0707, "lr": 5e-05, "speed_it_s": 0.184, "elapsed_s": 24.2, "mem_gb": 33.21}
+{"iter": 3, "loss": 1812.645142, "grad_norm": 444.4608, "lr": 0.0, "speed_it_s": 0.254, "elapsed_s": 28.2, "mem_gb": 33.21}

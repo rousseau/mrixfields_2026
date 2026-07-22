@@ -112,17 +112,18 @@ def _build_model(cfg: dict, vae, device: torch.device):
     modalities = data_cfg.get("modalities", MODALITIES)
     fields = data_cfg.get("fields", DOMAINS)
     n_fields = len(fields)
-    n_classes = len(modalities) * n_fields
+    # V2 : n_classes = modalités uniquement (3) ; V1 : modalités × champs (15)
+    n_classes = len(modalities) if method == "mmfm3d_vectorized_v2" else len(modalities) * n_fields
 
-    if method in ("mmfm3d", "mmfm", "mmfm3d_vectorized", "mmfm3d_vectorized_v1"):
-        from cfm.train_mmfm_3d import build_mmfm
+    if method in ("mmfm3d", "mmfm", "mmfm3d_vectorized", "mmfm3d_vectorized_v1", "mmfm3d_vectorized_v2"):
+        from cfm.train_mmfm_3d import build_vector_mmfm
         # Determine latent shape for vectorizer
         with torch.no_grad():
             dummy = torch.zeros((1, 1, 128, 128, 80), device=device)
             z_dummy = vae.encode(dummy)
             latent_shape = tuple(z_dummy.shape[1:])
             flat_dim = int(np.prod(latent_shape))
-        mmfm = build_mmfm(cfg, flat_dim, n_classes).to(device)
+        mmfm = build_vector_mmfm(cfg, flat_dim, n_classes).to(device)
         return mmfm, "vectorial", latent_shape
 
     elif method in ("mmfm3d_unet", "mmfm3d_unet_v2"):
@@ -154,14 +155,20 @@ def _load_model_weights(model, ckpt: dict, use_ema: bool, model_type: str):
 
 
 def _make_flow_spec(model_type: str, mod_idx: int, src_field_idx: int,
-                    tgt_field_idx: int, n_fields: int) -> dict:
+                    tgt_field_idx: int, n_fields: int, use_v2: bool = False) -> dict:
     """Construire la spécification de flow pour une translation.
 
-    - vectorial (legacy) : conditionne sur la classe cible (mod, champ cible).
+    - vectorial v1 (legacy) : conditionne sur la classe cible (mod, champ cible).
+    - vectorial v2 : conditionne sur la modalité seule.
     - unet (multi-marginal) : contraste + temps (champ) source->cible.
     """
     if model_type == "vectorial":
-        return {"tgt_class": _flat_class(mod_idx, tgt_field_idx, n_fields)}
+        if use_v2:
+            # V2 : tgt_class = mod_idx (modalité seule, dans [0,2])
+            return {"tgt_class": mod_idx}
+        else:
+            # V1 : tgt_class = _flat_class(mod_idx, tgt_field_idx, n_fields)
+            return {"tgt_class": _flat_class(mod_idx, tgt_field_idx, n_fields)}
     return {
         "contrast": mod_idx,
         "t_start": _field_to_time(src_field_idx, n_fields),
@@ -371,6 +378,9 @@ def infer_single(
     mod_idx = modalities.index(mod)
     src_field_idx = fields.index(src)
     tgt_field_idx = fields.index(tgt_field)
+    
+    # V2 method flag
+    use_v2 = (cfg.get("method", "mmfm3d") == "mmfm3d_vectorized_v2")
 
     print(f"[{mod}] {src} → {tgt_field} | Loading VAE...")
     vae = load_vae(cfg, dev)
@@ -384,7 +394,7 @@ def infer_single(
     print(f"  Model loaded ({loaded_from}, iter={ckpt.get('iter', '?')}) from {checkpoint}")
 
     latent_vectorizer = LatentVectorizer(latent_shape) if model_type == "vectorial" else None
-    flow_spec = _make_flow_spec(model_type, mod_idx, src_field_idx, tgt_field_idx, n_fields)
+    flow_spec = _make_flow_spec(model_type, mod_idx, src_field_idx, tgt_field_idx, n_fields, use_v2)
 
     t0 = time.time()
     pred_vol, affine, header = process_volume_unified(
@@ -446,7 +456,10 @@ def infer_batch(
     all_modalities = data_cfg.get("modalities", MODALITIES)
     fields = data_cfg.get("fields", DOMAINS)
     n_fields = len(fields)
-    n_classes = len(all_modalities) * n_fields
+    n_classes = len(all_modalities) if cfg.get("method", "mmfm3d") == "mmfm3d_vectorized_v2" else len(all_modalities) * n_fields
+    
+    # V2 method flag
+    use_v2 = (cfg.get("method", "mmfm3d") == "mmfm3d_vectorized_v2")
 
     modalities = modalities if modalities is not None else all_modalities
 
@@ -479,7 +492,7 @@ def infer_batch(
         mod_idx = all_modalities.index(mod)
         for src, tgt in task_pairs:
             flow_spec = _make_flow_spec(
-                model_type, mod_idx, fields.index(src), fields.index(tgt), n_fields
+                model_type, mod_idx, fields.index(src), fields.index(tgt), n_fields, use_v2
             )
             pair_out_dir = out_root / "task3" / mod / f"{src}_to_{tgt}"
             pair_out_dir.mkdir(parents=True, exist_ok=True)

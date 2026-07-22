@@ -36,7 +36,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import nibabel as nib
 import nibabel.processing as nib_proc
@@ -761,6 +761,187 @@ def infer_batch(
     elapsed = time.time() - start_all
     print(f"\n✅ Batch inference done in {elapsed / 3600:.2f} h")
     print(f"   Predictions saved to: {out_root}")
+
+
+# --------------------------------------------------------------------------- #
+#  Drop-in full-resolution infer() — même signature que
+#  cfm.train_mmfm_unet_3d.infer(), pour être utilisée comme remplacement
+#  direct dans les dispatchers (ex: visualize_cfm3d.py) sans casser les
+#  appelants existants. Contrairement à cette dernière (crop centré unique
+#  128x128x80 @ 1mm), ici on parcourt tout le volume par patches glissants
+#  et on reconstruit une prédiction pleine résolution/FOV (via process_volume).
+# --------------------------------------------------------------------------- #
+
+
+def infer(
+    cfg_path: str,
+    checkpoint: str,
+    output_dir: str,
+    source_field: str,
+    source_modality: str,
+    target_field: str,
+    target_modality: str,
+    env_path: Optional[str] = None,
+    input_dir: Optional[str] = None,
+    input_volume: Optional[str] = None,
+    n_steps: Optional[int] = None,
+    use_ema: bool = True,
+) -> None:
+    """Inférence MMFM-UNet pleine résolution : crop centré unique replacé
+    correctement dans le repère/FOV natif.
+
+    Remplacement direct de cfm.train_mmfm_unet_3d.infer() : même signature
+    et même convention de nommage de sortie, mais utilise process_volume()
+    pour resampler/recaler correctement la sortie sur la grille native
+    (0.5mm) au lieu de sauvegarder un volume brut 128x128x80 @ 1mm mal aligné
+    avec le GT (problème d'échelle en visualisation/évaluation).
+
+    IMPORTANT : on utilise ici un crop centré UNIQUE (center_crop_only=True),
+    PAS le tiling par patches glissants + blending de process_volume.
+    Diagnostic (2026-07-18) : même avec une grille centrée et un modèle
+    entraîné avec random_crop_prob=0.8 (donc a priori tolérant des patches
+    décentrés), le tiling + blending Hann détruit presque tout le détail
+    anatomique fin (sillons/gyri), verifié empiriquement en comparant
+    tiled vs center_crop_only sur le même sujet/checkpoint : le mode centré
+    seul restitue un niveau de détail proche du GT, le tiling produit une
+    image globalement floue et quasi indépendante du champ cible. Cause :
+    chaque patch est encodé/décodé indépendamment (pas de contexte partagé
+    entre patches voisins) ; moyenner plusieurs générations indépendantes
+    (même avec un faible recouvrement) détruit le contenu haute fréquence
+    qui ne coïncide pas spatialement d'un patch à l'autre. Conséquence :
+    le volume reconstruit ne couvre que la région centrale 128x128x80mm
+    (le reste est à zéro, comme l'ancienne inférence basse-résolution),
+    mais avec un contenu fidèle à la capacité réelle du modèle.
+    """
+    cfg = load_yaml_with_include(cfg_path)
+    cfg = resolve_paths(cfg, load_env(env_path))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    data_cfg = cfg["data"]
+    train_cfg = cfg["train"]
+
+    amp_dtype_name = train_cfg.get("amp_dtype", "bf16")
+    use_amp = bool(train_cfg.get("use_amp", True))
+    amp_dtype = torch.bfloat16 if amp_dtype_name == "bf16" else torch.float16
+
+    n_steps = _resolve_n_steps(cfg, n_steps)
+    norm_mode = _resolve_norm_mode(cfg, None)
+    p_lo = data_cfg.get("percentile_lower", 0.5)
+    p_hi = data_cfg.get("percentile_upper", 99.5)
+
+    raw_vs = data_cfg.get("volume_size", None)
+    patch_size = tuple(int(v) for v in raw_vs) if raw_vs else (128, 128, 80)
+    stride = tuple(max(s // 2, 1) for s in patch_size)
+    pad = 16
+
+    # NOTE (2026-07-18) : le tiling par patches glissants + blending Hann
+    # détruit le détail anatomique fin, y compris pour un modèle entraîné
+    # avec random_crop_prob > 0 (vérifié empiriquement). On utilise donc
+    # toujours un crop centré unique ici (voir docstring). `random_crop_prob`
+    # n'est plus utilisé pour décider du mode ; conservé dans la config pour
+    # l'entraînement uniquement.
+    center_crop_only = True
+
+    modalities: List[str] = data_cfg.get("modalities", MODALITIES)
+    fields: List[str] = data_cfg.get("fields", DOMAINS)
+    n_fields = len(fields)
+    n_classes = len(modalities) * n_fields
+
+    for name, val, lst in [
+        ("source_field", source_field, fields),
+        ("target_field", target_field, fields),
+        ("source_modality", source_modality, modalities),
+        ("target_modality", target_modality, modalities),
+    ]:
+        if val not in lst:
+            raise ValueError(f"{name}='{val}' non présent dans la config ({lst})")
+
+    tgt_mod_idx = modalities.index(target_modality)
+    tgt_class = _flat_class(tgt_mod_idx, fields.index(target_field), n_fields)
+
+    print(
+        f"Inférence MMFM-UNet full-res : {source_modality}@{source_field} → "
+        f"{target_modality}@{target_field}  |  tgt_class={tgt_class}  |  "
+        f"{n_steps} steps Euler  |  patch={patch_size}  stride={stride}  |  "
+        f"center_crop_only={center_crop_only}"
+    )
+
+    print("Loading VAE...")
+    vae = load_vae(cfg, device)
+    if vae.latent_format != "spatial":
+        raise RuntimeError(f"Requiert un VAE spatial, got latent_format='{vae.latent_format}'.")
+
+    print("Loading UNet...")
+    unet = build_unet_3d(cfg, vae.latent_channels, n_classes).to(device)
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+
+    saved_n_classes = ckpt.get("n_classes", None)
+    if saved_n_classes is not None and saved_n_classes != n_classes:
+        raise RuntimeError(
+            f"Incohérence n_classes : checkpoint={saved_n_classes}, config courante={n_classes}."
+        )
+
+    loaded_from = "model"
+    if use_ema and "ema" in ckpt and ckpt["ema"]:
+        ema_state = ckpt["ema"]
+        shadow = ema_state.get("shadow_params", None) if isinstance(ema_state, dict) else None
+        if shadow is not None:
+            unet.load_state_dict(_remap_monai_attention_keys(shadow))
+            loaded_from = "ema.shadow_params"
+        elif isinstance(ema_state, dict) and ema_state:
+            unet.load_state_dict(_remap_monai_attention_keys(ema_state))
+            loaded_from = "ema"
+        else:
+            unet.load_state_dict(_remap_monai_attention_keys(ckpt["model"]))
+    else:
+        unet.load_state_dict(_remap_monai_attention_keys(ckpt["model"]))
+    unet.eval()
+    print(f"  UNet chargé (clé: {loaded_from}, iter={ckpt.get('iter', '?')}) depuis {checkpoint}")
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if input_volume is not None:
+        input_files = [Path(input_volume)]
+    elif input_dir is not None:
+        input_files = sorted(Path(input_dir).glob("*.nii.gz"))
+        if not input_files:
+            raise FileNotFoundError(f"Aucun fichier .nii.gz dans {input_dir}")
+    else:
+        raise ValueError("Fournir --input_dir ou --input_volume.")
+
+    print(f"  {len(input_files)} volume(s) → {out_dir}")
+
+    for nii_path in input_files:
+        t_start = time.time()
+        pred_vol, affine, header = process_volume(
+            nii_path,
+            vae,
+            unet,
+            tgt_class=tgt_class,
+            n_steps=n_steps,
+            patch_size=patch_size,
+            stride=stride,
+            pad=pad,
+            p_lo=p_lo,
+            p_hi=p_hi,
+            device=device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            norm_mode=norm_mode,
+            center_crop_only=center_crop_only,
+            center_aligned=True,
+        )
+
+        stem = nii_path.name.replace(".nii.gz", "")
+        out_name = f"{stem}_{target_modality}_{target_field}_mmfm_unet.nii.gz"
+        out_path = out_dir / out_name
+        nib.save(nib.Nifti1Image(pred_vol, affine, header), str(out_path))
+
+        elapsed = time.time() - t_start
+        print(f"  {nii_path.name} → {out_name}  ({elapsed:.1f}s)")
+
+    print(f"\nInférence MMFM-UNet full-res terminée. Prédictions dans : {out_dir}")
 
 
 # --------------------------------------------------------------------------- #

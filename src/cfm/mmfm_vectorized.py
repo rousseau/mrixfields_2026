@@ -93,7 +93,8 @@ class VectorMMFM(nn.Module):
       - z_t_vec: interpolated latent vector
       - z_src_vec: source latent vector
       - timesteps: scalar flow times sampled by the CFM sampler
-      - class_labels: discrete target-domain ids (15 classes = modality x field)
+      - class_labels: discrete target-domain ids (3 classes in v2 = modalités,
+                       15 classes in v1 = modalités × champs)
 
     Output:
       - vector field with the same dimensionality as the flattened MedVAE latent

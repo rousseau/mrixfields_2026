@@ -1,0 +1,39 @@
+{
+  "date": "2026-07-17",
+  "task": "task3",
+  "modality": "T1W",
+  "evaluation_script": "src/evaluation/evaluate.py",
+  "strict_mode": {
+    "pred_dir_explicit": true,
+    "auto_discovery_disabled_by_cli": true,
+    "expected_predictions": 60
+  },
+  "models": [
+    {
+      "name": "mmfm_vector_latest",
+      "train_config": "configs/mmfm3d_medvae_multimodal.yaml",
+      "checkpoint": "outputs/cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1/weights/model_final.pth",
+      "pred_dir": "outputs/predictions/mmfm/task3/T1W",
+      "results_csv": "results/mmfm/analysis/protocol_20260717/task3_mmfm_vector_latest.csv"
+    },
+    {
+      "name": "mmfm_unet_v1_latest",
+      "train_config": "configs/mmfm3d_unet_medvae_multimodal.yaml",
+      "checkpoint": "outputs/cfm3d/runs/mmfm3d_unet_medvae_multimodal/weights/model_final.pth",
+      "pred_dir": "outputs/predictions/mmfm_unet/task3/T1W",
+      "results_csv": "results/mmfm/analysis/protocol_20260717/task3_mmfm_unet_v1_latest.csv"
+    },
+    {
+      "name": "mmfm_unet_v2_latest",
+      "train_config": "configs/mmfm3d_unet_v2_medvae_multimodal.yaml",
+      "checkpoint": "outputs/cfm3d/runs/mmfm3d_unet_v2_medvae_multimodal/weights/checkpoint_115000.pth",
+      "pred_dir": "outputs/predictions/mmfm_unet_v2/task3/T1W",
+      "results_csv": "results/mmfm/analysis/protocol_20260717/task3_mmfm_unet_v2_latest.csv"
+    }
+  ],
+  "notes": [
+    "Les dossiers de predictions existent deja; cette execution n'a pas regenere les volumes.",
+    "Conformite geometrique: mmfm_unet_v1 full-res; mmfm_vector et mmfm_unet_v2 en 128x128x80 dans ces pred_dir.",
+    "Le checkpoint le plus avance disponible pour v2 est checkpoint_115000.pth."
+  ]
+}

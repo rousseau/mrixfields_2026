@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-CFM 3D — Inférence + visualisation 0.1T → 7T sur sujets de validation T1W.
+CFM 3D — Inférence + visualisation 0.1T → 7T sur Training_prospective T1W.
 
 Ce script :
   1. Charge le checkpoint CFM (model_final.pth) entraîné sur 0.1T↔7T
-  2. Pour chaque sujet 0.1T de Validating_prospective :
+  2. Pour chaque sujet 0.1T de Training_prospective :
        encode (MedVAE) → Euler ODE 50 steps → decode → prédiction 7T
   3. Génère des figures de comparaison dans l'espace d'inférence 1mm cropé :
        [ 0.1T source | CFM 7T prédit | GT 7T ] × [axiale | coronale | sagittale]
 
-Appariement sujets (Validating_prospective) :
-  P_T1W_0.1T_0001  ↔  P_T1W_7T_0016  (1er sujet)
-  P_T1W_0.1T_0002  ↔  P_T1W_7T_0017  (2ème sujet)
-  P_T1W_0.1T_0003  ↔  P_T1W_7T_0018  (3ème sujet)
-  Appariement par ordre alphabétique (position dans la liste triée).
+Appariement sujets (Training_prospective, 3 sujets × 5 champs × 3 contrastes) :
+  Le matching se fait par subject_id (dernier champ du nom de fichier officiel
+  P_{MOD}_{FIELD}_{ID}.nii.gz). Exemple : P_T1W_0.1T_0006 ↔ P_T1W_7T_0006.
+  Plus de matching positionnel par tri alphabétique.
 
 Usage :
   python src/cfm/run_inference_viz_cfm3d.py
@@ -45,6 +44,7 @@ from cfm.train_cfm_3d import (
     build_unet_3d,
     load_vae,
 )
+from visualization.common import subject_id_from_name
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Utilitaires
@@ -266,8 +266,13 @@ def generate_figures(
     out_fig_dir = Path(output_dir) / "figures"
     out_fig_dir.mkdir(parents=True, exist_ok=True)
 
-    # Appariement positionnel : 1er 0.1T ↔ 1er 7T (tri alphabétique)
-    gt_files = sorted(Path(input_dir_7t).glob("*.nii.gz"))
+    # Appariement robuste par subject_id (dernier champ du nom de fichier)
+    # Exemple: P_T1W_7T_0006.nii.gz -> "0006"
+    gt_files = list(Path(input_dir_7t).glob("*.nii.gz"))
+    gt_by_id = {
+        subject_id_from_name(p.name): p
+        for p in gt_files
+    }
 
     views = ["axial", "coronal", "sagittal"]
     view_labels = ["Axiale", "Coronale", "Sagittale"]
@@ -284,18 +289,16 @@ def generate_figures(
         pred_vol = res["pred_vol"]  # (128,128,80) @ 1mm, [0,1]
 
         # GT 7T : les données sont déjà en [0, 1] (challenge preprocessing)
-        gt_path = gt_files[i] if i < len(gt_files) else None
+        subject_id = subject_id_from_name(nii_01t.name)
+        gt_path = gt_by_id.get(subject_id)
         if gt_path and gt_path.exists():
             gt_vol_raw = _preprocess(gt_path, target_spacing, volume_size, p_lo, p_hi)
             gt_vol = np.clip((gt_vol_raw + 1.0) / 2.0, 0.0, 1.0)  # [-1,1] → [0,1]
         else:
-            print(f"  [WARN] GT 7T introuvable pour le sujet {i + 1}")
+            print(f"  [WARN] GT 7T introuvable pour le sujet {subject_id}")
             gt_vol = np.zeros_like(src_vol)
 
-        # Sujet ID depuis le nom de fichier : P_T1W_0.1T_0001.nii.gz → "0001"
-        parts = nii_01t.name.split(".")[0].split("_")  # strip extension first
-        subject_id = parts[-1] if len(parts) >= 4 else str(i + 1)
-        gt_id = gt_files[i].name.split(".")[0].split("_")[-1] if gt_path else "N/A"
+        gt_id = subject_id_from_name(gt_path.name) if gt_path else "N/A"
 
         # Métriques MAE / SSIM sur le crop (uniquement là où on a une prédiction)
         mae = float(np.mean(np.abs(pred_vol - gt_vol)))
@@ -380,7 +383,7 @@ def generate_figures(
 
         # Titre global
         fig.suptitle(
-            f"CFM 3D  0.1T → 7T  |  Sujet val. {subject_id}  "
+            f"CFM 3D  0.1T → 7T  |  Sujet {subject_id}  "
             f"[MAE={mae:.3f}  SSIM≈{ss:.3f}]",
             fontsize=12,
             fontweight="bold",
@@ -415,7 +418,8 @@ def generate_figures(
     for i, res in enumerate(results):
         src_vol = res["src_vol"]
         pred_vol = res["pred_vol"]
-        gt_path = gt_files[i] if i < len(gt_files) else None
+        subject_id = subject_id_from_name(res["nii_01t"].name)
+        gt_path = gt_by_id.get(subject_id)
         # GT 7T : les données sont déjà en [0, 1], on convertit en [-1,1] puis [0,1]
         gt_vol = (
             np.clip(
@@ -428,9 +432,7 @@ def generate_figures(
             else np.zeros_like(src_vol)
         )
 
-        parts = res["nii_01t"].name.split(".")[0].split("_")
-        subject_id = parts[-1] if len(parts) >= 4 else str(i + 1)
-        gt_id = gt_files[i].name.split(".")[0].split("_")[-1] if gt_path else "?"
+        gt_id = subject_id_from_name(gt_path.name) if gt_path else "?"
 
         volumes = [src_vol, pred_vol, gt_vol]
 
@@ -482,8 +484,7 @@ def generate_figures(
         )
 
     fig_all.suptitle(
-        f"OT-CFM 3D  0.1T → 7T  |  {n_subj} sujets validation T1W  "
-        f"(MedVAE fine-tuné + UNet 178M, 100k iters)",
+        f"OT-CFM 3D  0.1T → 7T  |  {n_subj} sujets Training_prospective T1W",
         fontsize=11,
         fontweight="bold",
         y=0.97,

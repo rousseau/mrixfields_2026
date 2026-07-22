@@ -87,6 +87,10 @@ def _flat_class(mod_idx: int, field_idx: int, n_fields: int) -> int:
     return mod_idx * n_fields + field_idx
 
 
+def _field_to_time(field_idx: int, n_fields: int) -> float:
+    return float(field_idx) / max(n_fields - 1, 1)
+
+
 def _infer_latent_shape(vae, volume_size: Tuple[int, int, int], device: torch.device) -> Tuple[int, ...]:
     dummy = torch.zeros(1, 1, *volume_size, device=device)
     with torch.no_grad():
@@ -137,12 +141,24 @@ def _make_infinite(loader):
         yield from loader
 
 
-def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] = None):
+def train(
+    cfg_path: str,
+    env_path: Optional[str] = None,
+    resume: Optional[str] = None,
+    method: str = "mmfm3d_vectorized_v1",
+    adjacent_only: bool = False,
+    identity_prob: float = 0.1,
+):
     cfg = load_yaml_with_include(cfg_path)
     cfg = resolve_paths(cfg, load_env(env_path))
     if resume is not None:
         cfg["resume"] = resume
-
+    
+    # V2 method flag and options
+    use_v2 = (method == "mmfm3d_vectorized_v2")
+    adj_only = adjacent_only
+    id_prob = identity_prob
+    
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
 
@@ -210,7 +226,8 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
     )
 
     class_loaders: Dict[int, any] = {}
-    n_classes = len(modalities) * len(fields)
+    # V2 : n_classes = modalités uniquement (3) ; V1 : modalités × champs (15)
+    n_classes = len(modalities) if use_v2 else len(modalities) * len(fields)
 
     for c_idx in range(n_classes):
         class_indices = [i for i, (_, _, _, c) in enumerate(ds.samples) if c == c_idx]
@@ -292,10 +309,14 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
             f"Vector MMFM: {n_params/1e6:.1f}M params | classes={n_classes} | "
             f"latent_shape={latent_shape} | flat_dim={latent_dim}"
         )
+        version = "v2" if use_v2 else "v1"
         print(
-            f"Training MMFM v1: iters={total_iters} batch={batch_size} "
+            f"Training MMFM {version}: iters={total_iters} batch={batch_size} "
             f"targets/step={num_targets_per_step} amp={use_amp} dtype={amp_dtype_name}"
         )
+        if use_v2:
+            print(f"  V2 Options: adjacent_only={adj_only}, identity_prob={id_prob}")
+
 
     weights_dir = output_dir / "weights"
     metrics_path = output_dir / "train_metrics.jsonl"
@@ -305,35 +326,83 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
     mmfm.train()
 
     for step in range(start_iter, total_iters):
-        # Synchroniser le choix src/tgt entre tous les ranks DDP pour garantir
-        # que chaque GPU travaille sur la même paire de classes au même step.
-        if is_distributed:
-            if dist.get_rank() == 0:
-                src_idx = torch.tensor(
-                    [random.randrange(len(available_classes))],
-                    dtype=torch.long, device=device,
-                )
+        # Sampling pairs (src, tgt)
+        if use_v2:
+            # V2 Sampling:- pick modality, then pick transition field_i -> field_j
+            if is_distributed:
+                if dist.get_rank() == 0:
+                    mod_idx = random.randrange(len(modalities))
+                    # Transition choice
+                    if random.random() < id_prob:
+                        f_src = random.randrange(len(fields))
+                        f_tgt = f_src
+                    elif adj_only:
+                        f_src = random.randrange(len(fields))
+                        f_tgt = random.choice([f for f in [f_src-1, f_src+1] if 0 <= f < len(fields)])
+                    else:
+                        f_src = random.randrange(len(fields))
+                        f_tgt = random.randrange(len(fields))
+                    
+                    # Pack for broadcast: (mod_idx, f_src, f_tgt)
+                    pair_tensor = torch.tensor([mod_idx, f_src, f_tgt], dtype=torch.long, device=device)
+                else:
+                    pair_tensor = torch.zeros(3, dtype=torch.long, device=device)
+                dist.broadcast(pair_tensor, src=0)
+                mod_idx, f_src, f_tgt = pair_tensor.tolist()
             else:
-                src_idx = torch.zeros(1, dtype=torch.long, device=device)
-            dist.broadcast(src_idx, src=0)
-            src_class = available_classes[src_idx.item()]
-
-            tgt_candidates = [c for c in available_classes if c != src_class]
-            k = min(num_targets_per_step, len(tgt_candidates))
-            if dist.get_rank() == 0:
-                tgt_idx_t = torch.tensor(
-                    random.sample(range(len(tgt_candidates)), k),
-                    dtype=torch.long, device=device,
-                )
+                mod_idx = random.randrange(len(modalities))
+                if random.random() < id_prob:
+                    f_src = random.randrange(len(fields))
+                    f_tgt = f_src
+                elif adj_only:
+                    f_src = random.randrange(len(fields))
+                    f_tgt = random.choice([f for f in [f_src-1, f_src+1] if 0 <= f < len(fields)])
+                else:
+                    f_src = random.randrange(len(fields))
+                    f_tgt = random.randrange(len(fields))
+            
+            if use_v2:
+                # V2 : tgt_class = mod_idx (index modalité seul, dans [0,2])
+                # Le sampling est déjà fait avec mod_idx directement
+                src_class = mod_idx
+                tgt_class = mod_idx
+                tgt_classes = [tgt_class]
+                k = 1
             else:
-                tgt_idx_t = torch.zeros(k, dtype=torch.long, device=device)
-            dist.broadcast(tgt_idx_t, src=0)
-            tgt_classes = [tgt_candidates[i] for i in tgt_idx_t.tolist()]
+                tgt_class = _flat_class(mod_idx, f_tgt, len(fields))
+                tgt_classes = [tgt_class]
+                k = 1 # V2 typically uses 1 target per step in this formulation, or we can loop
+            
         else:
-            src_class = random.choice(available_classes)
-            tgt_candidates = [c for c in available_classes if c != src_class]
-            k = min(num_targets_per_step, len(tgt_candidates))
-            tgt_classes = random.sample(tgt_candidates, k=k)
+            # V1 Sampling (legacy)
+            if is_distributed:
+                if dist.get_rank() == 0:
+                    src_idx = torch.tensor(
+                        [random.randrange(len(available_classes))],
+                        dtype=torch.long, device=device,
+                    )
+                else:
+                    src_idx = torch.zeros(1, dtype=torch.long, device=device)
+                dist.broadcast(src_idx, src=0)
+                src_class = available_classes[src_idx.item()]
+        
+                tgt_candidates = [c for c in available_classes if c != src_class]
+                k = min(num_targets_per_step, len(tgt_candidates))
+                if dist.get_rank() == 0:
+                    tgt_idx_t = torch.tensor(
+                        random.sample(range(len(tgt_candidates)), k),
+                        dtype=torch.long, device=device,
+                    )
+                else:
+                    tgt_idx_t = torch.zeros(k, dtype=torch.long, device=device)
+                dist.broadcast(tgt_idx_t, src=0)
+                tgt_classes = [tgt_candidates[i] for i in tgt_idx_t.tolist()]
+            else:
+                src_class = random.choice(available_classes)
+                tgt_candidates = [c for c in available_classes if c != src_class]
+                k = min(num_targets_per_step, len(tgt_candidates))
+                tgt_classes = random.sample(tgt_candidates, k=k)
+
 
         src_batch = next(class_loaders[src_class])
         src_x = src_batch[0].to(device)
@@ -354,8 +423,38 @@ def train(cfg_path: str, env_path: Optional[str] = None, resume: Optional[str] =
             # Phase F: API canonique to_vector (fonctionne pour spatial et vector)
             z_src_vec = vae.to_vector(z_src)
             z_tgt_vec = vae.to_vector(z_tgt)
-            t_batch, z_t, ut = FM.sample_location_and_conditional_flow(z_src_vec, z_tgt_vec)
-            t_vec = t_batch.to(device).float().reshape(z_src_vec.shape[0], -1).squeeze(-1)
+            
+            if use_v2:
+                # OT-CFM projection to global time
+                # z_src_vec and z_tgt_vec are already the endpoints
+                # We sample t_local in [0, 1]
+                t_local = torch.rand(z_src_vec.shape[0], device=device)
+                
+                # Global time projection: t_global = t_i + t_local * (t_j - t_i)
+                t_i = _field_to_time(f_src, len(fields))
+                t_j = _field_to_time(f_tgt, len(fields))
+                t_global = t_i + t_local * (t_j - t_i)
+                t_vec = t_global.float().reshape(z_src_vec.shape[0], -1).squeeze(-1)
+                
+                # Conditional flow: z_t = (1-t_local)*z_src + t_local*z_tgt
+                z_t = (1 - t_local[:, None]) * z_src_vec + t_local[:, None] * z_tgt_vec
+                
+                # Velocity in global time: ut_global = (z_tgt - z_src) / (t_j - t_i)
+                # If identity: ut_global = 0
+                if f_src == f_tgt:
+                    ut = torch.zeros_like(z_src_vec)
+                else:
+                    ut = (z_tgt_vec - z_src_vec) / max(t_j - t_i, 1e-8)
+                    # Note: we actually use the flow matcher's ut if it handles the scaling,
+                    # but since we are manually calculating t_global, we must scale ut.
+                    # In v1, we used FM.sample_location_and_conditional_flow.
+                    # In v2, we bypass it for the global projection.
+            else:
+                t_batch, z_t, ut = FM.sample_location_and_conditional_flow(z_src_vec, z_tgt_vec)
+                t_vec = t_batch.to(device).float().reshape(z_src_vec.shape[0], -1).squeeze(-1)
+                
+            # V2 : y_tgt = mod_idx (modalité seule, dans [0,2])
+            # V1 : y_tgt = tgt_class (index aplatmodalite/champ, dans [0,14])
             y_tgt = torch.full((z_src_vec.shape[0],), tgt_class, dtype=torch.long, device=device)
 
             with torch.amp.autocast(
@@ -466,36 +565,49 @@ def _euler_integrate_vector(
     device: torch.device,
     use_amp: bool = False,
     amp_dtype: torch.dtype = torch.bfloat16,
+    method: str = "mmfm3d_vectorized_v1",
+    source_field_idx: Optional[int] = None,
+    target_field_idx: Optional[int] = None,
+    n_fields: int = 5,
 ) -> Tensor:
     """Intégration Euler du champ vectoriel MMFM : z_src_vec → z_tgt_vec.
-
-    Args:
-        mmfm: VectorMMFM chargé et en mode eval.
-        z_src_vec: Vecteur latent source, shape (1, D).
-        tgt_class: Indice de classe cible (mod_idx * n_fields + field_idx).
-        n_steps: Nombre de pas d'intégration Euler.
-        device: Périphérique de calcul.
-        use_amp: Activer l'autocast AMP.
-        amp_dtype: Type de données AMP.
-
-    Returns:
-        Vecteur latent prédit, shape (1, D).
+    
+    Supports v1 (t in [0,1]) and v2 (t in [t_start, t_end]).
     """
-    dt = 1.0 / n_steps
     z = z_src_vec.clone().to(device).float()
     z_src = z_src_vec.to(device).float()
     y = torch.tensor([tgt_class], dtype=torch.long, device=device)
-
-    for step_i in range(n_steps):
-        t_val = step_i * dt
-        t_vec = torch.tensor([t_val], dtype=torch.float32, device=device)
-        with torch.amp.autocast(
-            "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
-        ):
-            vt = mmfm(z, z_src, t_vec, y)
-        z = z + dt * vt.float()
-
+    
+    if method == "mmfm3d_vectorized_v2":
+        if source_field_idx is None or target_field_idx is None:
+            raise ValueError("source_field_idx and target_field_idx are required for v2 inference")
+        
+        t_start = _field_to_time(source_field_idx, n_fields)
+        t_end = _field_to_time(target_field_idx, n_fields)
+        dt = (t_end - t_start) / n_steps
+        
+        for step_i in range(n_steps):
+            t_val = t_start + step_i * dt
+            t_vec = torch.tensor([t_val], dtype=torch.float32, device=device)
+            with torch.amp.autocast(
+                "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+            ):
+                vt = mmfm(z, z_src, t_vec, y)
+            z = z + dt * vt.float()
+    else:
+        # Legacy v1: t in [0, 1]
+        dt = 1.0 / n_steps
+        for step_i in range(n_steps):
+            t_val = step_i * dt
+            t_vec = torch.tensor([t_val], dtype=torch.float32, device=device)
+            with torch.amp.autocast(
+                "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+            ):
+                vt = mmfm(z, z_src, t_vec, y)
+            z = z + dt * vt.float()
+    
     return z
+
 
 
 def infer(
@@ -511,6 +623,7 @@ def infer(
     input_volume: Optional[str] = None,
     n_steps: Optional[int] = None,
     use_ema: bool = True,
+    method: str = "mmfm3d_vectorized_v1",
 ) -> None:
     """Inférence MMFM : encode → intégration ODE vectorielle → decode.
 
@@ -609,6 +722,10 @@ def infer(
         if shadow is not None:
             mmfm.load_state_dict(shadow)
             loaded_from = "ema.shadow_params"
+        elif isinstance(ema_state, dict) and ema_state:
+            # EMAModel.state_dict() plat (OrderedDict de poids)
+            mmfm.load_state_dict(ema_state)
+            loaded_from = "ema"
         else:
             mmfm.load_state_dict(ckpt["model"])
     else:
@@ -681,7 +798,11 @@ def infer(
 
         # ── Intégration Euler vectorielle ────────────────────────────────
         z_tgt_vec = _euler_integrate_vector(
-            mmfm, z_src_vec, tgt_class, n_steps, device, use_amp, amp_dtype
+            mmfm, z_src_vec, tgt_class, n_steps, device, use_amp, amp_dtype,
+            method=method,
+            source_field_idx=fields.index(source_field),
+            target_field_idx=fields.index(target_field),
+            n_fields=n_fields
         )
 
         # ── Decode ───────────────────────────────────────────────────────
@@ -694,6 +815,10 @@ def infer(
 
         pred_vol = recon.squeeze().cpu().float().numpy()
         pred_vol = (np.clip(pred_vol, -1.0, 1.0) + 1.0) / 2.0  # [-1,1] → [0,1]
+
+        # Apply source brain mask (background normalized to -1 is excluded)
+        brain_mask = (vol > -0.99).astype(np.float32)
+        pred_vol = pred_vol * brain_mask
 
         # ── Sauvegarde ───────────────────────────────────────────────────
         stem = nii_path.name.replace(".nii.gz", "")
@@ -711,10 +836,16 @@ def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MMFM v1 vectorized baseline — train & infer")
     p.add_argument("--mode", default="train", choices=["train", "infer"],
                    help="'train' : entraînement | 'infer' : inférence sur volumes NIfTI")
+    p.add_argument("--method", default="mmfm3d_vectorized_v1", choices=["mmfm3d_vectorized_v1", "mmfm3d_vectorized_v2"],
+                   help="Méthode MMFM à utiliser (v1: discret domaine, v2: continu champ)")
     p.add_argument("--config", required=True, help="Chemin vers le YAML de configuration")
     p.add_argument("--env", default=None, help="Env YAML (local / remote / chemin)")
     # Train-only
     p.add_argument("--resume", default=None, help="[train] Reprendre depuis ce checkpoint")
+    p.add_argument("--adjacent_only", action="store_true",
+                   help="[train v2] Echantillonner uniquement les transitions entre champs adjacents")
+    p.add_argument("--identity_prob", type=float, default=0.1,
+                   help="[train v2] Probabilité d'échantillonner un cas identité (source == cible)")
     # Infer-only
     p.add_argument("--checkpoint", default=None,
                    help="[infer] Chemin vers le checkpoint MMFM (.pth)")
@@ -742,8 +873,16 @@ def _parse() -> argparse.Namespace:
 if __name__ == "__main__":
     args = _parse()
     if args.mode == "train":
-        train(args.config, env_path=args.env, resume=args.resume)
+        train(
+            cfg_path=args.config, 
+            env_path=args.env, 
+            resume=args.resume,
+            method=args.method,
+            adjacent_only=args.adjacent_only,
+            identity_prob=args.identity_prob
+        )
     else:
+        # Inférence
         missing = [
             name for name, val in [
                 ("--checkpoint", args.checkpoint),
@@ -762,7 +901,7 @@ if __name__ == "__main__":
             )
         if args.input_dir is None and args.input_volume is None:
             raise ValueError("Mode infer : fournir --input_dir ou --input_volume.")
-
+        
         infer(
             cfg_path=args.config,
             checkpoint=args.checkpoint,
@@ -776,4 +915,5 @@ if __name__ == "__main__":
             input_volume=args.input_volume,
             n_steps=args.n_steps,
             use_ema=not args.no_ema,
+            method=args.method,
         )

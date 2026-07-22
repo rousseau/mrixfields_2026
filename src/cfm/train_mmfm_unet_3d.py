@@ -133,7 +133,15 @@ def _field_to_time(field_idx: int, n_fields: int) -> float:
 
 def _make_infinite(loader: DataLoader):
     while True:
-        yield from loader
+        try:
+            yield from loader
+        except StopIteration:
+            pass  # epoch fini, on relance
+        except Exception as e:
+            print(f"[DEBUG] _make_infinite: loader raised {type(e).__name__}: {e}", flush=True)
+            import traceback; traceback.print_exc()
+            # ne pas relancer — redémarrer le loader à l'epoch suivante
+            continue
 
 
 def _pad_to_multiple(z: torch.Tensor, mult: int = 4):
@@ -494,6 +502,8 @@ def train(
         state = torch.load(resume_path, map_location=device, weights_only=False)
         raw_unet.load_state_dict(_remap_monai_attention_keys(state["model"]))
         optimizer.load_state_dict(state["optimizer"])
+        if "scheduler" in state and state["scheduler"] is not None:
+            scheduler.load_state_dict(state["scheduler"])
         if "ema" in state:
             ema.load_state_dict(_remap_monai_attention_keys(state["ema"]))
         if "scaler" in state and use_scaler and state["scaler"] is not None:
@@ -518,8 +528,9 @@ def train(
     last_log_t = t0
     recent_losses: deque = deque(maxlen=print_every)
 
-    for step in range(start_iter, total_iters):
-        # ── Échantillonnage multi-marginal ────────────────────────────────────
+    print(f"[DEBUG] start_iter={start_iter} total_iters={total_iters} range_len={len(range(start_iter, total_iters))}", flush=True)
+
+    for step in range(start_iter, total_iters):        # ── Échantillonnage multi-marginal ────────────────────────────────────
         # On tire un CONTRASTE puis num_targets_per_step transitions de champ.
         # Chaque transition = (field_i -> field_j) le long de l'axe temporel.
         # rank 0 décide, puis broadcast en DDP.
@@ -569,11 +580,16 @@ def train(
             src_flat = _flat_class(contrast, fi, n_fields)
             tgt_flat = _flat_class(contrast, fj, n_fields)
 
-            src_item = next(class_loaders[src_flat])[0].to(device)
-            if fi == fj:
-                tgt_item = src_item  # cas identité : même distribution
-            else:
-                tgt_item = next(class_loaders[tgt_flat])[0].to(device)
+            try:
+                src_item = next(class_loaders[src_flat])[0].to(device)
+                if fi == fj:
+                    tgt_item = src_item  # cas identité : même distribution
+                else:
+                    tgt_item = next(class_loaders[tgt_flat])[0].to(device)
+            except Exception as e:
+                print(f"[DEBUG] loader error at step {step}: {type(e).__name__}: {e}", flush=True)
+                import traceback; traceback.print_exc()
+                raise
 
             if use_latent_cache:
                 # Les items sont déjà des latents (C, H', W', D') → (B, C, H', W', D')
@@ -694,6 +710,7 @@ def train(
                     "model": raw_unet.state_dict(),
                     "ema": ema.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
                     "scaler": scaler.state_dict() if use_scaler else None,
                     "cfg_path": str(cfg_path),
                     "n_classes": n_classes,
@@ -713,6 +730,7 @@ def train(
                 "model": raw_unet.state_dict(),
                 "ema": ema.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict() if use_scaler else None,
                 "cfg_path": str(cfg_path),
                 "n_classes": n_classes,
