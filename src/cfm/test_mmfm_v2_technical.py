@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 from common.io import DOMAINS, MODALITIES
 from cfm.mmfm_vectorized import VectorMMFM
-from cfm.train_mmfm_3d import _field_to_time, _euler_integrate_vector
+from cfm.mmfm_core import _field_to_time, euler_integrate
 
 def test_field_mapping():
     print("Testing field mapping...")
@@ -44,29 +44,25 @@ def test_euler_v2_logic():
     model.eval()
     
     z_src_vec = torch.randn(1, latent_dim)
-    tgt_class = 0
+    y = torch.tensor([0])
     n_steps = 10
     device = torch.device("cpu")
-    
-    # Case 1: identity transition (0.1T -> 0.1T)
-    # We expect the integrate to run, but the actual "delta" is handled by the model.
-    # In v2 mapping, t_start = t_end.
-    z_out_id = _euler_integrate_vector(
-        model, z_src_vec, tgt_class, n_steps, device,
-        method="mmfm3d_vectorized_v2",
-        source_field_idx=0,
-        target_field_idx=0,
-        n_fields=5
+    model_fn = lambda z_t, z_src, t, y: model(z_t, z_src, t, y)
+
+    # Case 1: identity transition (0.1T -> 0.1T) — t_start == t_end.
+    n_fields = 5
+    z_out_id = euler_integrate(
+        model_fn, z_src_vec, y,
+        t_start=_field_to_time(0, n_fields), t_end=_field_to_time(0, n_fields),
+        n_steps=n_steps, device=device,
     )
     assert z_out_id.shape == (1, latent_dim)
-    
+
     # Case 2: forward transition (0.1T -> 7T)
-    z_out_fwd = _euler_integrate_vector(
-        model, z_src_vec, tgt_class, n_steps, device,
-        method="mmfm3d_vectorized_v2",
-        source_field_idx=0,
-        target_field_idx=4,
-        n_fields=5
+    z_out_fwd = euler_integrate(
+        model_fn, z_src_vec, y,
+        t_start=_field_to_time(0, n_fields), t_end=_field_to_time(4, n_fields),
+        n_steps=n_steps, device=device,
     )
     assert z_out_fwd.shape == (1, latent_dim)
     print("✅ Euler v2 integration flow OK.")

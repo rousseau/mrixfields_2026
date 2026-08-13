@@ -1,0 +1,148 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM à latent INR (SIREN + hypernetwork) — config d'entraînement canonique.
+#
+# `data:`/`train:`/`inference:` sont IDENTIQUES à configs/mmfm/{vectorized,unet}.yaml
+# (comparabilité — voir docs/MMFM_ARCHITECTURE.md) sauf output_subdir/cache. La
+# différence architecturale : pas de MedVAE (`vae: {vae_type: identity}`), le
+# flow opère sur un latent INR fitté par volume (voir cfm/arch_inr.py) au lieu
+# d'un latent MedVAE aplati — mais comme ce latent est lui aussi un vecteur
+# plat, le modèle de flow réutilise VectorMMFM tel quel (bloc `model:`
+# identique à vectorized.yaml).
+#
+# Prérequis (backbone gelé, entraîné séparément — analogue à MedVAE) :
+#   1. PYTHONPATH=src python src/cfm/train_inr_backbone.py \
+#          --config configs/mmfm/inr_backbone.yaml --env local
+#   2. PYTHONPATH=src python src/cfm/precompute_inr_latents.py \
+#          --config configs/mmfm/inr.yaml --env local
+#      (note le cache_id imprimé, à reporter dans data.latent_cache_dir ci-dessous)
+#
+# Le bloc `inr_backbone:` DOIT correspondre exactement au bloc `model:` de
+# configs/mmfm/inr_backbone.yaml (même architecture que celle réellement
+# entraînée) — mmfm_core.py ne connaît qu'un seul cfg (celui-ci), donc ces
+# hyperparamètres sont dupliqués ici plutôt que relus depuis inr_backbone.yaml.
+# Voir docs/MMFM_INR_STATE_OF_THE_ART.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_inr
+task_name: mmfm_inr
+
+vae:
+  vae_type: identity
+
+inr_backbone:
+  checkpoint: outputs/mmfm/inr_backbone/weights/model_final.pth
+  # latent_dim 4096 -> 129024 (2026-08-10, demande explicite) : égale la taille
+  # du latent MedVAE @1mm (48x56x48), pour tester si la capacité de `z` est le
+  # facteur limitant de l'INR.
+  #
+  # AVERTISSEMENT MESURÉ : ce changement seul est très probablement un no-op sur
+  # la capacité réelle. Le SIREN à modulation par décalage ne reçoit que
+  # `modulation_dim = num_hidden_layers x hidden_dim` = 6 x 256 = 1536 nombres
+  # par volume, quantité INDÉPENDANTE de latent_dim. Le hypernetwork comprime
+  # donc 129024 -> 512 -> 1536, soit un goulot de 252:1 (le projet a déjà observé
+  # qu'un goulot de 64:1 DÉGRADAIT la fidélité, cf. inr_reconstruction_capacity.csv).
+  # Coût mesuré : 67.2M params, 11.4 GB, 0.98 s/iter => ~13.7h pour 50k.
+  # Les alternatives qui lèvent réellement le goulot ont été mesurées et écartées
+  # pour leur coût : modulation x4 = 83h, modulation x8 = 134h (et encore 10x en
+  # dessous des 129024 de MedVAE). Voir results/mmfm/comparison_20260807_1mm/.
+  latent_dim: 129024
+  hidden_dim: 256
+  num_hidden_layers: 6
+  omega_0: 30.0
+  omega_hidden: 30.0
+  hyper_hidden_dim: 512
+  inner_lr: 0.01
+  inner_steps_train: 10
+  inner_steps_eval: 20
+  # Nombre de points de supervision pour le fit de z (Algorithme 2) au
+  # precompute. À 2mm le fit était « dense » = 1.03M voxels ; à 1mm dense
+  # signifierait 8.3M points (~26h pour 1939 volumes). On garde donc le MÊME
+  # budget de points qu'à 2mm (1048576) sur une grille plus fine : même effort
+  # de fitting, résolution supérieure.
+  fit_points: 1048576
+  fg_weight: 5.0
+  bg_threshold: -0.9
+
+# hidden_dim=1024 (identique à vectorized.yaml/unet.yaml) confirmé comme le bon
+# réglage après ablation (2026-08-06) : doubler à 2048 (3.4x plus de paramètres,
+# 160M) a DÉGRADÉ Task3 (nRMSE 0.4787->0.4911, SSIM 0.8384->0.8351, LPIPS
+# 0.1729->0.1768, 5/20 paires seulement améliorées) — la capacité du flow n'est
+# pas le facteur limitant. Rappel : le latent INR (4096-d) est déjà 4x PLUS PETIT
+# que le latent MedVAE aplati du vectorisé (16128-d), et hidden_dim=1024 le
+# compresse déjà MOINS agressivement (0.25:1) que pour le vectorisé (0.064:1),
+# qui pourtant fonctionne mieux — la piste restante est la structure/régularité
+# de l'espace latent INR lui-même (z fitté par quelques pas de descente de
+# gradient par volume, sans régularisateur de continuité, contrairement au
+# latent KL/perceptuel de MedVAE), pas sa taille ni la capacité du flow qui
+# l'exploite. Voir docs/MMFM_ARCHITECTURE.md et memory pour le détail.
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  # RÉSOLUTION 1mm (2026-08-09) — alignée sur vectorized.yaml/unet.yaml pour que
+  # la comparaison des trois architectures se fasse à résolution égale.
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  split: retro_train
+  output_subdir: mmfm/inr
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/inr
+  latent_cache_dir: outputs/mmfm/latent_cache/inr/inr_932b0b37/retro_train
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  batch_size: 1
+  # 25000 : ALIGNÉ sur vectorized.yaml/unet.yaml (comparaison des trois
+  # architectures à budget d'itérations identique à 1mm).
+  total_iters: 25000
+  num_targets_per_step: 1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  adjacent_only: false
+  identity_prob: 0.1
+  accumulation_steps: 1
+  save_every: 2500
+  # Nombre de checkpoints INTERMÉDIAIRES conservés (rotation par numéro
+  # d'itération). `model_final.pth` n'est jamais concerné. 0 = tout garder
+  # (ancien comportement). Un checkpoint UNet pèse 2.9 Go : sans rotation, un
+  # entraînement de 25000 itérations à save_every=2500 laisse 30 Go derrière lui.
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

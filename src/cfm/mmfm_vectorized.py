@@ -145,3 +145,64 @@ class VectorMMFM(nn.Module):
         for block in self.blocks:
             h = block(h)
         return self.output_head(h)
+
+
+def cycle_rollout_vector(
+    raw_mmfm: VectorMMFM,
+    z_src_vec: torch.Tensor,
+    y_tgt: torch.Tensor,
+    t_i: float,
+    t_j: float,
+    n_steps: int,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Differentiable forward-then-backward Euler round trip in vector latent
+    space: src(t_i) -> ~tgt(t_j) -> ~src(t_i).
+
+    Self-supervised cycle-consistency check for unpaired multi-field training
+    (see MMFM v2): `z_src_vec`/`y_tgt` are the FIXED conditioning inputs used
+    throughout both legs, exactly mirroring how `_euler_integrate_vector`
+    conditions on a fixed source at inference time — the only difference is
+    this version is NOT wrapped in `torch.no_grad()`, so gradients flow back
+    through the whole rollout into `raw_mmfm`'s parameters.
+
+    `z` is kept in fp32 across steps (autocast only wraps each `raw_mmfm`
+    call), matching `_euler_integrate_vector`'s `z = z + dt * vt.float()`
+    pattern, to avoid accumulating bf16 rounding error over the multi-step
+    backprop-through-time chain.
+
+    `dt` is deliberately signed (no `abs()`/`max(dt, eps)`): t_j may be below
+    t_i (target field below source field) — see the identical reasoning in
+    train()'s v2 velocity-target computation.
+
+    Returns:
+        (z_tgt_hat, z_src_roundtrip) — the forward-leg endpoint and the
+        round-tripped point, both fp32. Compare `z_src_roundtrip` against the
+        real `z_src_vec` (known ground truth) for the cycle-consistency loss;
+        `z_tgt_hat` is exposed too since edge-consistency (or future losses)
+        may want the forward endpoint as well as the round trip.
+    """
+    device = z_src_vec.device
+    dt_fwd = (t_j - t_i) / n_steps
+
+    z = z_src_vec.float()
+    for step_i in range(n_steps):
+        t_val = t_i + step_i * dt_fwd
+        t_vec = torch.full((z.shape[0],), t_val, dtype=torch.float32, device=device)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
+            v = raw_mmfm(z, z_src_vec, t_vec, y_tgt)
+        z = z + dt_fwd * v.float()
+    z_tgt_hat = z
+
+    dt_bwd = (t_i - t_j) / n_steps
+    z = z_tgt_hat
+    for step_i in range(n_steps):
+        t_val = t_j + step_i * dt_bwd
+        t_vec = torch.full((z.shape[0],), t_val, dtype=torch.float32, device=device)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
+            v = raw_mmfm(z, z_src_vec, t_vec, y_tgt)
+        z = z + dt_bwd * v.float()
+    z_src_roundtrip = z
+
+    return z_tgt_hat, z_src_roundtrip

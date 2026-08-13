@@ -1,0 +1,106 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Config fine-tuning MedVAE 3D — recette LPIPS + PatchGAN (2026-08-06)
+#
+# Remplace configs/medvae_finetune_all.yaml (L1 pure), dont le checkpoint
+# produisait des reconstructions visiblement floues (SSIM ~0.88-0.95 à 2mm,
+# détail cortical fin perdu — voir
+# results/mmfm/comparison_20260801_final/figures_representation_capacity/).
+#
+# DIAGNOSTIC (recherche documentée dans le manifest et la mémoire projet) :
+#   - Le papier MedVAE (Varma et al., arXiv:2502.14753, MIDL 2025) rapporte
+#     MS-SSIM 0.983 / PSNR 29.52 sur IRM cérébrale pour EXACTEMENT ce modèle
+#     (medvae_4_1_3d) — la capacité du checkpoint pré-entraîné n'est pas en
+#     cause, c'est notre recette de fine-tuning qui l'a dégradée.
+#   - Leur code (StanfordMIMI/MedVAE, medvae/losses/vae_losses.py) entraîne
+#     avec L1 + LPIPS(2.5D) + PatchGAN(2.5D) + KL — une descendance directe de
+#     la loss d'autoencodeur de Latent Diffusion (Rombach et al. 2022). Notre
+#     fine-tuning n'utilisait QUE la L1 : on érodait activement la netteté
+#     héritée du pré-entraînement (flou par moyennage = espérance
+#     conditionnelle ; Larsen et al. 2016, Isola et al. 2017 pix2pix).
+#
+# Deux corrections par rapport à l'ancienne config :
+#   (A) recette de loss complète (voir bloc `train:` ci-dessous) ;
+#   (B) patches 64^3 comme la recette officielle MedVAE 3D
+#       (medvae/utils/loaders.py::load_mri_3d_finetune → RandSpatialCrop 64^3),
+#       au lieu de 128x128x80 — et surtout un fine-tuning à la MÊME résolution
+#       que celle réellement déployée en aval (l'ancien run affinait à 1mm mais
+#       le pipeline MMFM encodait à 2mm : incohérence train/inférence réelle).
+#
+# Valeurs de référence reprises telles quelles de
+#   configs/experiment/medvae_4x_1c_3d_finetuning.yaml
+#   configs/criterion/lpips_with_discriminator.yaml
+# du dépôt officiel : kl_weight=1e-6, disc_weight=0.5, disc_start=3125,
+# perceptual_weight=1.0, lr=4.5e-6, batch_size=4.
+#
+# Lancement :
+#   PYTHONPATH=src python src/vae3d/finetune_medvae.py \
+#       --config configs/medvae_finetune_lpips.yaml --env local
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: medvae_finetune
+task_name: medvae_finetune_lpips
+
+medvae:
+  model_name: medvae_4_1_3d
+  freeze_encoder: false
+  freeze_decoder: false
+
+data:
+  split: retro_train
+  modalities: [T1W, T2W, T2FLAIR]
+  fields: [0.1T, 1.5T, 3T, 5T, 7T]
+
+  output_subdir: medvae/runs/medvae_finetune_lpips
+
+  # 64^3 : taille de patch de la recette officielle MedVAE 3D.
+  patch_size: [64, 64, 64]
+
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+
+  # 1mm — résolution de travail cible (voir (B) ci-dessus). Le VAE étant
+  # entièrement convolutif, il s'applique ensuite à n'importe quelle taille de
+  # volume à cette résolution.
+  target_spacing: [1.0, 1.0, 1.0]
+
+  val_fraction: 0.1
+
+train:
+  batch_size: 4                 # valeur de la config officielle MedVAE 3D
+  num_workers: 8
+  # Budget borné : ~12s/pas mesuré au smoke test à slice_stride=1 (768 coupes
+  # VGG par appel à batch=4) => 20000 pas = 66h, rédhibitoire. Avec
+  # slice_stride=2 (~6s/pas) et 6000 pas => ~10h, avec un checkpoint tous les
+  # 1000 pas pour pouvoir SÉLECTIONNER le meilleur plutôt que sur-affiner (le
+  # pré-entraîné à 1mm est déjà à SSIM 0.9152 : le fine-tuning est une
+  # adaptation de domaine, pas un sauvetage).
+  total_steps: 6000
+
+  lr: 4.5e-6                    # base_learning_rate officiel MedVAE 3D
+  lr_warmup_steps: 500
+
+  save_every: 1000
+  print_every: 50
+
+  use_amp: true                 # -> bf16 automatiquement (pas de GradScaler avec
+                                #    la recette perceptuelle, cf. finetune_medvae.py)
+
+  # nll en réduction `sum` (fidèle à LDM/MedVAE) => normes de gradient ~1e4.
+  # AdamW étant invariant à un facteur d'échelle constant sur la loss, ce n'est
+  # pas un problème en soi, MAIS un grad_clip=1.0 (l'ancienne valeur) écraserait
+  # tout d'un facteur ~1e4 et annulerait l'adaptativité d'Adam. Clip désactivé,
+  # normes surveillées via les logs.
+  grad_clip: 0
+
+  lambda_l1: 1.0
+  lambda_kl: 1.0e-6             # kl_weight officiel (l'ancienne config avait 0.0)
+
+  # ─── Recette perceptuelle + adversariale ────────────────────────────────
+  lambda_perceptual: 1.0        # perceptual_weight officiel
+  disc_weight: 0.5              # disc_weight officiel
+  disc_start: 1000              # même ratio que la référence (3125/20000 ≈ 15%)
+  disc_lr: 4.5e-6
+  slice_stride: 2               # 1 = fidèle ; 2 = 1 coupe sur 2 par axe (~2x plus rapide)
+  nll_reduction: sum            # fidèle à LDM/MedVAE
+
+  dist_backend: nccl

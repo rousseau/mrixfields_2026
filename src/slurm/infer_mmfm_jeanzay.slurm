@@ -8,8 +8,8 @@
 #
 # Lancement :
 #   sbatch src/slurm/infer_mmfm_jeanzay.slurm \
-#       configs/mmfm3d_multimarginal_medvae_run1.yaml \
-#       outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/model_final.pth \
+#       configs/mmfm/unet.yaml \
+#       outputs/mmfm/unet/weights/model_final.pth \
 #       outputs/submission_candidates/mmfm_multimarginal_val \
 #       Validating_prospective
 #

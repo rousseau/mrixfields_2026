@@ -14,6 +14,7 @@ Supported vae_types:
   - "pythae_vae"        : Pythae VAE 3D (conv encoder/decoder + reparameterization)
   - "pythae_vqvae"      : Pythae VQ-VAE 3D (5D quantizer, EMA codebook)
   - "pythae_rhvae"      : Pythae RHVAE 3D (Riemannian Hamiltonian VAE, vectorial latent)
+  - "identity"          : no-op pass-through (INR variant — operates on raw volumes, no VAE)
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ except ImportError:
 from models.vae_base import MRIxFieldsVAE
 from models.vae_wrappers import (
     AEKLWrapper,
+    IdentityVAEWrapper,
     MedVAEWrapper,
     MedVAEDisentangleWrapper,
     VQVAEWrapper,
@@ -86,6 +88,8 @@ def load_vae(cfg: dict, device: torch.device) -> MRIxFieldsVAE:
         wrapper = _load_pythae_vqvae(vae_cfg, device)
     elif vae_type == "pythae_rhvae":
         wrapper = _load_pythae_rhvae(vae_cfg, device)
+    elif vae_type == "identity":
+        wrapper = IdentityVAEWrapper()
     else:
         wrapper = _load_aekl(vae_cfg, device, vae_source)
 

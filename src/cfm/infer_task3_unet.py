@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cfm.train_mmfm_unet_3d import infer
+from cfm.mmfm_core import infer
 
 DOMAINS = ["0.1T", "1.5T", "3T", "5T", "7T"]
 
@@ -51,6 +51,7 @@ def main():
                 input_volume=None,
                 n_steps=args.n_steps,
                 use_ema=not args.no_ema,
+                method="mmfm3d_unet",
             )
 
     print(f"\nToutes les prédictions sont dans : {out_root}")

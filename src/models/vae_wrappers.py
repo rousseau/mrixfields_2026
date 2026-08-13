@@ -103,6 +103,36 @@ class AEKLWrapper(MRIxFieldsVAE):
 
 
 # --------------------------------------------------------------------------- #
+# Identity (no-op) — for architectures operating on raw volumes (INR)         #
+# --------------------------------------------------------------------------- #
+
+
+class IdentityVAEWrapper(MRIxFieldsVAE):
+    """Pass-through 'VAE' — no encoding, no learned parameters.
+
+    Lets an architecture that operates directly on raw volumes (the INR
+    variant, see cfm/arch_inr.py) reuse mmfm_core.py's train()/infer() flow
+    unchanged: encode()/decode() are no-ops, and the real per-volume work
+    (INR meta-fitting) happens in the arch's own prep_latent/restore_latent,
+    not here. See docs/MMFM_INR_STATE_OF_THE_ART.md section (C).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.latent_channels = 1
+
+    @property
+    def latent_format(self):
+        return "spatial"
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return z
+
+
+# --------------------------------------------------------------------------- #
 # MedVAE (StanfordMIMI)                                                       #
 # --------------------------------------------------------------------------- #
 

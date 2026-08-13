@@ -1,0 +1,65 @@
+{
+  "date": "2026-07-29",
+  "task": "task3 (+ triage task1 subset)",
+  "modality": "T1W",
+  "evaluation_script": "src/evaluation/evaluate.py",
+  "inference_script": "src/cfm/infer_mmfm_unified.py",
+  "strict_mode": {
+    "pred_dir_explicit": true,
+    "auto_discovery_disabled_by_cli": true,
+    "expected_predictions_triage": 12,
+    "expected_predictions_full": 60
+  },
+  "triage_models": [
+    {
+      "name": "run1",
+      "train_config": "configs/mmfm3d_multimarginal_medvae_run1.yaml",
+      "checkpoint": "outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/model_final.pth",
+      "pred_dir": "outputs/predictions/mmfm_unet_mm_run1_triage/task3/T1W",
+      "results_csv": "results/mmfm/analysis/protocol_20260729_unet_mm_baseline/triage_run1.csv",
+      "mean_intensity_ratio_pred_over_gt": 4.69,
+      "mean_nrmse": 3.511
+    },
+    {
+      "name": "run2_local",
+      "train_config": "configs/mmfm3d_multimarginal_medvae_run2_local.yaml",
+      "checkpoint": "outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run2_local/weights/model_final.pth",
+      "pred_dir": "outputs/predictions/mmfm_unet_mm_run2_local_triage/task3/T1W",
+      "results_csv": "results/mmfm/analysis/protocol_20260729_unet_mm_baseline/triage_run2_local.csv",
+      "mean_intensity_ratio_pred_over_gt": 3.02,
+      "mean_nrmse": 2.456,
+      "selected_best": true
+    },
+    {
+      "name": "run3c",
+      "train_config": "configs/mmfm3d_multimarginal_medvae_run3c.yaml",
+      "checkpoint": "outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run3c/weights/model_final.pth",
+      "pred_dir": "outputs/predictions/mmfm_unet_mm_run3c_triage/task3/T1W",
+      "results_csv": "results/mmfm/analysis/protocol_20260729_unet_mm_baseline/triage_run3c.csv",
+      "mean_intensity_ratio_pred_over_gt": 4.07,
+      "mean_nrmse": 3.070
+    }
+  ],
+  "full_eval_model": {
+    "name": "run2_local",
+    "train_config": "configs/mmfm3d_multimarginal_medvae_run2_local.yaml",
+    "checkpoint": "outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run2_local/weights/model_final.pth",
+    "pred_dir": "outputs/predictions/mmfm_unet_mm_run2_local_full/task3/T1W",
+    "results_csv": "results/mmfm/analysis/protocol_20260729_unet_mm_baseline/task3_run2_local_T1W.csv",
+    "predictions_complete": "60/60",
+    "mean_nrmse_overall": 1.180,
+    "mean_nrmse_by_target_field": {
+      "0.1T": 0.487,
+      "1.5T": 0.625,
+      "3T": 0.454,
+      "5T": 1.881,
+      "7T": 2.455
+    },
+    "reference_vectorized_current_best": {
+      "csv": "results/task3_mmfm_v2_regularized_v2_T1W.csv",
+      "mean_nrmse_overall": 0.53
+    }
+  },
+  "conclusion": "Bug d'amplification d'intensite confirme et severe sur les 3 checkpoints multi-marginaux, concentre specifiquement sur les cibles 5T/7T (nRMSE 4-5x pire que 0.1T/1.5T/3T) -- signature coherente avec l'hypothese de normalisation par volume au lieu de field_norm_stats fixe par champ. Valide la Phase 1 du plan (port de field_norm_stats) comme prochaine etape.",
+  "next_step": "Phase 1 -- port field_norm_stats_1mm.json dans train_mmfm_unet_3d.py + infer_mmfm_unified.py + cache latent spatial"
+}

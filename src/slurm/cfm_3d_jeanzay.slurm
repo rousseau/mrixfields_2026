@@ -14,14 +14,11 @@
 #   # Variante bidomaine 0.1T↔7T uniquement :
 #   sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_medvae_0p1T_7T.yaml
 #
-#   # Baseline MMFM v1 vectorisée sur latent MedVAE aplati
-#   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm T1W configs/mmfm3d_medvae_multimodal.yaml
+#   # MMFM vectorisé (MLP) sur latent MedVAE aplati
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm T1W configs/mmfm/vectorized.yaml
 #
-#   # MMFM-UNet 3D spatial V1 sur latent MedVAE
-#   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm_unet T1W configs/mmfm3d_unet_medvae_multimodal.yaml
-#
-#   # MMFM-UNet 3D spatial V2 (random crop, full brain) — recommandé
-#   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm_unet MULTI configs/mmfm3d_unet_v2_medvae_multimodal.yaml
+#   # MMFM-UNet 3D spatial sur latent MedVAE
+#   sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm_unet T1W configs/mmfm/unet.yaml
 #
 # Prérequis (via setup_jeanzay.sh) :
 #   $WORK/MRIX/mrixfields_2026/   ← ce repo
@@ -137,6 +134,7 @@ trap '_requeue_handler' USR1
 # ─── Sélection de la config ───────────────────────────────────────────────────
 cd "$CODE_DIR"
 
+METHOD_ARG=""
 if [ "$PHASE" = "vae" ]; then
     SCRIPT="src/vae3d/train_vae_3d.py"
     if [ -n "$CONFIG_ARG" ]; then
@@ -152,18 +150,20 @@ elif [ "$PHASE" = "cfm" ]; then
         CONFIG="configs/cfm3d_T1W_medvae_finetuned.yaml"
     fi
 elif [ "$PHASE" = "mmfm" ]; then
-    SCRIPT="src/cfm/train_mmfm_3d.py"
+    SCRIPT="src/cfm/train_mmfm_unified.py"
+    METHOD_ARG="--method mmfm3d_vectorized"
     if [ -n "$CONFIG_ARG" ]; then
         CONFIG="$CONFIG_ARG"
     else
-        CONFIG="configs/mmfm3d_medvae_multimodal.yaml"
+        CONFIG="configs/mmfm/vectorized.yaml"
     fi
 elif [ "$PHASE" = "mmfm_unet" ]; then
-    SCRIPT="src/cfm/train_mmfm_unet_3d.py"
+    SCRIPT="src/cfm/train_mmfm_unified.py"
+    METHOD_ARG="--method mmfm3d_unet"
     if [ -n "$CONFIG_ARG" ]; then
         CONFIG="$CONFIG_ARG"
     else
-        CONFIG="configs/mmfm3d_unet_medvae_multimodal.yaml"
+        CONFIG="configs/mmfm/unet.yaml"
     fi
 else
     echo "[ERREUR] Phase inconnue : '$PHASE'. Utiliser 'vae', 'cfm', 'mmfm' ou 'mmfm_unet'."
@@ -250,6 +250,7 @@ torchrun \
     --master_addr=localhost \
     --master_port="$MASTER_PORT" \
     "$SCRIPT" \
+    $METHOD_ARG \
     --config "$CONFIG" \
     --env remote \
     $RESUME_FLAG

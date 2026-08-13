@@ -61,8 +61,15 @@ def _dispatch_infer(method: str):
     if method == "cfm3d":
         from cfm.train_cfm_3d import infer as _infer
         return _infer
-    if method in ("mmfm3d", "mmfm", "mmfm3d_vectorized", "mmfm3d_vectorized_v1"):
-        from cfm.train_mmfm_3d import infer as _infer
+    if method == "mmfm3d_vectorized_v1":
+        raise ValueError(
+            "mmfm3d_vectorized_v1 a été retiré lors de l'unification vectorisé/UNet "
+            "(jamais mis à jour cette session, algorithme différent des versions "
+            "actives — voir le plan d'unification) — récupérable via `git show` "
+            "si nécessaire."
+        )
+    if method in ("mmfm3d", "mmfm", "mmfm3d_vectorized", "mmfm3d_vectorized_v2"):
+        from cfm.mmfm_core import infer as _infer
         return _infer
     if method in ("mmfm3d_unet_v2", "mmfm3d_unet"):
         # Pipeline pleine résolution (patches glissants + blending), qui
@@ -86,6 +93,7 @@ def run_inference_for_targets(
     n_steps: int | None,
     use_ema: bool,
     env_path: str | None,
+    field_norm_stats_path: str | None = None,
 ) -> None:
     """Lance l'inférence pour chaque champ cible sur les sujets sélectionnés."""
     with open(cfg_path) as f:
@@ -118,7 +126,9 @@ def run_inference_for_targets(
                 n_steps=n_steps,
                 use_ema=use_ema,
             )
-        else:
+        elif method in ("mmfm3d_unet_v2", "mmfm3d_unet"):
+            # infer_mmfm_unet_v2_batch.infer() has no `method` kwarg (single
+            # full-res sliding-window pipeline shared by unet v1/v2).
             infer_fn(
                 cfg_path=str(cfg_path),
                 checkpoint=str(checkpoint),
@@ -132,6 +142,28 @@ def run_inference_for_targets(
                 input_volume=None,
                 n_steps=n_steps,
                 use_ema=use_ema,
+            )
+        else:
+            # Vectorized MLP (mmfm3d / mmfm / mmfm3d_vectorized / _v2, all
+            # sharing the same unified multi-marginal scheme post-unification
+            # — see cfm/mmfm_core.py): forward the canonical method string,
+            # not the YAML's possibly-legacy one (mmfm_core.infer() only
+            # accepts "mmfm3d_vectorized").
+            infer_fn(
+                cfg_path=str(cfg_path),
+                checkpoint=str(checkpoint),
+                output_dir=str(out_dir),
+                source_field=source_field,
+                source_modality=modality,
+                target_field=tgt,
+                target_modality=modality,
+                env_path=env_path,
+                input_dir=str(input_dir),
+                input_volume=None,
+                n_steps=n_steps,
+                use_ema=use_ema,
+                method="mmfm3d_vectorized",
+                field_norm_stats_path=field_norm_stats_path,
             )
 
 
@@ -168,6 +200,9 @@ def main():
                         help="Environnement de résolution des chemins (local/remote/chemin)")
     parser.add_argument("--no-ema", action="store_true",
                         help="Ignorer les poids EMA")
+    parser.add_argument("--field-norm-stats", default=None,
+                        help="Chemin vers un JSON de compute_field_norm_stats.py "
+                             "(normalisation fixe par champ, vectorisé v1/v2 uniquement)")
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
@@ -204,6 +239,7 @@ def main():
         n_steps=args.n_steps,
         use_ema=not args.no_ema,
         env_path=args.env,
+        field_norm_stats_path=args.field_norm_stats,
     )
 
     out_path = Path(args.out) if args.out else (

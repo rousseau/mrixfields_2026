@@ -1,5 +1,10 @@
 # ── Données lourdes (jamais versionnées) ────────────────────────────────────
-outputs/          # images, prédictions, checkpoints générés localement
+# images, prédictions, checkpoints générés localement.
+# ATTENTION : un commentaire en FIN DE LIGNE n'existe pas dans un .gitignore —
+# seules les lignes commençant par '#' sont des commentaires. La ligne était
+# écrite `outputs/          # images, ...`, donc le motif était cette phrase
+# entière et n'a jamais rien exclu : outputs/ était versionnable par mégarde.
+outputs/
 *.nii
 *.nii.gz
 *.npy

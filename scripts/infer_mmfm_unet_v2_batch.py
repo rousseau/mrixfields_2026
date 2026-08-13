@@ -46,15 +46,32 @@ import torch
 _SRC = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_SRC))
 
-from cfm.train_mmfm_unet_3d import (
-    build_unet_3d,
-    load_vae,
-    _euler_integrate,
-    _flat_class,
-    _remap_monai_attention_keys,
-)
+from cfm.arch_unet import build_unet_3d, remap_monai_attention_keys as _remap_monai_attention_keys
+from cfm.mmfm_core import _flat_class
 from common.config import load_yaml_with_include, load_env, resolve_paths
 from common.io import DOMAINS, MODALITIES
+from models.vae_loader import load_vae
+
+
+@torch.no_grad()
+def _euler_integrate(unet, z_src, tgt_class, n_steps, device, use_amp=False, amp_dtype=torch.bfloat16):
+    """[LEGACY] Flat-class Euler integration over t in [0,1] — this script's
+    own pre-multi-marginal scheme (15 flat (modality, field) classes, no
+    field-as-time axis), kept as a self-contained copy since
+    train_mmfm_unet_3d.py (which used to host this exact function for this
+    exact caller) was retired in favor of the unified multi-marginal trainer
+    (see train_mmfm_unified.py / mmfm_core.euler_integrate)."""
+    dt = 1.0 / n_steps
+    z = z_src.clone().to(device)
+    y = torch.tensor([tgt_class], dtype=torch.long, device=device)
+    for step_i in range(n_steps):
+        t_val = step_i * dt
+        t_vec = torch.tensor([t_val], dtype=torch.float32, device=device)
+        z_in = torch.cat([z, z_src], dim=1)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
+            vt = unet(x=z_in, timesteps=t_vec, class_labels=y)
+        z = z + dt * vt.float()
+    return z
 
 
 # --------------------------------------------------------------------------- #

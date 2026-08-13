@@ -11,9 +11,9 @@
 #   CONFIG   : chemin vers le fichier YAML de config
 #
 # Exemples :
-#   bash src/slurm/submit.sh mmfm_unet T1W configs/mmfm3d_unet_medvae_multimodal.yaml
+#   bash src/slurm/submit.sh mmfm_unet T1W configs/mmfm/unet.yaml
 #   bash src/slurm/submit.sh cfm       T1W configs/cfm3d_T1W_medvae.yaml
-#   bash src/slurm/submit.sh mmfm      T1W configs/mmfm3d_medvae_multimodal.yaml
+#   bash src/slurm/submit.sh mmfm      T1W configs/mmfm/vectorized.yaml
 #
 # Nom du job : dérivé de output_subdir dans le YAML, tronqué à 15 caractères.
 # Logs       : logs/<job_name>_<SLURM_JOB_ID>.{out,err}

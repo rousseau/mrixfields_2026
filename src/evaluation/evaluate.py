@@ -59,6 +59,7 @@ VAE_REG = {
 CFM_REG = {
     "cfm":         {"path": "outputs/cfm3d/runs/cfm3d_T1W_medvae_0p1T_7T/weights/model_final.pth"},
     "mmfm":        {"path": "outputs/cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1/weights/model_final.pth"},
+    "mmfm_v2":     {"path": "outputs/cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v2/weights/model_final.pth"},
     "mmfm_unet":   {"path": "outputs/cfm3d/runs/mmfm3d_unet_medvae_multimodal/weights/model_final.pth"},
 }
 
@@ -73,7 +74,7 @@ def _parse_iter(name: str) -> int:
 
 def discover_pred_dir(method: str, modality: str = "T1W", task: str = "task3") -> Optional[Path]:
     # New structured full-resolution output: outputs/predictions/{method}/{task}/{modality}
-    if method in ("mmfm_unet", "mmfm"):
+    if method in ("mmfm_unet", "mmfm", "mmfm_v2"):
         fullres_candidate = Path("outputs/predictions") / method / task / modality
         if fullres_candidate.exists() and any(fullres_candidate.rglob("*.nii*")):
             return fullres_candidate
@@ -114,21 +115,23 @@ def discover_pred_dir(method: str, modality: str = "T1W", task: str = "task3") -
 # --------------------------------------------------------------------------- #
 
 def parse_mmfm_filename(name: str) -> Optional[Dict]:
+    """Legacy naming: P_{MOD}_{SRC}_{ID}_{MOD}_{TGT}_{method}.nii.gz."""
     pattern = re.compile(r"^P_([A-Z0-9]+)_([\d\.]+T)_(\d{4})_([A-Z0-9]+)_([\d\.]+T)_.*\.nii.*$")
     m = pattern.match(name)
     if m:
         return {
             "modality": m.group(1), "src_field": m.group(2), "subject": m.group(3),
-            "tgt_field": m.group(5),
+            "tgt_field": m.group(5), "is_official": False,
         }
     return None
 
 
 def parse_generic_filename(name: str) -> Optional[Dict]:
+    """Official naming: P_{MOD}_{TGT}_{ID}.nii.gz."""
     pattern = re.compile(r"^P_([A-Z0-9]+)_([\d\.]+T)_(\d{4})\.nii.*$")
     m = pattern.match(name)
     if m:
-        return {"modality": m.group(1), "tgt_field": m.group(2), "subject": m.group(3)}
+        return {"modality": m.group(1), "tgt_field": m.group(2), "subject": m.group(3), "is_official": True}
     return None
 
 
@@ -141,9 +144,19 @@ def parse_pair_dir_name(name: str) -> Optional[Tuple[str, str]]:
 
 
 def build_prediction_matrix(pred_dir: Path, modality: str = "T1W") -> Dict[str, Dict[str, Dict[str, Path]]]:
-    """Build matrix: {src_field: {subject: {tgt_field: pred_path}}}."""
-    matrix = {}
-    for pred_path in pred_dir.rglob("*.nii*"):
+    """Build matrix: {src_field: {subject: {tgt_field: pred_path}}}.
+
+    When both the official naming convention (P_{MOD}_{TGT}_{ID}.nii.gz) and
+    the legacy one (P_{MOD}_{SRC}_{ID}_{MOD}_{TGT}_{method}.nii.gz) exist for
+    the same (src, subject, tgt) — e.g. leftovers from an earlier inference
+    run in the same output dir — the official one always wins, deterministically.
+    Two candidates with the same official-ness is an unresolvable ambiguity
+    and is reported rather than silently picked by filesystem iteration order.
+    """
+    matrix: Dict[str, Dict[str, Dict[str, Path]]] = {}
+    official_flags: Dict[Tuple[str, str, str], bool] = {}
+
+    for pred_path in sorted(pred_dir.rglob("*.nii*")):
         info = parse_mmfm_filename(pred_path.name) or parse_generic_filename(pred_path.name)
         if not info:
             continue
@@ -162,12 +175,29 @@ def build_prediction_matrix(pred_dir: Path, modality: str = "T1W") -> Dict[str, 
             tgt = info.get("tgt_field")
 
         sid = info.get("subject")
-        if sid and src and tgt:
-            if src not in matrix:
-                matrix[src] = {}
-            if sid not in matrix[src]:
-                matrix[src][sid] = {}
-            matrix[src][sid][tgt] = pred_path
+        if not (sid and src and tgt):
+            continue
+
+        is_official = bool(info.get("is_official"))
+        key = (src, sid, tgt)
+        existing_official = official_flags.get(key)
+
+        if existing_official is not None:
+            kept = matrix[src][sid][tgt]
+            if existing_official == is_official:
+                print(
+                    f"⚠️  Doublon ambigu pour {src}→{tgt} sujet {sid}: "
+                    f"'{kept.name}' vs '{pred_path.name}' (même statut officiel={is_official}) "
+                    f"— fichier conservé: '{kept.name}'"
+                )
+                continue
+            if not is_official:
+                # Existing entry is official, new one is legacy: keep existing.
+                continue
+            # New entry is official, existing one was legacy: replace it.
+
+        matrix.setdefault(src, {}).setdefault(sid, {})[tgt] = pred_path
+        official_flags[key] = is_official
     return matrix
 
 
@@ -225,6 +255,7 @@ def prepare_pair_dir(
     tgt_out.mkdir(parents=True, exist_ok=True)
 
     count = 0
+    resample_warned = False
     for sid in PROSPECTIVE_SUBJECTS:
         if tgt_field not in matrix.get(sid, {}):
             continue
@@ -244,6 +275,15 @@ def prepare_pair_dir(
         gt_data = gt_nii.get_fdata(dtype=np.float32)
 
         if pred_data.shape != gt_data.shape or not np.allclose(pred_nii.affine, gt_nii.affine, atol=1e-3):
+            if not resample_warned:
+                print(
+                    f"⚠️  {src_field}→{tgt_field}: prédiction {pred_data.shape} "
+                    f"rééchantillonnée (cubique) vers la grille GT {gt_data.shape}. "
+                    "Les métriques locales sont une estimation approximative, PAS un "
+                    "prédicteur fiable du score officiel (le pipeline Synapse ne "
+                    "rééchantillonne jamais — les soumissions sont en résolution native)."
+                )
+                resample_warned = True
             pred_img = nib.Nifti1Image(pred_data, pred_nii.affine)
             gt_img = nib.Nifti1Image(gt_data, gt_nii.affine)
             pred_resampled = nib_proc.resample_from_to(pred_img, gt_img, order=3, mode="constant", cval=0.0)
@@ -370,7 +410,7 @@ def evaluate_task(
 #  CLI
 # --------------------------------------------------------------------------- #
 
-SUPPORTED_METHODS = ["stargan2d", "cfm", "mmfm", "mmfm_unet"]
+SUPPORTED_METHODS = ["stargan2d", "cfm", "mmfm", "mmfm_v2", "mmfm_unet", "mmfm_inr"]
 SUPPORTED_TASKS = ["task1", "task2", "task3"]
 
 

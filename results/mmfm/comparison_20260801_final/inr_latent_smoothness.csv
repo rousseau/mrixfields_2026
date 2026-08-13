@@ -1,0 +1,9 @@
+metric,condition,model,value,n
+interp_smoothness_std_step,same_field,inr,0.0003901485364656399,20
+interp_smoothness_std_step,same_field,medvae,0.002257761603256106,20
+interp_smoothness_std_step,cross_field,inr,0.0011434055307487049,20
+interp_smoothness_std_step,cross_field,medvae,0.003020651812130448,20
+lipschitz_median,isotropic,inr,0.33937703713516243,160
+lipschitz_std,isotropic,inr,0.04416730974033236,160
+lipschitz_median,isotropic,medvae,3.4716487794232074e-05,160
+lipschitz_std,isotropic,medvae,1.4809963214437428e-06,160

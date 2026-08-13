@@ -34,10 +34,17 @@ def strip_nifti_ext(name: str) -> str:
 
 def subject_id_from_name(name: str) -> str:
     """
-    Extrait le subject_id d'un nom officiel P_{MOD}_{FIELD}_{ID}.nii.gz.
+    Extrait le subject_id d'un nom P_{MOD}_{FIELD}_{ID}[_...].nii.gz.
     Gère correctement les champs contenant un point (ex: 0.1T).
+
+    L'ID est toujours le 4e token (index 3, après P/modalité/champ) : ceci
+    reste correct aussi bien pour le nommage officiel (4 tokens, ID en
+    dernière position) que pour le nommage legacy avec suffixe méthode
+    (ex: P_T1W_0.1T_0006_T1W_3T_mmfm_unet.nii.gz), où prendre le DERNIER
+    token renverrait à tort "unet" au lieu de "0006".
     """
-    return strip_nifti_ext(name).split("_")[-1]
+    tokens = strip_nifti_ext(name).split("_")
+    return tokens[3] if len(tokens) > 3 else tokens[-1]
 
 
 def load_mid_slice(nifti_path: Path, axis: int = 2) -> np.ndarray:
@@ -115,6 +122,25 @@ def list_subjects(
     return [subject_id_from_name(f.name) for f in sorted(src_dir.glob("*.nii.gz"))]
 
 
+def _draw_panel(ax, sl: np.ndarray | None) -> None:
+    """Draw a slice panel, or a visually distinct placeholder if `sl` is None.
+
+    A missing file must never render identically to a real dark/near-zero
+    prediction — otherwise a broken inference path (wrong output dir, failed
+    run) is indistinguishable, in the saved PNG itself, from a genuinely
+    collapsed model output.
+    """
+    if sl is None:
+        ax.imshow(np.zeros((64, 64)), cmap="gray", origin="lower", vmin=0, vmax=1)
+        ax.text(
+            0.5, 0.5, "MANQUANT", ha="center", va="center",
+            fontsize=7, fontweight="bold", color="red", transform=ax.transAxes,
+        )
+    else:
+        ax.imshow(sl.T, cmap="gray", origin="lower", vmin=0, vmax=1)
+    ax.axis("off")
+
+
 def make_multi_field_figure(
     subjects: list[str],
     modality: str,
@@ -159,14 +185,12 @@ def make_multi_field_figure(
         # ---- Source --------------------------------------------------------
         src_dir = data_dir / "Training_prospective" / modality / source_field
         src_file = find_subject_file(src_dir, subject_id)
-        if src_file is not None:
-            sl = normalize(load_mid_slice(src_file, axis))
-        else:
-            sl = np.zeros((64, 64))
-        axes[row_idx][0].imshow(sl.T, cmap="gray", origin="lower", vmin=0, vmax=1)
+        sl = normalize(load_mid_slice(src_file, axis)) if src_file is not None else None
+        if src_file is None:
+            print(f"  [ATTENTION] Source introuvable : {src_dir} / sujet {subject_id}")
+        _draw_panel(axes[row_idx][0], sl)
         axes[row_idx][0].set_title(col_labels[0] if row_idx == 0 else "", fontsize=7)
         axes[row_idx][0].set_ylabel(f"Sujet {subject_id}", fontsize=7)
-        axes[row_idx][0].axis("off")
 
         # ---- Pred + GT pour chaque champ cible -----------------------------
         for tgt_idx, tgt_field in enumerate(target_fields):
@@ -181,7 +205,7 @@ def make_multi_field_figure(
             if gt_file is not None:
                 sl_gt = normalize(load_mid_slice(gt_file, axis))
             else:
-                sl_gt = np.zeros((64, 64))
+                sl_gt = None
                 print(f"  [ATTENTION] GT introuvable : {gt_dir} / sujet {subject_id}")
 
             # Prédiction — recalée sur la grille du GT pour éviter tout
@@ -195,19 +219,16 @@ def make_multi_field_figure(
                 else:
                     sl_pred = normalize(load_mid_slice(pred_file, axis))
             else:
-                sl_pred = np.zeros((64, 64))
+                sl_pred = None
                 print(
                     f"  [ATTENTION] Prédiction introuvable : "
                     f"{tgt_pred_dir} / sujet {subject_id}"
                 )
 
             for col_idx, sl in ((col_pred, sl_pred), (col_gt, sl_gt)):
-                axes[row_idx][col_idx].imshow(
-                    sl.T, cmap="gray", origin="lower", vmin=0, vmax=1
-                )
+                _draw_panel(axes[row_idx][col_idx], sl)
                 if row_idx == 0:
                     axes[row_idx][col_idx].set_title(col_labels[col_idx], fontsize=7)
-                axes[row_idx][col_idx].axis("off")
 
     if title is None:
         title = (

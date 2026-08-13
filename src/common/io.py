@@ -73,6 +73,43 @@ def normalize_volume(
     return (vol * 2.0 - 1.0).astype(np.float32)
 
 
+def normalize_volume_fixed(
+    vol: np.ndarray,
+    lo: float,
+    hi: float,
+) -> np.ndarray:
+    """Normalize using externally-provided (lo, hi) instead of this volume's
+    own percentiles.
+
+    normalize_volume() computes lo/hi PER VOLUME, which independently
+    stretches every volume to fill [0, 1] — this erases genuine intensity-
+    scale differences between fields (e.g. 5T/7T natively occupy only a
+    fraction of [0, 1] compared to 0.1T/1.5T/3T). Use per-field fixed
+    statistics from compute_field_norm_stats.py here instead, so the model
+    sees and can learn the real field-to-field dynamic range differences.
+
+    Returns: normalized volume in [-1, 1] as float32 (same convention as
+    normalize_volume).
+    """
+    if hi <= lo:
+        return np.zeros_like(vol, dtype=np.float32)
+    vol = np.clip((vol - lo) / (hi - lo), 0.0, 1.0)
+    return (vol * 2.0 - 1.0).astype(np.float32)
+
+
+def denormalize_from_01(vol01: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Inverse of normalize_volume_fixed's [0, 1] stage.
+
+    Maps a model output in [0, 1] back to a field's native intensity range
+    (lo, hi). Must be applied at inference — using the TARGET field's stats —
+    before saving a prediction; otherwise the output stays in the always-
+    full-range training-time scale and is compared against native-scale GT
+    at a mismatched intensity range (the root cause of the nRMSE blowup
+    specifically on 5T/7T targets, whose native range is far narrower).
+    """
+    return (vol01 * (hi - lo) + lo).astype(np.float32)
+
+
 def resample_volume(
     vol: np.ndarray,
     original_spacing,
@@ -207,6 +244,8 @@ def load_nifti_volume(
     normalize: bool = True,
     lo_pct: float = 0.5,
     hi_pct: float = 99.5,
+    fixed_lo: Optional[float] = None,
+    fixed_hi: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Charge un volume NIfTI, optionnellement le rééchantillonne, crop/pad, normalise.
 
@@ -215,8 +254,12 @@ def load_nifti_volume(
         target_spacing: Target voxel spacing (mm). None = no resampling.
         volume_size: Target shape (H, W, D). None = no crop/pad.
         normalize: Whether to apply percentile normalization.
-        lo_pct: Lower percentile for normalization.
-        hi_pct: Upper percentile for normalization.
+        lo_pct: Lower percentile for normalization (ignored if fixed_lo/fixed_hi given).
+        hi_pct: Upper percentile for normalization (ignored if fixed_lo/fixed_hi given).
+        fixed_lo: If provided (with fixed_hi), use this fixed value instead of
+            computing lo_pct on this volume — see normalize_volume_fixed()
+            and compute_field_norm_stats.py (per-field, not per-volume, scale).
+        fixed_hi: See fixed_lo.
 
     Returns:
         (volume_array, affine_matrix)
@@ -233,7 +276,10 @@ def load_nifti_volume(
         vol = center_crop_or_pad_np(vol, volume_size)
 
     if normalize:
-        vol = normalize_volume(vol, lo_pct, hi_pct)
+        if fixed_lo is not None and fixed_hi is not None:
+            vol = normalize_volume_fixed(vol, fixed_lo, fixed_hi)
+        else:
+            vol = normalize_volume(vol, lo_pct, hi_pct)
 
     return vol, affine
 

@@ -10,19 +10,20 @@ Gère :
 
 Usage single:
     PYTHONPATH=src python src/cfm/infer_mmfm_unified.py \
-        --config configs/mmfm3d_medvae_multimodal.yaml \
-        --checkpoint outputs/cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1/weights/model_final.pth \
+        --config configs/mmfm/vectorized.yaml \
+        --checkpoint outputs/mmfm/vectorized/weights/model_final.pth \
         --input /path/to/P_T1W_0.1T_0006.nii.gz --tgt-field 3T --output /tmp/pred.nii.gz
 
 Usage batch Task 3:
     PYTHONPATH=src python src/cfm/infer_mmfm_unified.py \
-        --config configs/mmfm3d_unet_v2_medvae_multimodal.yaml \
-        --checkpoint outputs/cfm3d/runs/mmfm3d_unet_v2_medvae_multimodal/weights/checkpoint_115000.pth \
-        --output_dir outputs/predictions/mmfm_unet_v2_fixed/task3 \
+        --config configs/mmfm/unet.yaml \
+        --checkpoint outputs/mmfm/unet/weights/model_final.pth \
+        --output_dir outputs/mmfm/unet/predictions/task3 \
         --split Training_prospective --modalities T1W
 """
 
 import argparse
+import json
 import re
 import shutil
 import sys
@@ -41,21 +42,12 @@ sys.path.insert(0, str(_SRC))
 _PROJECT_ROOT = _SRC.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from cfm.mmfm_vectorized import LatentVectorizer
-from cfm.train_mmfm_3d import _euler_integrate_vector
-from cfm.train_mmfm_unet_3d import (
-    build_unet_3d,
-    load_vae,
-    _euler_integrate,
-    _euler_integrate_mm,
-    _flat_class,
-    _field_to_time,
-    _pad_to_multiple,
-    _crop_to_shape,
-    _remap_monai_attention_keys,
-)
+from cfm import arch_inr, arch_unet, arch_vector
+from models.tiled_vae import tiled_decode, tiled_encode
+from cfm.mmfm_core import euler_integrate, _infer_latent_shape, _flat_class, _field_to_time
 from common.config import load_yaml_with_include, load_env, resolve_paths
-from common.io import DOMAINS, MODALITIES
+from common.io import DOMAINS, MODALITIES, denormalize_from_01, center_crop_or_pad_np
+from models.vae_loader import load_vae
 
 # Import process_volume from batch script (re-use full-res logic)
 from scripts.infer_mmfm_unet_v2_batch import (
@@ -105,36 +97,55 @@ def _resolve_norm_mode(cfg: dict, norm_mode: Optional[str]) -> str:
     return cfg.get("inference", {}).get("norm_mode", "global")
 
 
-def _build_model(cfg: dict, vae, device: torch.device):
-    """Build and return the flow model (vectorial MLP or UNet)."""
+def _build_model(cfg: dict, vae, device: torch.device, volume_size: Tuple[int, int, int]):
+    """Build and return the flow model (vectorial MLP or UNet), plus its
+    ArchAdapter (see mmfm_core.py) so the caller can encode/decode/checkpoint
+    -load through the same architecture-agnostic contract used at training
+    time.
+
+    Supports both the current unified method strings (mmfm3d_vectorized,
+    mmfm3d_unet) and the legacy pre-unification ones still referenced by
+    historical checkpoints/configs (mmfm3d, mmfm3d_vectorized_v1/v2,
+    mmfm3d_unet_v2) — this script loads and evaluates OLD checkpoints too,
+    not just ones trained via train_mmfm_unified.py.
+    """
     method = cfg.get("method", "mmfm3d")
     data_cfg = cfg["data"]
     modalities = data_cfg.get("modalities", MODALITIES)
     fields = data_cfg.get("fields", DOMAINS)
     n_fields = len(fields)
-    # V2 : n_classes = modalités uniquement (3) ; V1 : modalités × champs (15)
-    n_classes = len(modalities) if method == "mmfm3d_vectorized_v2" else len(modalities) * n_fields
+    # Legacy v1 conditions on (modality, field) jointly (n_classes=15); every
+    # other scheme (v2, unified UNet/vectorized) conditions on modality alone.
+    n_classes = len(modalities) * n_fields if method == "mmfm3d_vectorized_v1" else len(modalities)
 
     if method in ("mmfm3d", "mmfm", "mmfm3d_vectorized", "mmfm3d_vectorized_v1", "mmfm3d_vectorized_v2"):
-        from cfm.train_mmfm_3d import build_vector_mmfm
-        # Determine latent shape for vectorizer
-        with torch.no_grad():
-            dummy = torch.zeros((1, 1, 128, 128, 80), device=device)
-            z_dummy = vae.encode(dummy)
-            latent_shape = tuple(z_dummy.shape[1:])
-            flat_dim = int(np.prod(latent_shape))
-        mmfm = build_vector_mmfm(cfg, flat_dim, n_classes).to(device)
-        return mmfm, "vectorial", latent_shape
+        latent_shape = _infer_latent_shape(vae, volume_size, device)
+        adapter = arch_vector.make_adapter(cfg, latent_shape, n_classes)
+        mmfm = adapter.build_model().to(device)
+        return mmfm, "vectorial", latent_shape, adapter
 
     elif method in ("mmfm3d_unet", "mmfm3d_unet_v2"):
-        unet = build_unet_3d(cfg, vae.latent_channels, n_classes).to(device)
-        return unet, "unet", None
+        latent_shape = _infer_latent_shape(vae, volume_size, device)
+        adapter = arch_unet.make_adapter(cfg, latent_shape, len(modalities))
+        unet = adapter.build_model().to(device)
+        return unet, "unet", latent_shape, adapter
+
+    elif method == "mmfm3d_inr":
+        # vae here is IdentityVAEWrapper — _infer_latent_shape(vae, ...) is a
+        # no-op dummy pass through it, returning (channels, *volume_size),
+        # exactly what arch_inr.make_adapter expects (see its docstring).
+        latent_shape = _infer_latent_shape(vae, volume_size, device)
+        adapter = arch_inr.make_adapter(cfg, latent_shape, len(modalities))
+        inr_flow = adapter.build_model().to(device)
+        return inr_flow, "inr", latent_shape, adapter
 
     raise ValueError(f"Unsupported method for unified inference: {method}")
 
 
-def _load_model_weights(model, ckpt: dict, use_ema: bool, model_type: str):
-    """Load EMA/model weights into vectorial MLP or UNet."""
+def _load_model_weights(model, ckpt: dict, use_ema: bool, adapter):
+    """Load EMA/model weights into the flow model via the adapter's
+    checkpoint_key_remap (MONAI-version compat shim for UNet, no-op for the
+    vectorial MLP)."""
     loaded_from = "model"
     state = ckpt["model"]
     if use_ema and "ema" in ckpt and ckpt["ema"]:
@@ -146,31 +157,27 @@ def _load_model_weights(model, ckpt: dict, use_ema: bool, model_type: str):
             state = ema_state
             loaded_from = "ema"
 
-    if model_type == "unet":
-        model.load_state_dict(_remap_monai_attention_keys(state))
-    else:
-        model.load_state_dict(state)
+    model.load_state_dict(adapter.checkpoint_key_remap(state))
     model.eval()
     return loaded_from
 
 
 def _make_flow_spec(model_type: str, mod_idx: int, src_field_idx: int,
-                    tgt_field_idx: int, n_fields: int, use_v2: bool = False) -> dict:
-    """Construire la spécification de flow pour une translation.
+                    tgt_field_idx: int, n_fields: int, use_v1: bool = False) -> dict:
+    """Build the (target class, time interval) flow spec for one translation.
 
-    - vectorial v1 (legacy) : conditionne sur la classe cible (mod, champ cible).
-    - vectorial v2 : conditionne sur la modalité seule.
-    - unet (multi-marginal) : contraste + temps (champ) source->cible.
+    - vectorial v1 (legacy): conditions on the flat (modality, target-field)
+      class, integrates over the fixed t in [0,1] (no field-based time axis).
+    - vectorial v2/unified, and unet (multi-marginal): condition on the
+      modality/contrast alone; the field is the time axis (t_start/t_end).
     """
-    if model_type == "vectorial":
-        if use_v2:
-            # V2 : tgt_class = mod_idx (modalité seule, dans [0,2])
-            return {"tgt_class": mod_idx}
-        else:
-            # V1 : tgt_class = _flat_class(mod_idx, tgt_field_idx, n_fields)
-            return {"tgt_class": _flat_class(mod_idx, tgt_field_idx, n_fields)}
+    if model_type == "vectorial" and use_v1:
+        return {
+            "y": _flat_class(mod_idx, tgt_field_idx, n_fields),
+            "t_start": 0.0, "t_end": 1.0,
+        }
     return {
-        "contrast": mod_idx,
+        "y": mod_idx,
         "t_start": _field_to_time(src_field_idx, n_fields),
         "t_end": _field_to_time(tgt_field_idx, n_fields),
     }
@@ -180,41 +187,49 @@ def _infer_patch_unified(
     patch_tensor: torch.Tensor,
     vae,
     model,
-    model_type: str,
-    latent_vectorizer,
+    adapter,
     flow_spec: dict,
     n_steps: int,
     device: torch.device,
     use_amp: bool,
     amp_dtype: torch.dtype,
+    encode_tile=None,
+    encode_tile_margin: int = 16,
 ) -> np.ndarray:
-    """Run VAE encode → flow → VAE decode on a single patch.
+    """Run VAE encode -> flow -> VAE decode on a single patch. Identical for
+    both architectures — the adapter absorbs the flatten/pad and call-
+    convention differences (see mmfm_core.py).
 
-    flow_spec:
-      - vectorial : {"tgt_class": int}
-      - unet (multi-marginal) : {"contrast": int, "t_start": float, "t_end": float}
-    """
+    `encode_tile` (non None) encode/décode le patch PAR TUILES : au-delà de 2mm
+    MedVAE ne tient pas en mémoire sur un volume entier (attention quadratique
+    au goulot, OOM dès 192x224x192). Doit reprendre EXACTEMENT les valeurs
+    `data.encode_tile`/`encode_tile_margin` utilisées au precompute, sinon les
+    latents d'inférence ne seraient pas dans la même distribution que ceux du
+    cache d'entraînement."""
+    model_fn = adapter.make_model_fn(model)
     with torch.no_grad(), torch.amp.autocast(
         "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
     ):
-        z_src = vae.encode(patch_tensor)
-
-        if model_type == "vectorial":
-            z_src_vec = vae.to_vector(z_src).float()
-            z_tgt_vec = _euler_integrate_vector(
-                model, z_src_vec, flow_spec["tgt_class"], n_steps, device, use_amp, amp_dtype
-            )
-            z_tgt = latent_vectorizer.unflatten(z_tgt_vec)
+        if encode_tile is not None:
+            z_src_enc = tiled_encode(vae, patch_tensor, tile=tuple(encode_tile),
+                                     margin=encode_tile_margin,
+                                     use_amp=use_amp, amp_dtype=amp_dtype)
         else:
-            z_src_p, lat_shape = _pad_to_multiple(z_src, 4)
-            z_tgt_p = _euler_integrate_mm(
-                model, z_src_p, flow_spec["contrast"],
-                flow_spec["t_start"], flow_spec["t_end"],
-                n_steps, device, use_amp, amp_dtype,
-            )
-            z_tgt = _crop_to_shape(z_tgt_p, lat_shape)
-
-        recon = vae.decode(z_tgt)
+            z_src_enc = vae.encode(patch_tensor)
+        z_src, meta = adapter.prep_latent(vae, z_src_enc)
+        z_src = z_src.float()
+        y = torch.tensor([flow_spec["y"]], dtype=torch.long, device=device)
+        z_tgt = euler_integrate(
+            model_fn, z_src, y, flow_spec["t_start"], flow_spec["t_end"],
+            n_steps, device, use_amp, amp_dtype,
+        )
+        z_tgt = adapter.restore_latent(z_tgt, meta)
+        if encode_tile is not None:
+            recon = tiled_decode(vae, z_tgt, tile=tuple(encode_tile),
+                                 margin=encode_tile_margin,
+                                 use_amp=use_amp, amp_dtype=amp_dtype)
+        else:
+            recon = vae.decode(z_tgt)
 
     pred = recon.squeeze().cpu().float().numpy()
     return (np.clip(pred, -1.0, 1.0) + 1.0) / 2.0
@@ -225,7 +240,7 @@ def process_volume_unified(
     vae,
     model,
     model_type: str,
-    latent_vectorizer,
+    adapter,
     flow_spec: dict,
     n_steps: int,
     patch_size,
@@ -240,16 +255,43 @@ def process_volume_unified(
     center_crop_only: bool = False,
     blend_mode: str = "hann",
     center_aligned: bool = False,
+    fixed_lo: Optional[float] = None,
+    fixed_hi: Optional[float] = None,
+    tgt_lo: Optional[float] = None,
+    tgt_hi: Optional[float] = None,
+    target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    encode_tile=None,
+    encode_tile_margin: int = 16,
 ):
-    """Full-resolution prediction, dispatching vectorial or UNet model."""
+    """Full-resolution prediction, dispatching vectorial or UNet model.
+
+    Variable names below (vol_1mm, img_pred_1mm, ...) are historical — the
+    actual resampling target is `target_spacing`, not necessarily 1mm.
+    Must match training's data.target_spacing for a valid comparison: the
+    model only ever saw inputs resampled to that spacing.
+    """
     img_src = nib.load(str(nii_path))
     affine_src = img_src.affine.copy()
     header_src = img_src.header.copy()
 
-    img_src_1mm = nib_proc.resample_to_output(img_src, voxel_sizes=(1.0, 1.0, 1.0), order=1)
+    img_src_1mm = nib_proc.resample_to_output(img_src, voxel_sizes=target_spacing, order=1)
     vol_1mm = img_src_1mm.get_fdata(dtype=np.float32)
 
-    if norm_mode == "crop_percentile":
+    if norm_mode == "field_fixed":
+        # Fixed per-(modality, source field) percentile bounds from
+        # compute_field_norm_stats.py, matching the normalization the model
+        # was trained with (see MultiModalNIfTILatentDataset / field_norm_stats)
+        # instead of per-volume percentiles computed on the fly — the latter
+        # erases genuine field-to-field dynamic-range differences (5T/7T
+        # natively occupy a much narrower range than 0.1T/1.5T/3T), which is
+        # the root cause of the intensity-amplification bug on those targets.
+        if fixed_lo is None or fixed_hi is None:
+            raise ValueError(
+                "norm_mode='field_fixed' requires fixed_lo/fixed_hi "
+                "(pass --field_norm_stats and let the caller resolve them)."
+            )
+        vol_1mm_norm = _normalize_with_params(vol_1mm, fixed_lo, fixed_hi)
+    elif norm_mode == "crop_percentile":
         h, w, d = vol_1mm.shape
         ph, pw, pd = patch_size
         sh, sw, sd = max(0, (h - ph) // 2), max(0, (w - pw) // 2), max(0, (d - pd) // 2)
@@ -264,17 +306,22 @@ def process_volume_unified(
         lo = hi = None
 
     if center_crop_only:
-        h, w, d = vol_1mm_norm.shape
-        ph, pw, pd = patch_size
-        sh, sw, sd = max(0, (h - ph) // 2), max(0, (w - pw) // 2), max(0, (d - pd) // 2)
-        crop = vol_1mm_norm[sh:sh + ph, sw:sw + pw, sd:sd + pd]
+        # center_crop_or_pad_np (not raw slicing) so this also handles the
+        # "fullfov" case where patch_size exceeds the native resampled FOV
+        # (e.g. vectorized/UNet harmonized comparison, volume_size=96x112x96
+        # @ 2mm > native ~91x109x91) — plain slicing would silently return a
+        # smaller-than-expected array and either crash the vectorial model
+        # (fixed flat_dim) or feed the UNet a shape it never trained on.
+        native_shape = vol_1mm_norm.shape
+        crop = center_crop_or_pad_np(vol_1mm_norm, patch_size)
         crop_tensor = torch.from_numpy(crop).unsqueeze(0).unsqueeze(0).to(device)
         pred_crop = _infer_patch_unified(
-            crop_tensor, vae, model, model_type, latent_vectorizer,
-            flow_spec, n_steps, device, use_amp, amp_dtype
+            crop_tensor, vae, model, adapter,
+            flow_spec, n_steps, device, use_amp, amp_dtype,
+            encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
         )
-        pred_1mm = np.zeros(vol_1mm_norm.shape, dtype=np.float32)
-        pred_1mm[sh:sh + ph, sw:sw + pw, sd:sd + pd] = pred_crop
+        # Invert the same crop/pad symmetrically back to the native shape.
+        pred_1mm = center_crop_or_pad_np(pred_crop, native_shape)
     else:
         patches, positions, padded_shape = _extract_patches(
             vol_1mm_norm, patch_size, stride, pad=pad, center_aligned=center_aligned
@@ -287,8 +334,9 @@ def process_volume_unified(
                 patch = _normalize_global(patch, p_lo, p_hi)
             patch_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(device)
             pred_patch = _infer_patch_unified(
-                patch_tensor, vae, model, model_type, latent_vectorizer,
-                flow_spec, n_steps, device, use_amp, amp_dtype
+                patch_tensor, vae, model, adapter,
+                flow_spec, n_steps, device, use_amp, amp_dtype,
+                encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
             )
             patch_outputs.append(torch.from_numpy(pred_patch).unsqueeze(0).unsqueeze(0).float())
 
@@ -299,6 +347,19 @@ def process_volume_unified(
     img_pred_1mm = nib.Nifti1Image(pred_1mm.astype(np.float32), img_src_1mm.affine)
     img_pred_05mm = nib_proc.resample_from_to(img_pred_1mm, img_src, order=1)
     pred_05mm = img_pred_05mm.get_fdata(dtype=np.float32)
+
+    if norm_mode == "field_fixed":
+        # Model output stays in the training-time always-full-[0,1]-range
+        # scale (matching the source's stretched normalize_volume_fixed
+        # domain) until explicitly mapped back to the TARGET field's native
+        # (narrow) range — otherwise it's compared against native-scale GT
+        # at a mismatched intensity range. See common.io.denormalize_from_01.
+        if tgt_lo is None or tgt_hi is None:
+            raise ValueError(
+                "norm_mode='field_fixed' requires tgt_lo/tgt_hi (target field's "
+                "field_norm_stats entry) to denormalize the prediction."
+            )
+        pred_05mm = denormalize_from_01(pred_05mm, tgt_lo, tgt_hi)
 
     vol_src_05mm = img_src.get_fdata(dtype=np.float32)
     mask = vol_src_05mm > 1e-6
@@ -329,6 +390,7 @@ def infer_single(
     center_crop_only: bool = False,
     use_ema: bool = True,
     device: str = "cuda",
+    field_norm_stats_path: Optional[str] = None,
 ):
     input_path = Path(input_path)
     if not input_path.exists():
@@ -340,6 +402,25 @@ def infer_single(
 
     mod = modality or parsed["field"]
     src = src_field or parsed["field"]
+
+    fixed_lo = fixed_hi = tgt_lo = tgt_hi = None
+    if field_norm_stats_path:
+        with open(field_norm_stats_path) as _f:
+            field_norm_stats = json.load(_f)["stats"]
+        entry = field_norm_stats.get(mod, {}).get(src)
+        if entry is None:
+            raise RuntimeError(
+                f"field_norm_stats fourni mais entrée manquante pour {mod}@{src}"
+            )
+        fixed_lo, fixed_hi = entry["lo"], entry["hi"]
+        tgt_entry = field_norm_stats.get(mod, {}).get(tgt_field)
+        if tgt_entry is None:
+            raise RuntimeError(
+                f"field_norm_stats fourni mais entrée manquante pour {mod}@{tgt_field}"
+            )
+        tgt_lo, tgt_hi = tgt_entry["lo"], tgt_entry["hi"]
+        print(f"  Normalisation par champ (fixe) : {field_norm_stats_path} -> "
+              f"src lo={fixed_lo:.4f} hi={fixed_hi:.4f} | tgt lo={tgt_lo:.4f} hi={tgt_hi:.4f}")
 
     cfg = load_yaml_with_include(cfg_path)
     cfg = resolve_paths(cfg, load_env(env_path))
@@ -362,11 +443,16 @@ def infer_single(
     patch_size = tuple(int(v) for v in raw_vs) if raw_vs else (128, 128, 80)
     stride = tuple(max(s // 2, 1) for s in patch_size)
     pad = 16
+    raw_ts = data_cfg.get("target_spacing", None)
+    target_spacing = tuple(float(v) for v in raw_ts) if raw_ts else (1.0, 1.0, 1.0)
+    # Tuilage MedVAE : DOIT reprendre les valeurs du precompute (cf. data.encode_tile)
+    _raw_tile = data_cfg.get("encode_tile", None)
+    encode_tile = tuple(int(v) for v in _raw_tile) if _raw_tile else None
+    encode_tile_margin = int(data_cfg.get("encode_tile_margin", 16))
 
     modalities = data_cfg.get("modalities", MODALITIES)
     fields = data_cfg.get("fields", DOMAINS)
     n_fields = len(fields)
-    n_classes = len(modalities) * n_fields
 
     if mod not in modalities:
         raise ValueError(f"Unknown modality '{mod}'. Config has {modalities}")
@@ -378,9 +464,9 @@ def infer_single(
     mod_idx = modalities.index(mod)
     src_field_idx = fields.index(src)
     tgt_field_idx = fields.index(tgt_field)
-    
-    # V2 method flag
-    use_v2 = (cfg.get("method", "mmfm3d") == "mmfm3d_vectorized_v2")
+
+    # Legacy v1 method flag (see _make_flow_spec)
+    use_v1 = (cfg.get("method", "mmfm3d") == "mmfm3d_vectorized_v1")
 
     print(f"[{mod}] {src} → {tgt_field} | Loading VAE...")
     vae = load_vae(cfg, dev)
@@ -388,20 +474,22 @@ def infer_single(
         raise RuntimeError(f"Requires spatial VAE, got {vae.latent_format}")
 
     print("Loading flow model...")
-    model, model_type, latent_shape = _build_model(cfg, vae, dev)
+    model, model_type, latent_shape, adapter = _build_model(cfg, vae, dev, patch_size)
     ckpt = torch.load(checkpoint, map_location=dev, weights_only=False)
-    loaded_from = _load_model_weights(model, ckpt, use_ema, model_type)
+    loaded_from = _load_model_weights(model, ckpt, use_ema, adapter)
     print(f"  Model loaded ({loaded_from}, iter={ckpt.get('iter', '?')}) from {checkpoint}")
 
-    latent_vectorizer = LatentVectorizer(latent_shape) if model_type == "vectorial" else None
-    flow_spec = _make_flow_spec(model_type, mod_idx, src_field_idx, tgt_field_idx, n_fields, use_v2)
+    flow_spec = _make_flow_spec(model_type, mod_idx, src_field_idx, tgt_field_idx, n_fields, use_v1)
 
     t0 = time.time()
     pred_vol, affine, header = process_volume_unified(
-        input_path, vae, model, model_type, latent_vectorizer,
+        input_path, vae, model, model_type, adapter,
         flow_spec=flow_spec, n_steps=n_steps, patch_size=patch_size, stride=stride, pad=pad,
         p_lo=p_lo, p_hi=p_hi, device=dev, use_amp=use_amp, amp_dtype=amp_dtype,
         norm_mode=norm_mode, center_crop_only=center_crop_only,
+        fixed_lo=fixed_lo, fixed_hi=fixed_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
+        target_spacing=target_spacing,
+        encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
     )
 
     if output_path:
@@ -430,7 +518,14 @@ def infer_batch(
     use_ema: bool = True,
     skip_existing: bool = False,
     device: str = "cuda",
+    field_norm_stats_path: Optional[str] = None,
 ):
+    field_norm_stats = None
+    if field_norm_stats_path:
+        with open(field_norm_stats_path) as _f:
+            field_norm_stats = json.load(_f)["stats"]
+        print(f"Normalisation par champ (fixe) : {field_norm_stats_path}")
+
     cfg = load_yaml_with_include(cfg_path)
     cfg = resolve_paths(cfg, load_env(env_path))
 
@@ -452,14 +547,19 @@ def infer_batch(
     patch_size = tuple(int(v) for v in raw_vs) if raw_vs else (128, 128, 80)
     stride = tuple(max(s // 2, 1) for s in patch_size)
     pad = 16
+    raw_ts = data_cfg.get("target_spacing", None)
+    target_spacing = tuple(float(v) for v in raw_ts) if raw_ts else (1.0, 1.0, 1.0)
+    # Tuilage MedVAE : DOIT reprendre les valeurs du precompute (cf. data.encode_tile)
+    _raw_tile = data_cfg.get("encode_tile", None)
+    encode_tile = tuple(int(v) for v in _raw_tile) if _raw_tile else None
+    encode_tile_margin = int(data_cfg.get("encode_tile_margin", 16))
 
     all_modalities = data_cfg.get("modalities", MODALITIES)
     fields = data_cfg.get("fields", DOMAINS)
     n_fields = len(fields)
-    n_classes = len(all_modalities) if cfg.get("method", "mmfm3d") == "mmfm3d_vectorized_v2" else len(all_modalities) * n_fields
-    
-    # V2 method flag
-    use_v2 = (cfg.get("method", "mmfm3d") == "mmfm3d_vectorized_v2")
+
+    # Legacy v1 method flag (see _make_flow_spec)
+    use_v1 = (cfg.get("method", "mmfm3d") == "mmfm3d_vectorized_v1")
 
     modalities = modalities if modalities is not None else all_modalities
 
@@ -469,12 +569,10 @@ def infer_batch(
         raise RuntimeError(f"Requires spatial VAE, got {vae.latent_format}")
 
     print("Loading flow model...")
-    model, model_type, latent_shape = _build_model(cfg, vae, dev)
+    model, model_type, latent_shape, adapter = _build_model(cfg, vae, dev, patch_size)
     ckpt = torch.load(checkpoint, map_location=dev, weights_only=False)
-    loaded_from = _load_model_weights(model, ckpt, use_ema, model_type)
+    loaded_from = _load_model_weights(model, ckpt, use_ema, adapter)
     print(f"  Model loaded ({loaded_from}, iter={ckpt.get('iter', '?')}) from {checkpoint}")
-
-    latent_vectorizer = LatentVectorizer(latent_shape) if model_type == "vectorial" else None
 
     data_root_env = cfg.get("data_root") or cfg.get("data", {}).get("data_root")
     data_root = Path(data_root_env) if data_root_env else Path("/home/rousseau/Data/MRIxFields_20260414")
@@ -492,10 +590,20 @@ def infer_batch(
         mod_idx = all_modalities.index(mod)
         for src, tgt in task_pairs:
             flow_spec = _make_flow_spec(
-                model_type, mod_idx, fields.index(src), fields.index(tgt), n_fields, use_v2
+                model_type, mod_idx, fields.index(src), fields.index(tgt), n_fields, use_v1
             )
             pair_out_dir = out_root / "task3" / mod / f"{src}_to_{tgt}"
             pair_out_dir.mkdir(parents=True, exist_ok=True)
+
+            fixed_lo = fixed_hi = tgt_lo = tgt_hi = None
+            if field_norm_stats is not None:
+                entry = field_norm_stats.get(mod, {}).get(src)
+                tgt_entry = field_norm_stats.get(mod, {}).get(tgt)
+                if entry is None or tgt_entry is None:
+                    print(f"[WARN] field_norm_stats sans entrée pour {mod}@{src} ou {mod}@{tgt}, skip pair")
+                    continue
+                fixed_lo, fixed_hi = entry["lo"], entry["hi"]
+                tgt_lo, tgt_hi = tgt_entry["lo"], tgt_entry["hi"]
 
             input_dir = data_root / split / mod / src
             if not input_dir.exists():
@@ -516,10 +624,13 @@ def infer_batch(
 
                 t0 = time.time()
                 pred_vol, affine, header = process_volume_unified(
-                    nii_path, vae, model, model_type, latent_vectorizer,
+                    nii_path, vae, model, model_type, adapter,
                     flow_spec=flow_spec, n_steps=n_steps, patch_size=patch_size, stride=stride, pad=pad,
                     p_lo=p_lo, p_hi=p_hi, device=dev, use_amp=use_amp, amp_dtype=amp_dtype,
                     norm_mode=norm_mode, center_crop_only=center_crop_only,
+                    fixed_lo=fixed_lo, fixed_hi=fixed_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
+                    target_spacing=target_spacing,
+                    encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
                 )
                 nib.save(nib.Nifti1Image(pred_vol, affine, header), str(out_path))
                 print(f"  {nii_path.name} → {out_path}  ({time.time() - t0:.1f}s)")
@@ -545,7 +656,11 @@ def parse_args():
     p.add_argument("--pairs", default=None, help="Subset of pairs, e.g. '0.1T_to_7T,1.5T_to_3T'")
     p.add_argument("--env", default="local")
     p.add_argument("--n_steps", type=int, default=None)
-    p.add_argument("--norm_mode", default=None, choices=["global", "crop_percentile", "per_patch"])
+    p.add_argument("--norm_mode", default=None,
+                   choices=["global", "crop_percentile", "per_patch", "field_fixed"])
+    p.add_argument("--field_norm_stats", default=None,
+                   help="Chemin JSON produit par compute_field_norm_stats.py — requis avec "
+                        "--norm_mode field_fixed")
     p.add_argument("--center_crop_only", action="store_true")
     p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--no_ema", action="store_true")
@@ -563,6 +678,7 @@ def main():
             n_steps=args.n_steps, norm_mode=args.norm_mode,
             center_crop_only=args.center_crop_only,
             use_ema=not args.no_ema, device=args.device,
+            field_norm_stats_path=args.field_norm_stats,
         )
     else:
         if not args.output_dir:
@@ -580,6 +696,7 @@ def main():
             env_path=args.env, n_steps=args.n_steps, norm_mode=args.norm_mode,
             center_crop_only=args.center_crop_only,
             use_ema=not args.no_ema, skip_existing=args.skip_existing, device=args.device,
+            field_norm_stats_path=args.field_norm_stats,
         )
 
 

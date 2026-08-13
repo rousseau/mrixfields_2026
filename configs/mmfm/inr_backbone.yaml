@@ -1,0 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Backbone INR (SIREN + hypernetwork + meta-learning) — config d'entraînement.
+#
+# Entraîne le réseau PARTAGÉ (theta, psi) une seule fois sur tout retro_train,
+# pooled across modalités/champs (le backbone n'a pas besoin de conditionnement
+# contraste/champ — c'est le `z` par volume qui absorbe cette variation).
+# Analogue à l'entraînement MedVAE : un checkpoint gelé, consommé ensuite par
+# cfm/arch_inr.py + cfm/precompute_inr_latents.py (cfg['inr_backbone']).
+#
+# Voir docs/MMFM_INR_STATE_OF_THE_ART.md et src/cfm/inr_backbone.py pour le
+# mécanisme (NOIR Algorithme 1/2). Le `fg_weight`/`bg_threshold` compensent un
+# collapse observé en Phase 1 (perte MSE dominée par le fond, invariant d'un
+# sujet à l'autre — voir inr_backbone.py::_weighted_mse).
+#
+# Astuces d'entraînement volontairement alignées sur les deux autres pipelines
+# "entraînées une fois, puis gelées" du projet (MedVAE, flow mmfm_core.py) :
+# grad clipping, AdamW+weight_decay, schedule warmup->plateau->décroissance
+# linéaire, EMA. Voir train_inr_backbone.py pour le détail des différences
+# encore existantes (MedVAE n'a ni perte foreground ni EMA — dette connue,
+# non corrigée pour ne pas invalider les résultats vectorized/unet déjà
+# reportés).
+# ─────────────────────────────────────────────────────────────────────────────
+
+task_name: mmfm_inr_backbone
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  # RÉSOLUTION 1mm (2026-08-09) — alignée sur vectorized.yaml/unet.yaml pour que
+  # la comparaison des trois architectures se fasse à résolution égale.
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  split: retro_train
+  output_subdir: mmfm/inr_backbone
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+
+model:
+  # latent_dim 4096 -> 129024 (2026-08-10, demande explicite) : égale la taille
+  # du latent MedVAE @1mm (48x56x48), pour tester si la capacité de `z` est le
+  # facteur limitant de l'INR.
+  #
+  # AVERTISSEMENT MESURÉ : ce changement seul est très probablement un no-op sur
+  # la capacité réelle. Le SIREN à modulation par décalage ne reçoit que
+  # `modulation_dim = num_hidden_layers x hidden_dim` = 6 x 256 = 1536 nombres
+  # par volume, quantité INDÉPENDANTE de latent_dim. Le hypernetwork comprime
+  # donc 129024 -> 512 -> 1536, soit un goulot de 252:1 (le projet a déjà observé
+  # qu'un goulot de 64:1 DÉGRADAIT la fidélité, cf. inr_reconstruction_capacity.csv).
+  # Coût mesuré : 67.2M params, 11.4 GB, 0.98 s/iter => ~13.7h pour 50k.
+  # Les alternatives qui lèvent réellement le goulot ont été mesurées et écartées
+  # pour leur coût : modulation x4 = 83h, modulation x8 = 134h (et encore 10x en
+  # dessous des 129024 de MedVAE). Voir results/mmfm/comparison_20260807_1mm/.
+  latent_dim: 129024
+  hidden_dim: 256
+  num_hidden_layers: 6
+  omega_0: 30.0
+  omega_hidden: 30.0
+  # hyper_hidden_dim 64->512 (2026-08-03): kept at NOIR's fixed 64 when latent_dim
+  # first went 512->4096, which made the hypernetwork's own bottleneck ratio go
+  # from 8:1 to 64:1 — a fresh 50k run at that setting was WORSE than the
+  # original 512-d backbone on reconstruction fidelity despite reaching a lower
+  # training loss (see results/mmfm/comparison_20260801_final/
+  # inr_reconstruction_capacity.csv). 512 restores the original 8:1 ratio
+  # (4096/512 = 512/64).
+  hyper_hidden_dim: 512
+  inner_lr: 0.01
+  # inner_steps doublés (5->10 train, 10->20 eval): avec un z 8x plus grand,
+  # le fitting (descente de gradient) a besoin de plus de pas pour converger
+  # dans un espace de recherche bien plus vaste — voir la même note ci-dessus.
+  inner_steps_train: 10
+  inner_steps_eval: 20
+  fg_weight: 5.0
+  bg_threshold: -0.9
+
+train:
+  # latent_dim 512->4096 (2026-08-03) est un changement d'architecture : les
+  # checkpoints 50k/150k précédents (latent_dim=512) ne sont PAS compatibles
+  # (mismatch de shape sur les poids du hypernetwork) — from scratch,
+  # total_iters revenu à la valeur de référence 50000. Le run précédent
+  # (150k itérations, même architecture 512-d) a montré qu'étendre
+  # l'entraînement SANS changer la capacité ne fait qu'errer autour d'un
+  # plafond (SSIM auto-reconstruction ~0.65-0.68, jamais mieux) — voir
+  # results/mmfm/comparison_20260801_final/inr_reconstruction_capacity.csv
+  # et la mémoire projet. Valider d'abord à petite échelle (smoke test) que
+  # latent_dim=4096 améliore réellement la fidélité avant de relancer un run
+  # complet de plusieurs heures.
+  total_iters: 50000
+  batch_size: 2
+  points_per_step: 16384
+  lr: 5.0e-6  # aligné sur beta=5e-6 de NOIR (Algorithme 1) — voir docs/MMFM_INR_STATE_OF_THE_ART.md
+  warmup_steps: 2000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  save_every: 2500
+  print_every: 100
+  # Pénalité de lissage sur z (Hutchinson VJP, inr_backbone.py::meta_train_step)
+  # — désactivée par défaut (0.0 = comportement identique à avant). Motivée par
+  # src/cfm/diagnose_inr_latent_smoothness.py (2026-08-06) : rugosité
+  # d'interpolation croisée-champ ~2.9x la rugosité même-champ pour l'INR,
+  # contre ~1.3x pour MedVAE — voir plan/mémoire projet pour l'investigation
+  # complète (fidélité de représentation et capacité du flow déjà écartées).
+  # Valeur choisie via balayage sur test_inr_backbone_smoke.py avant tout run
+  # complet — voir ce fichier pour la valeur retenue et pourquoi.
+  z_reg_weight: 0.0
+  z_reg_warmup_frac: 0.1

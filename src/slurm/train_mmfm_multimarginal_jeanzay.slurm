@@ -2,18 +2,18 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Script SLURM — Entraînement MMFM-UNet multi-marginal sur Jean Zay (4×H100)
 #
-# Continue l'entraînement depuis le checkpoint du Run 1 (effectué localement sur
-# DGX GB10). Pré-encode le cache latent si nécessaire, puis lance torchrun DDP.
+# Continue l'entraînement UNet depuis un checkpoint local (ex. entraîné sur DGX
+# GB10). Pré-encode le cache latent si nécessaire, puis lance torchrun DDP.
 #
 # Lancement :
 #   sbatch src/slurm/train_mmfm_multimarginal_jeanzay.slurm \
-#       configs/mmfm3d_multimarginal_medvae_run2.yaml \
-#       outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/model_final.pth
+#       configs/mmfm/unet.yaml \
+#       outputs/mmfm/unet/weights/model_final.pth
 #
 # Prérequis (via sync_to_jeanzay.sh) :
 #   - Code synchronisé dans $WORK/MRIX/mrixfields_2026/
-#   - Checkpoint Run 1 transféré :
-#       outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/model_final.pth
+#   - Checkpoint de reprise transféré :
+#       outputs/mmfm/unet/weights/model_final.pth
 #   - Poids MedVAE fine-tuné transféré :
 #       outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth
 #   - Données NIfTI dans $WORK/MRIX/data/Training_retrospective/
@@ -39,8 +39,8 @@
 
 set -e
 
-CONFIG="${1:-configs/mmfm3d_multimarginal_medvae_run2.yaml}"
-RESUME_CKPT="${2:-outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/model_final.pth}"
+CONFIG="${1:-configs/mmfm/unet.yaml}"
+RESUME_CKPT="${2:-outputs/mmfm/unet/weights/model_final.pth}"
 
 CODE_DIR="$WORK/MRIX/mrixfields_2026"
 mkdir -p "$CODE_DIR/logs"
@@ -134,7 +134,8 @@ torchrun \
     --node_rank=0 \
     --master_addr=localhost \
     --master_port="$MASTER_PORT" \
-    src/cfm/train_mmfm_unet_3d.py \
+    src/cfm/train_mmfm_unified.py \
+    --method mmfm3d_unet \
     --config "$CONFIG" \
     --env remote \
     --resume "$RESUME_CKPT"

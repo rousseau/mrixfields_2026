@@ -276,6 +276,36 @@ def is_main() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def medvae_forward_dist(model: torch.nn.Module, x: torch.Tensor):
+    """Encode → posterior gaussien → sample → decode.
+
+    Variante de `medvae_forward` pour la recette LPIPS+GAN : renvoie le
+    `DiagonalGaussianDistribution` lui-même (et non une KL déjà réduite), car
+    `LPIPSWithDiscriminator3D` attend `posteriors.kl()` — même contrat que la
+    loss de référence MedVAE/LDM.
+
+    `MVAE.encode()` renvoie le mode (µ) ; c'est `MVAE.model.encode()`
+    (l'`AutoencoderKL` sous-jacent) qui renvoie la distribution complète.
+
+    Retourne (recon, posterior).
+    """
+    inner = getattr(model, "model", model)
+    posterior = inner.encode(x)
+    z = posterior.sample()
+    recon = inner.decode(z)
+    if recon.shape != x.shape:
+        recon = F.interpolate(recon, size=x.shape[2:], mode="trilinear", align_corners=False)
+    return recon, posterior
+
+
+def _decoder_last_layer(model: torch.nn.Module) -> Optional[torch.Tensor]:
+    """Poids de la dernière conv du décodeur — référence pour le poids adaptatif
+    de la loss adversariale (LDM utilise `decoder.conv_out.weight`)."""
+    inner = getattr(model, "model", model)
+    conv_out = getattr(getattr(inner, "decoder", None), "conv_out", None)
+    return conv_out.weight if conv_out is not None else None
+
+
 def medvae_forward(
     model: torch.nn.Module,
     x: torch.Tensor,
@@ -327,8 +357,18 @@ def _validate(
     lambda_l1: float,
     lambda_kl: float,
     max_batches: int = 50,
+    perceptual_fn=None,
+    lambda_perceptual: float = 0.0,
 ) -> float:
-    """Calcule la loss de validation (L1 + λ·KL) sur au plus max_batches batches."""
+    """Loss de validation, utilisée pour sélectionner `model_best.pth`.
+
+    Avec la recette LPIPS+GAN (`perceptual_fn` fourni), la validation est
+    `L1 + lambda_perceptual * LPIPS` — délibérément PAS une L1 seule : une L1
+    seule resélectionnerait précisément la solution floue (moyenne
+    conditionnelle) que cette recette vise à corriger. Le terme adversarial est
+    volontairement exclu (le score du discriminateur n'est pas une mesure de
+    fidélité et bouge avec son propre entraînement).
+    """
     model.eval()
     losses = []
     for i, batch in enumerate(loader):
@@ -338,8 +378,14 @@ def _validate(
         with torch.amp.autocast(
             "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
         ):
-            recon, kl = medvae_forward(model, x)
-            loss = lambda_l1 * F.l1_loss(recon, x) + lambda_kl * kl
+            if perceptual_fn is not None:
+                recon, _post = medvae_forward_dist(model, x)
+                loss = F.l1_loss(recon, x)
+                if lambda_perceptual > 0:
+                    loss = loss + lambda_perceptual * perceptual_fn._perceptual_3d(x, recon)
+            else:
+                recon, kl = medvae_forward(model, x)
+                loss = lambda_l1 * F.l1_loss(recon, x) + lambda_kl * kl
         losses.append(float(loss.item()))
     model.train()
     return float(np.mean(losses)) if losses else float("inf")
@@ -396,6 +442,18 @@ def train(
     grad_clip = cfg["train"].get("grad_clip", 1.0)
     lambda_l1 = cfg["train"].get("lambda_l1", 1.0)
     lambda_kl = cfg["train"].get("lambda_kl", 0.0)
+
+    # ── Recette LPIPS + PatchGAN (MedVAE/LDM) ───────────────────────────────
+    # Valeurs de référence : configs/experiment/medvae_4x_1c_3d_finetuning.yaml
+    # + configs/criterion/lpips_with_discriminator.yaml de StanfordMIMI/MedVAE.
+    # lambda_perceptual=0 -> ancienne recette L1 pure (rétrocompatible).
+    lambda_perceptual = float(cfg["train"].get("lambda_perceptual", 0.0))
+    disc_weight = float(cfg["train"].get("disc_weight", 0.5))
+    disc_start = int(cfg["train"].get("disc_start", 3125))
+    disc_lr = float(cfg["train"].get("disc_lr", lr))
+    slice_stride = int(cfg["train"].get("slice_stride", 1))
+    nll_reduction = cfg["train"].get("nll_reduction", "sum")
+    use_perceptual = lambda_perceptual > 0.0
 
     # ── Distributed setup ───────────────────────────────────────────────────
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -542,7 +600,44 @@ def train(
         return max(0.05, 0.5 * (1.0 + np.cos(np.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
-    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
+
+    # ── Loss perceptuelle + discriminateur (optionnelle) ────────────────────
+    perceptual_loss_fn = None
+    disc_optimizer = None
+    last_layer = None
+    if use_perceptual:
+        from vae3d.medvae_perceptual_loss import LPIPSWithDiscriminator3D
+
+        perceptual_loss_fn = LPIPSWithDiscriminator3D(
+            disc_start=disc_start,
+            kl_weight=lambda_kl,
+            disc_weight=disc_weight,
+            perceptual_weight=lambda_perceptual,
+            num_channels=1,
+            slice_stride=slice_stride,
+            nll_reduction=nll_reduction,
+        ).to(device)
+        disc_optimizer = torch.optim.AdamW(
+            list(perceptual_loss_fn.discriminator.parameters()) + [perceptual_loss_fn.logvar],
+            lr=disc_lr,
+            weight_decay=1e-4,
+        )
+        last_layer = _decoder_last_layer(raw_model)
+        if is_main():
+            print(f"  Loss       : L1 + {lambda_perceptual}·LPIPS(2.5D) + {lambda_kl}·KL "
+                  f"+ PatchGAN(w={disc_weight}, start={disc_start})")
+            print(f"  nll_reduc  : {nll_reduction}  |  slice_stride={slice_stride}")
+            if last_layer is None:
+                print("  ⚠ decoder.conv_out introuvable — poids adaptatif désactivé")
+
+    # fp16+GradScaler cohabite mal avec les torch.autograd.grad du poids
+    # adaptatif (double backward sur un graphe scalé) ; la référence MedVAE
+    # entraîne d'ailleurs en `mixed_precision: "no"`. On désactive donc le
+    # scaler dès que la recette perceptuelle est active (bf16 ou fp32, qui
+    # n'ont pas besoin de loss scaling).
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=(use_amp and device.type == "cuda" and not use_perceptual)
+    )
 
     # ── Reprise ──────────────────────────────────────────────────────────────
     start_step = 0
@@ -559,7 +654,12 @@ def train(
             print(f"  → Reprise depuis step {start_step}: {resume_path}\n")
 
     weights_dir = output_dir / "weights"
-    amp_dtype = torch.float16 if use_amp else torch.float32
+    # bf16 (et non fp16) avec la recette perceptuelle : pas de loss scaling
+    # nécessaire, donc compatible avec le double backward du poids adaptatif.
+    if use_amp:
+        amp_dtype = torch.bfloat16 if use_perceptual else torch.float16
+    else:
+        amp_dtype = torch.float32
 
     # ── Gestion auto-requeue SLURM (signal USR1 envoyé 120s avant timeout) ──
     _requeue_triggered = [False]
@@ -595,21 +695,54 @@ def train(
             x = next(data_iter).to(device)
 
         # ── Forward + backward ──────────────────────────────────────────────
-        optimizer.zero_grad(set_to_none=True)
+        gen_log = {}
+        if use_perceptual:
+            # Phase 1 — générateur (le VAE) : L1 + LPIPS + KL + adversarial
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(
+                "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+            ):
+                recon, posterior = medvae_forward_dist(raw_model, x)
+                loss, gen_log = perceptual_loss_fn(
+                    x, recon, posterior, optimizer_idx=0,
+                    global_step=step, last_layer=last_layer,
+                )
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            scheduler.step()
 
-        with torch.amp.autocast(
-            "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
-        ):
-            recon, kl = medvae_forward(raw_model, x)
-            l1_loss = F.l1_loss(recon, x)
-            loss = lambda_l1 * l1_loss + lambda_kl * kl
+            # Phase 2 — discriminateur (inactif avant `disc_start`)
+            if step >= disc_start:
+                disc_optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(
+                    "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+                ):
+                    d_loss, d_log = perceptual_loss_fn(
+                        x, recon.detach(), posterior, optimizer_idx=1, global_step=step,
+                    )
+                d_loss.backward()
+                disc_optimizer.step()
+                gen_log.update(d_log)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
+            l1_loss = torch.as_tensor(gen_log.get("train/rec", 0.0))
+            kl = torch.as_tensor(gen_log.get("train/kl", 0.0))
+        else:
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(
+                "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+            ):
+                recon, kl = medvae_forward(raw_model, x)
+                l1_loss = F.l1_loss(recon, x)
+                loss = lambda_l1 * l1_loss + lambda_kl * kl
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
 
         recent_loss.append(float(loss.item()))
         step += 1
@@ -625,22 +758,34 @@ def train(
                 if device.type == "cuda"
                 else 0
             )
-            kl_str = f"  kl={float(kl.item()):.4f}" if lambda_kl > 0 else ""
+            if use_perceptual:
+                extra = (
+                    f"  rec={gen_log.get('train/rec', 0):.4f}"
+                    f"  lpips={gen_log.get('train/perceptual', 0):.4f}"
+                    f"  kl={gen_log.get('train/kl', 0):.1f}"
+                    f"  dw={gen_log.get('train/d_weight', 0):.2f}"
+                    f"  g={gen_log.get('train/g_loss', 0):.4f}"
+                    f"  disc={gen_log.get('train/disc', 0):.4f}"
+                )
+            else:
+                kl_str = f"  kl={float(kl.item()):.4f}" if lambda_kl > 0 else ""
+                extra = f"  l1={float(l1_loss.item()):.4f}{kl_str}"
             print(
                 f"  [{step:6d}/{total_steps}]"
                 f"  loss={avg:.4f}"
-                f"  l1={float(l1_loss.item()):.4f}"
-                f"{kl_str}"
+                f"{extra}"
                 f"  lr={cur_lr:.2e}"
                 f"  mem={mem_gb:.1f}GB"
-                f"  t={elapsed:.0f}min  eta={eta:.0f}min"
+                f"  t={elapsed:.0f}min  eta={eta:.0f}min",
+                flush=True,
             )
 
         # ── Checkpoint + validation périodiques ────────────────────────────
         save_now = (step % save_every == 0) or (step == total_steps)
         if (is_main() and save_now) or _requeue_triggered[0]:
             val_loss = _validate(
-                raw_model, val_loader, device, use_amp, amp_dtype, lambda_l1, lambda_kl
+                raw_model, val_loader, device, use_amp, amp_dtype, lambda_l1, lambda_kl,
+                perceptual_fn=perceptual_loss_fn, lambda_perceptual=lambda_perceptual,
             )
             is_best = val_loss < best_val_loss
             if is_best:

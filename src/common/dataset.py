@@ -56,6 +56,7 @@ class MRIxFieldsBaseDataset(Dataset):
         volume_size: Optional[Tuple[int, int, int]] = None,
         max_per_class: Optional[int] = None,
         random_crop_prob: float = 0.0,
+        field_norm_stats: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
     ):
         self.data_root = Path(data_root)
         self.split = split
@@ -66,6 +67,11 @@ class MRIxFieldsBaseDataset(Dataset):
         self.target_spacing = target_spacing
         self.volume_size = volume_size
         self.random_crop_prob = random_crop_prob
+        # {modality: {field: {"lo": float, "hi": float}}} — see
+        # compute_field_norm_stats.py. When set, normalization uses these
+        # FIXED per-field statistics instead of this volume's own percentiles,
+        # preserving genuine inter-field intensity-scale differences.
+        self.field_norm_stats = field_norm_stats
 
         self.mod_to_idx = {m: i for i, m in enumerate(self.modalities)}
         self.field_to_idx = {f: i for i, f in enumerate(self.fields)}
@@ -95,14 +101,23 @@ class MRIxFieldsBaseDataset(Dataset):
                         continue
                     self.samples.append((p, mod_idx, field_idx))
 
-    def _load_tensor(self, path: Path) -> torch.Tensor:
+    def _load_tensor(
+        self, path: Path, modality: Optional[str] = None, field: Optional[str] = None
+    ) -> torch.Tensor:
         """Load a single volume and apply full preprocessing."""
+        fixed_lo = fixed_hi = None
+        if self.field_norm_stats is not None and modality is not None and field is not None:
+            entry = self.field_norm_stats.get(modality, {}).get(field)
+            if entry is not None:
+                fixed_lo, fixed_hi = entry["lo"], entry["hi"]
         vol, _ = load_nifti_volume(
             path,
             target_spacing=self.target_spacing,
             normalize=True,
             lo_pct=self.percentile_lower,
             hi_pct=self.percentile_upper,
+            fixed_lo=fixed_lo,
+            fixed_hi=fixed_hi,
         )
         # Optional random crop for training diversity
         if self.volume_size is not None:
@@ -226,6 +241,7 @@ class MultiModalNIfTILatentDataset(MRIxFieldsBaseDataset):
         volume_size: Optional[Tuple[int, int, int]] = None,
         max_per_class: Optional[int] = None,
         random_crop_prob: float = 0.0,
+        field_norm_stats: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
     ):
         super().__init__(
             data_root=data_root,
@@ -238,6 +254,7 @@ class MultiModalNIfTILatentDataset(MRIxFieldsBaseDataset):
             volume_size=volume_size,
             max_per_class=max_per_class,
             random_crop_prob=random_crop_prob,
+            field_norm_stats=field_norm_stats,
         )
         # Rebuild samples with flat class index
         self.samples = []
@@ -258,7 +275,7 @@ class MultiModalNIfTILatentDataset(MRIxFieldsBaseDataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, int, int]:
         path, mod_idx, field_idx, class_idx = self.samples[idx]
-        x = self._load_tensor(path)
+        x = self._load_tensor(path, self.modalities[mod_idx], self.fields[field_idx])
         return (
             x,
             torch.tensor(mod_idx, dtype=torch.long),
@@ -404,7 +421,42 @@ class MRIxFieldsPairedDataset(Dataset):
 # Latent cache dataset (MMFM multi-marginal, fast training)                   #
 # --------------------------------------------------------------------------- #
 
+import hashlib as _hashlib
 import json as _json
+
+
+def flat_latent_cache_id(
+    cfg: dict,
+    target_spacing,
+    volume_size,
+    p_lo: float,
+    p_hi: float,
+    field_norm_stats_path: Optional[str] = None,
+) -> str:
+    """Cache identifier for FlatLatentCacheDataset — shared by
+    precompute_mmfm_latents.py (writer) and train_mmfm_3d.py (reader) so both
+    always agree on the same cache path for a given config. Any change to the
+    VAE checkpoint, spacing, crop size, or normalization percentiles yields a
+    different id, so a stale/mismatched cache is never silently reused.
+
+    field_norm_stats_path: path to a compute_field_norm_stats.py JSON, if
+    fixed per-field normalization is used instead of per-volume percentiles
+    (see normalize_volume_fixed). Included in the hash so switching between
+    per-volume and per-field normalization always yields a fresh cache_id
+    rather than silently reusing latents encoded under the other scheme.
+    """
+    vae_cfg = cfg.get("vae", {})
+    key = "|".join([
+        str(vae_cfg.get("vae_type", "vae")),
+        str(vae_cfg.get("checkpoint", "")),
+        str(target_spacing),
+        str(volume_size),
+        f"{p_lo}",
+        f"{p_hi}",
+        f"field_norm={field_norm_stats_path or ''}",
+    ])
+    h = _hashlib.sha1(key.encode()).hexdigest()[:8]
+    return f"{vae_cfg.get('vae_type', 'vae')}_{h}"
 
 
 class LatentCacheDataset(Dataset):
@@ -473,6 +525,61 @@ class LatentCacheDataset(Dataset):
         if self.flip_lr_prob > 0 and random.random() < self.flip_lr_prob:
             # axe spatial +1 car dim0 = canaux
             z = torch.flip(z, dims=[self.flip_axis + 1])
+        return (
+            z,
+            torch.tensor(s["mod_idx"], dtype=torch.long),
+            torch.tensor(s["field_idx"], dtype=torch.long),
+            torch.tensor(s["class_idx"], dtype=torch.long),
+        )
+
+
+class FlatLatentCacheDataset(Dataset):
+    """Dataset de vecteurs latents MMFM pré-encodés ET pré-aplatis.
+
+    Lit un cache produit par src/cfm/precompute_mmfm_latents.py, qui reproduit
+    exactement le pipeline resample->normalize->center_crop_or_pad->encode->
+    to_vector() de MultiModalNIfTILatentDataset. Contrairement à
+    LatentCacheDataset (volume entier, format spatial, nécessite to_vector()
+    à l'usage), les tenseurs ici sont déjà aplatis (flat_dim,) et prêts à
+    l'emploi direct par VectorMMFM — aucun encode/resample/crop restant dans
+    la boucle d'entraînement.
+
+    Retourne (latent_vec, mod_idx, field_idx, class_idx).
+    """
+
+    def __init__(self, cache_dir: Path, cache_root: Path, preload_ram: bool = True):
+        self.cache_dir = Path(cache_dir)
+        self.cache_root = Path(cache_root)
+        self.preload_ram = preload_ram
+
+        index_path = self.cache_dir / "index.json"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Index de cache introuvable : {index_path}")
+        with open(index_path) as f:
+            self.meta = _json.load(f)
+
+        self.samples = self.meta["samples"]
+        if not self.samples:
+            raise RuntimeError(f"Cache vide : {index_path}")
+        self.flat_dim = self.meta.get("flat_dim")
+        n_fields = len(self.meta["fields"])
+        for s in self.samples:
+            s["class_idx"] = s["mod_idx"] * n_fields + s["field_idx"]
+
+        self._ram: Dict[str, torch.Tensor] = {}
+        if self.preload_ram:
+            for s in self.samples:
+                self._ram[s["path"]] = self._load_disk(s["path"])
+
+    def _load_disk(self, rel_path: str) -> torch.Tensor:
+        return torch.load(self.cache_root / rel_path, map_location="cpu").to(torch.float32)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        z = self._ram[s["path"]] if self.preload_ram else self._load_disk(s["path"])
         return (
             z,
             torch.tensor(s["mod_idx"], dtype=torch.long),

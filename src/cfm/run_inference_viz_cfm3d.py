@@ -46,6 +46,29 @@ from cfm.train_cfm_3d import (
 )
 from visualization.common import subject_id_from_name
 
+from skimage.metrics import structural_similarity as _sk_ssim
+
+
+def _slicewise_ssim(pred: np.ndarray, target: np.ndarray, axis: int = 2) -> float:
+    """Windowed SSIM averaged over 2D slices along `axis`.
+
+    Matches the official evaluator's methodology (slice-wise skimage SSIM),
+    unlike a naive per-voxel formula which is NOT SSIM (no local windowing).
+    """
+    data_range = float(target.max() - target.min())
+    if data_range < 1e-10:
+        return 1.0
+    vals = []
+    for i in range(pred.shape[axis]):
+        s = [slice(None)] * pred.ndim
+        s[axis] = i
+        s = tuple(s)
+        ps, ts = pred[s], target[s]
+        if ts.max() - ts.min() < 1e-10:
+            continue
+        vals.append(_sk_ssim(ps, ts, data_range=data_range))
+    return float(np.mean(vals)) if vals else 1.0
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Utilitaires
 # ═══════════════════════════════════════════════════════════════════════════
@@ -303,19 +326,17 @@ def generate_figures(
         # Métriques MAE / SSIM sur le crop (uniquement là où on a une prédiction)
         mae = float(np.mean(np.abs(pred_vol - gt_vol)))
         rmse = float(np.sqrt(np.mean((pred_vol - gt_vol) ** 2)))
-        ss = float(
-            np.mean((2 * pred_vol * gt_vol + 0.01) / (pred_vol**2 + gt_vol**2 + 0.01))
-        )  # approx SSIM
+        ss = _slicewise_ssim(pred_vol, gt_vol, axis=2)
         metrics_rows.append(
             {
                 "sujet_0.1T": subject_id,
                 "sujet_7T_GT": gt_id,
                 "MAE": f"{mae:.4f}",
                 "RMSE": f"{rmse:.4f}",
-                "SSIM_approx": f"{ss:.4f}",
+                "SSIM": f"{ss:.4f}",
             }
         )
-        print(f"  Sujet {subject_id} | MAE={mae:.4f}  RMSE={rmse:.4f}  SSIM≈{ss:.4f}")
+        print(f"  Sujet {subject_id} | MAE={mae:.4f}  RMSE={rmse:.4f}  SSIM={ss:.4f}")
 
         # ── Figure individuelle ────────────────────────────────────────────
         fig = plt.figure(figsize=(9, 9.5), dpi=120)
@@ -384,7 +405,7 @@ def generate_figures(
         # Titre global
         fig.suptitle(
             f"CFM 3D  0.1T → 7T  |  Sujet {subject_id}  "
-            f"[MAE={mae:.3f}  SSIM≈{ss:.3f}]",
+            f"[MAE={mae:.3f}  SSIM={ss:.3f}]",
             fontsize=12,
             fontweight="bold",
             y=0.97,
@@ -498,13 +519,13 @@ def generate_figures(
     # ── Résumé métriques ───────────────────────────────────────────────────
     print("\n  === Métriques (espace 1mm cropé 128×128×80) ===")
     print(
-        f"  {'Sujet 0.1T':>10} | {'GT 7T':>8} | {'MAE':>7} | {'RMSE':>7} | {'SSIM≈':>7}"
+        f"  {'Sujet 0.1T':>10} | {'GT 7T':>8} | {'MAE':>7} | {'RMSE':>7} | {'SSIM':>7}"
     )
     print("  " + "-" * 55)
     for m in metrics_rows:
         print(
             f"  {m['sujet_0.1T']:>10} | {m['sujet_7T_GT']:>8} | "
-            f"{m['MAE']:>7} | {m['RMSE']:>7} | {m['SSIM_approx']:>7}"
+            f"{m['MAE']:>7} | {m['RMSE']:>7} | {m['SSIM']:>7}"
         )
 
     return out_fig_dir, metrics_rows, out_all

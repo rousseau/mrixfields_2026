@@ -1,0 +1,157 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM vectorisé (MLP) — config d'entraînement canonique.
+#
+# Ce fichier et configs/mmfm/unet.yaml sont IDENTIQUES hors du bloc `model:` —
+# même data/train/inference — pour que toute différence de résultat ne puisse
+# venir que de l'architecture (MLP vectoriel vs UNet spatial). Voir
+# docs/MMFM_ARCHITECTURE.md pour le design partagé (src/cfm/mmfm_core.py +
+# ArchAdapter) et results/mmfm/analysis/protocol_20260730_harmonized_comparison/
+# pour les résultats de référence (nRMSE 0.436, le meilleur obtenu à ce jour).
+#
+# Convention : ce fichier est édité SUR PLACE pour chaque nouvelle phase
+# d'entraînement (ex. reprise avec plus d'itérations, nouveaux lambdas) —
+# pas de copie _v2/_ext/_test à chaque essai. L'historique des essais reste
+# dans git log ; le résultat de chaque essai significatif est consigné dans un
+# results/mmfm/comparison_<date>_<slug>/.
+#
+# Entraîné via train_mmfm_unified.py --method mmfm3d_vectorized, FROM SCRATCH
+# (pas de --resume) : l'unification a basculé le vectorisé du couplage
+# indépendant/linéaire (jamais de vrai OT-CFM) vers le sampler
+# availability-aware + le vrai OT-CFM (voir mmfm_core.py) — un changement
+# d'algorithme, pas juste un changement de résolution, donc repartir d'un
+# checkpoint entraîné sous l'ancien régime risquerait d'ancrer le modèle dans
+# un mauvais bassin (voir configs/mmfm/unet.yaml pour le raisonnement inverse
+# côté UNet, qui lui peut légitimement reprendre depuis un ancien checkpoint).
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_vectorized
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  # checkpoint VOLONTAIREMENT VIDE = poids MedVAE pré-entraînés (Stanford) bruts.
+  # Notre ancien fine-tuning L1 (outputs/medvae/runs/medvae_finetune_all/) est
+  # ABANDONNÉ : mesuré sur 9 volumes (manifest, section « LA RÉSOLUTION EST LE
+  # VRAI GOULOT »), il plafonne le SSIM d'auto-reconstruction à ~0.88 à toute
+  # résolution, là où le pré-entraîné atteint 0.915 à 1mm et 0.948 à 0.5mm.
+  # La L1 gagne en nRMSE (ce qu'elle optimise) mais détruit la structure.
+  # ATTENTION : à 2mm la hiérarchie est INVERSÉE (le fine-tuné y paraît
+  # meilleur) — la vérité terrain à 2mm est trop lissée pour révéler l'écart.
+  checkpoint:
+  latent_channels: 1
+
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  # RÉSOLUTION 1mm (2026-08-07) — passage depuis 2mm/96x112x96.
+  # Mesuré sur 9 volumes (manifest, « LA RÉSOLUTION EST LE VRAI GOULOT ») :
+  # l'auto-reconstruction MedVAE passe de SSIM 0.800 @2mm à 0.915 @1mm
+  # (nRMSE 0.187 -> 0.082). La grille native du challenge est 364x436x364 @0.5mm :
+  # travailler à 2mm jetait ~98% des voxels acquis, et l'évaluateur ré-interpole
+  # ensuite x4, donc tout le détail au-dessus du Nyquist de 2mm était absent par
+  # construction au moment du scoring.
+  # 1mm et pas 0.5mm : à 0.5mm l'attention de l'UNet de flow (niveau 1 =
+  # 129k tokens) demanderait ~33 GB pour sa seule matrice d'attention. À 1mm :
+  # 16k tokens, 0.5 GB. 1mm est la résolution maximale exploitable de bout en bout.
+  # 192x224x192 = 2x2x2 tuiles de 96x112x96 (cf. models/tiled_vae.py) -> latent
+  # 48x56x48 = 129k valeurs (vs 16k @2mm).
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  # Tuilage de l'encodage MedVAE (models/tiled_vae.py) : 2x2x2 tuiles de
+  # 96x112x96 + marge de contexte de 16 voxels, retirée du latent après encodage.
+  # Mesuré à 1mm sur 0006 : SSIM 0.980 (0.1T) / 0.959 (7T), nRMSE 0.039 / 0.118 —
+  # nettement mieux qu'un découpage en patches 64x64x64 fusionnés par fenêtre de
+  # Hann en espace image (0.934 / 0.919), qui lissait les détails.
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: retro_train
+  output_subdir: mmfm/vectorized
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  # Cache 1mm APLATI, converti depuis le cache UNet (mêmes latents,
+  # simplement reshapés) via convert_unet_cache_to_flat.py — garantit
+  # une comparaison strictement équitable entre les deux architectures.
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_c4d1e200/retro_train
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  # batch_size 1->16 (2026-08-06) : avec batch=1, le couplage "OT exact"
+  # (torchcfm.ExactOptimalTransportConditionalFlowMatcher) est mathématiquement
+  # dégénéré (une seule paire src/tgt possible, rien à optimiser — vérifié en
+  # lisant torchcfm/optimal_transport.py : pot.emd sur une matrice de coût 1x1
+  # n'a qu'un plan de transport possible) : identique bit à bit à un CFM sans
+  # OT. Ce couplage n'a donc jamais réellement fonctionné dans aucun résultat
+  # rapporté jusqu'ici (vectorisé, UNet, INR partagent ce code). Diagnostic
+  # court (8k iters) confirmé : loss batch=1 déjà plate (comme sur le run
+  # complet 100k), batch=8/16 encore clairement décroissante, batch=16 au
+  # niveau de loss le plus bas des trois.
+  #
+  # MAIS (2026-08-06) : le run complet à batch=16 a DÉGRADÉ Task 3 —
+  # nRMSE 0.4288 -> 0.4635, SSIM 0.8730 -> 0.8690, régression concentrée sur les
+  # transitions impliquant 7T. La loss d'entraînement était donc un proxy
+  # trompeur : le vrai couplage OT réduit le bruit des cibles de vitesse sans
+  # améliorer le résultat final. RETOUR À 1, faute de bénéfice mesuré.
+  # Contrainte supplémentaire depuis le passage à 1mm : l'UNet à cette
+  # résolution consomme 46.5 GB à batch=1 et 93.2 GB à batch=2 (mesuré) —
+  # batch>2 est de toute façon hors d'atteinte.
+  batch_size: 1
+  # 25000 : ALIGNÉ EXACTEMENT sur configs/mmfm/unet.yaml pour que la comparaison
+  # 1mm ne diffère que par l'architecture. Le vectorisé pourrait aller plus vite
+  # (8.6 GB et ~430M params contre 46.5 GB pour l'UNet), mais lui donner plus
+  # d'itérations invaliderait la comparaison.
+  total_iters: 25000
+  num_targets_per_step: 1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  adjacent_only: false
+  identity_prob: 0.1
+  accumulation_steps: 1
+  save_every: 2500
+  # Nombre de checkpoints INTERMÉDIAIRES conservés (rotation par numéro
+  # d'itération). `model_final.pth` n'est jamais concerné. 0 = tout garder
+  # (ancien comportement). Un checkpoint UNet pèse 2.9 Go : sans rotation, un
+  # entraînement de 25000 itérations à save_every=2500 laisse 30 Go derrière lui.
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

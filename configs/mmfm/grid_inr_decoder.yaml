@@ -1,0 +1,85 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Décodeur implicite conditionné par GRILLE LATENTE (LIIF + activations SIREN).
+#
+# Remplace le seul DÉCODEUR de MedVAE ; l'encodeur reste gelé et le latent est
+# celui, déjà en cache, des architectures vectorisée/UNet — le modèle de flow
+# est donc strictement inchangé et la comparaison reste équitable.
+#
+# POURQUOI cette architecture (voir results/mmfm/comparison_20260807_1mm/) :
+# l'INR à latent GLOBAL plafonne à `num_couches x hidden_dim` = 1536 nombres par
+# volume, indépendamment de latent_dim ET de la résolution. Mesuré : latent_dim
+# x32 -> Task 3 légèrement PIRE ; modulation enrichie (capacité x60) -> aucun
+# gain. Kim & Fridovich-Keil (NeurIPS 2025, arXiv:2506.11139) montrent qu'à
+# paramètres égaux une grille bat tout INR sur les signaux DENSES — une IRM
+# cérébrale en est un. Le conditionnement LOCAL par grille lève ce plafond :
+# la capacité vaut h*w*d*feat_dim (48*56*48*64 = 8.3M ici) et croît avec la
+# résolution du latent.
+#
+# CE QU'ON GAGNE : décodage à résolution ARBITRAIRE (latent 1mm -> sortie 0.5mm
+# native). L'évaluateur ré-interpolant vers 0.5mm, c'est le seul argument
+# sérieux pour réintroduire un INR dans ce pipeline.
+#
+# Usage :
+#   PYTHONPATH=src python src/cfm/train_grid_inr_decoder.py \
+#       --config configs/mmfm/grid_inr_decoder.yaml --env local
+# ─────────────────────────────────────────────────────────────────────────────
+
+task_name: grid_inr_decoder
+
+model:
+  latent_channels: 1        # latent MedVAE medvae_4_1_3d
+  feat_dim: 64              # canaux de la grille de features locales
+  n_res_blocks: 2
+  hidden_dim: 256           # largeur du SIREN (identique au backbone global, comparabilité)
+  num_hidden_layers: 5
+  omega_0: 30.0
+  omega_hidden: 30.0
+  fg_weight: 5.0            # même perte pondérée foreground que le backbone global
+  bg_threshold: -0.9
+
+data:
+  split: retro_train
+  # MÊME cache que l'UNet : latents spatiaux 1mm (48x56x48), encodeur MedVAE
+  # PRÉ-ENTRAÎNÉ, encodage par tuiles (models/tiled_vae.py).
+  latent_cache_root: outputs/mmfm/latent_cache/unet
+  latent_cache_dir: outputs/mmfm/latent_cache/unet/medvae_finetune_c4d1e200/retro_train
+  volume_size: [192, 224, 192]
+  target_spacing: [1.0, 1.0, 1.0]
+  # Validation par SUJET (pas par volume) : un sujet a jusqu'à 3 acquisitions
+  # (contrastes x champs) et les disperser fuiterait son anatomie. 40 sujets sur
+  # 1056 = ~4% des volumes, coût négligeable pour une évaluation hors-échantillon.
+  val_subjects: 40
+  # Supervision à 0.5mm (natif) alors que le LATENT reste à 1mm. Sans cela le
+  # décodeur n'apprendrait rien de ce qui se passe entre deux voxels 1mm et le
+  # décodage à 0.5mm ne vaudrait pas mieux qu'une trilinéaire — autrement dit le
+  # seul argument de cette architecture serait perdu d'avance. 1 = supervision
+  # sur la grille du latent (comportement d'origine).
+  supervision_factor: 2
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  output_subdir: mmfm/grid_inr_decoder
+
+train:
+  batch_size: 2
+  # Chargement des volumes cible À LA VOLÉE (NIfTI 0.5mm -> rééchantillonnage
+  # 1mm à chaque accès). C'est le poste dominant du temps par pas, mais on ne
+  # pré-calcule PAS de volumes sur disque : les seuls artefacts précalculés du
+  # projet sont les latents (outputs/mmfm/latent_cache/, ~0.5 Go), et un cache
+  # de volumes 1mm coûterait ~32 Go pour un gain purement de vitesse.
+  # Le seul levier gratuit est le parallélisme CPU (20 cœurs sur cette machine).
+  num_workers: 14
+  total_iters: 50000
+  points_per_step: 16384    # supervision creuse, comme le backbone global
+  # Un volume 0.5mm coûte ~4s à lire et normaliser pour n'en garder que 16384
+  # voxels sur 66 millions ; on en tire donc 8 lots disjoints, consommés en 8
+  # pas successifs. Le bruit de gradient par pas est inchangé ; la contrepartie
+  # est que 8 pas consécutifs voient les mêmes volumes (pratique courante en
+  # entraînement d'INR : plusieurs lots de rayons par image). Mettre 1 pour
+  # retrouver un pas par lecture.
+  batches_per_volume: 8
+  lr: 1.0e-4                # pas de méta-apprentissage ici : LR standard, pas le 5e-6 de NOIR
+  warmup_steps: 1000
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  save_every: 5000
+  print_every: 100

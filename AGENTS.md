@@ -205,35 +205,49 @@ sbatch src/slurm/cfm_3d_jeanzay.slurm cfm T1W configs/cfm3d_T1W_vqvae.yaml
 
 ---
 
-### Étape 4 — MedVAE vectorisé + MMFM *(baseline)*
+### Étape 4 — MMFM (vectorisé / UNet / INR)
 
-**Objectif** : Construire une baseline MMFM fidèle au papier / code original, en gardant MedVAE inchangé comme encodeur/décodeur et en vectorisant son latent avant le modèle de flow.
+**Objectif** : Multi-Marginal Flow Matching, comparant plusieurs architectures de modèle de flow à
+code strictement identique (seule l'architecture diffère). Vectorisé/UNet opèrent sur un latent
+MedVAE gelé ; l'INR opère directement sur le volume brut via un backbone SIREN+hypernetwork
+méta-appris séparément (pas de MedVAE pour cette variante).
 
-**Principe** :
-- volume 3D -> latent MedVAE
-- flatten du latent en vecteur
-- MMFM vectoriel sur le latent aplati
-- unflatten avant décodage MedVAE
+**Principe** : voir `docs/MMFM_ARCHITECTURE.md` pour le design complet (sampler multi-marginal,
+couplage OT-CFM, `ArchAdapter`) et `docs/MMFM_INR_STATE_OF_THE_ART.md` pour le design/état de l'art
+spécifique à la variante INR.
 
 | Fichier | Rôle |
 |---------|------|
+| `src/cfm/mmfm_core.py` | Boucle d'entraînement/inférence partagée (sampler, OT-CFM, pertes, EMA, checkpointing) |
+| `src/cfm/arch_vector.py` | `ArchAdapter` — variante vectorisée (MLP résiduel) |
+| `src/cfm/arch_unet.py` | `ArchAdapter` — variante UNet 3D spatial (MONAI) |
+| `src/cfm/arch_inr.py` | `ArchAdapter` — variante INR (réutilise `VectorMMFM` comme modèle de flow) |
 | `src/cfm/mmfm_vectorized.py` | Briques vectorielles: flatten/unflatten, embeddings temps/classe, MLP résiduel |
-| `src/cfm/train_mmfm_3d.py` | Entraînement MMFM v1 vectorisé sur latent MedVAE |
-| `src/cfm/test_mmfm_v1_smoke.py` | Smoke test de la vectorisation et du champ vectoriel |
-| `configs/mmfm3d_medvae_multimodal.yaml` | Config baseline MMFM v1 |
-| `docs/MMFM_V1_VECTORIZED.md` | Documentation détaillée de la baseline et des shapes |
-| `src/slurm/cfm_3d_jeanzay.slurm` | Job SLURM Jean Zay (phase `mmfm`) |
-| `src/slurm/launch_cfm3d_dgx.sh` | Lancement multi-GPU local (phase `mmfm`) |
+| `src/cfm/inr_backbone.py` | Backbone INR : SIREN + hypernetwork + meta-learning (NOIR Algorithme 1/2) |
+| `src/cfm/train_inr_backbone.py` | Entraînement séparé du backbone INR (analogue au fine-tuning MedVAE) |
+| `src/cfm/precompute_inr_latents.py` | Cache des latents INR fittés (Algorithme 2, coûteux à refaire à chaque step) |
+| `src/cfm/train_mmfm_unified.py` | CLI unique train+infer : `--method mmfm3d_vectorized\|mmfm3d_unet\|mmfm3d_inr` |
+| `configs/mmfm/vectorized.yaml`, `configs/mmfm/unet.yaml`, `configs/mmfm/inr.yaml` | Configs d'entraînement canoniques (flow) |
+| `configs/mmfm/inr_backbone.yaml` | Config d'entraînement du backbone INR |
+| `docs/MMFM_ARCHITECTURE.md` | Documentation de l'architecture MMFM unifiée |
+| `src/slurm/cfm_3d_jeanzay.slurm` | Job SLURM Jean Zay (phases `mmfm`/`mmfm_unet`) |
+| `src/slurm/launch_cfm3d_dgx.sh` | Lancement multi-GPU local (phases `mmfm`/`mmfm_unet`) |
 
 ```bash
 # Local
-PYTHONPATH=src python src/cfm/train_mmfm_3d.py --config configs/mmfm3d_medvae_multimodal.yaml --env local
+PYTHONPATH=src python src/cfm/train_mmfm_unified.py --method mmfm3d_vectorized \
+    --config configs/mmfm/vectorized.yaml --env local
 
 # Jean Zay
-sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm T1W configs/mmfm3d_medvae_multimodal.yaml
+sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm T1W configs/mmfm/vectorized.yaml
 ```
 
-**État** : ✅ Baseline v1 implémentée, documentée et smoke-testée.
+**État** : ✅ Les trois variantes sont codées, entraînées et évaluées à code partagé identique (voir
+`results/mmfm/comparison_20260801_final/manifest.md`) : vectorisé nRMSE **0.4288** (meilleur global),
+UNet 0.4741, INR 0.4566 (entre les deux, mais meilleur sur les cibles 5T/7T — voir le manifest pour le
+détail). Le backbone INR est actuellement en cours d'entraînement prolongé (représentation encore
+sous-convergée par rapport à MedVAE, voir `results/mmfm/comparison_20260801_final/
+inr_reconstruction_capacity.csv`) avant de reprendre l'entraînement du flow.
 ---
 
 ### Évaluation unifiée
@@ -336,11 +350,13 @@ mrixfields_2026/
 │   │
 │   ├── cfm/                            #   Étape 3 : CFM
 │   │   ├── train_cfm_3d.py             #     OT-CFM 3D latent
-│   │   ├── train_mmfm_3d.py            #     MMFM vectorisé
-│   │   ├── train_mmfm_unet_3d.py       #     MMFM-UNet 3D (multi-marginal)
-│   │   ├── precompute_latents.py       #     Cache de latents pour MMFM-UNet
+│   │   ├── mmfm_core.py                #     MMFM : boucle partagée (sampler, OT-CFM, EMA...)
+│   │   ├── arch_vector.py              #     MMFM : ArchAdapter vectorisé
+│   │   ├── arch_unet.py                #     MMFM : ArchAdapter UNet 3D (multi-marginal)
+│   │   ├── train_mmfm_unified.py       #     MMFM : CLI unique train+infer
+│   │   ├── precompute_unet_latents.py  #     Cache de latents pour MMFM-UNet
+│   │   ├── precompute_mmfm_latents.py  #     Cache de latents pour MMFM vectorisé
 │   │   ├── infer_mmfm_unified.py       #     Inférence any-to-any MMFM
-│   │   ├── test_mmfm_v1_smoke.py       #     Smoke test MMFM
 │   │   └── mmfm_vectorized.py          #     Briques vectorielles
 │   │
 │   ├── stargan/                        #   Étape 1 : Baseline StarGAN 2D
@@ -400,7 +416,7 @@ mrixfields_2026/
 │   ├── BENCHMARK_PLAN.md
 │   ├── EVALUATION_SCRIPT.md
 │   ├── VAE_IMPLEMENTATION_PLAN.md      #   Plan VAE détaillé (Phases A–F)
-│   ├── MMFM_V1_VECTORIZED.md
+│   ├── MMFM_ARCHITECTURE.md
 │   └── ARCHITECTURE.md                 #   (à créer)
 │
 ├── paper/                              # ─── PAPIER (vide) ───

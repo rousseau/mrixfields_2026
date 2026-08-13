@@ -2,39 +2,51 @@
 """Figures comparatives qualitatives — FOV complet + zoom patch.
 
 Pour chaque paire clé et chaque sujet prospectif :
-    Rang 1: FOV complet [ Source | GT | MLP | UNet V1 | UNet V2 ]
-    Rang 2: Zoom patch  [ Source | GT | MLP | UNet V1 | UNet V2 ]
+    Rang 1: FOV complet [ Source | GT | <méthode 1> | <méthode 2> | ... ]
+    Rang 2: Zoom patch  [ Source | GT | <méthode 1> | <méthode 2> | ... ]
     + Rectangle rouge sur Rang 1 indiquant le boundary de la prédiction.
+
+Les méthodes comparées ne sont plus figées dans le code : `--pred-dir
+name=path` peut être répété pour ajouter/remplacer une entrée (ex: la
+méthode active `mmfm_v2`) sans éditer ce fichier.
+
+Usage :
+    python scripts/generate_comparison_figures_v2.py
+    python scripts/generate_comparison_figures_v2.py \\
+        --pred-dir mmfm_v2=outputs/predictions/mmfm_v2/task3/T1W \\
+        --pairs 0.1T:7T 1.5T:7T \\
+        --subjects 0006 0007
 """
 
+import argparse
 from pathlib import Path
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import nibabel as nib
-import nibabel
 import nibabel.processing
 import numpy as np
 
 DATA_ROOT = Path("/home/rousseau/Data/MRIxFields_20260414/Training_prospective")
-PRED_DIRS = {
+
+DEFAULT_PRED_DIRS = {
     "mlp":     Path("results/mmfm/visuals/mmfm_mlp_all_tasks"),
     "unet_v1": Path("results/mmfm/visuals/mmfm_unet_all_tasks"),
     "unet_v2": Path("results/mmfm/visuals/mmfm_unet_v2_all_tasks"),
 }
-OUT_DIR = Path("results/mmfm/visuals/comparison_figures")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_OUT_DIR = Path("results/mmfm/visuals/comparison_figures")
 
-PAIRS = [
+DEFAULT_PAIRS = [
     ("0.1T", "7T"),
     ("1.5T", "7T"),
     ("0.1T", "1.5T"),
     ("7T", "0.1T"),
 ]
 
-SUBJECTS = ["0006", "0007", "0009"]
-MODALITIES = ["T1W", "T2W", "T2FLAIR"]
+DEFAULT_SUBJECTS = ["0006", "0007", "0009"]
+DEFAULT_MODALITIES = ["T1W", "T2W", "T2FLAIR"]
 AXES = [2, 1, 0]  # axial, coronal, sagittal
 AXIS_NAMES = ["Axial", "Coronal", "Sagittal"]
 
@@ -63,8 +75,18 @@ def _mid_slice(vol: np.ndarray, axis: int):
 
 
 def find_pred_file(directory: Path, modality: str, src: str, subject: str, tgt: str):
-    """Find a prediction file using multiple possible suffixes."""
+    """Find a prediction file, trying the official naming convention first
+    (P_{MOD}_{TGT}_{ID}.nii.gz) then legacy source-tagged conventions.
+
+    Also tries a `{src}_to_{tgt}/` subdirectory — the layout produced by
+    infer_mmfm_unified.py's batch mode (`process_volume_unified`), the
+    current convention for evaluation predictions (as opposed to the older
+    flat layout from one-off generator scripts like
+    generate_all_predictions_mmfm_mlp.sh)."""
+    pair_dir = directory / f"{src}_to_{tgt}"
     candidates = [
+        directory / f"P_{modality}_{tgt}_{subject}.nii.gz",
+        pair_dir / f"P_{modality}_{tgt}_{subject}.nii.gz",
         directory / f"P_{modality}_{src}_{subject}_{modality}_{tgt}_mmfm_unet.nii.gz",
         directory / f"P_{modality}_{src}_{subject}_{modality}_{tgt}_mmfm.nii.gz",
         directory / f"P_{modality}_{src}_{subject}_{modality}_{tgt}_mmfm_unet_v2.nii.gz",
@@ -90,13 +112,22 @@ def _bbox_nonzero_2d(arr2d, margin=5):
     return (y0, y1, x0, x1)
 
 
-def generate_figure(subject: str, modality: str, src: str, tgt: str):
+def generate_figure(
+    subject: str,
+    modality: str,
+    src: str,
+    tgt: str,
+    pred_dirs: dict,
+    out_dir: Path,
+):
+    method_names = list(pred_dirs.keys())
+
     src_path = DATA_ROOT / modality / src / f"P_{modality}_{src}_{subject}.nii.gz"
     tgt_path = DATA_ROOT / modality / tgt / f"P_{modality}_{tgt}_{subject}.nii.gz"
 
     pred_files = {
         name: find_pred_file(d, modality, src, subject, tgt)
-        for name, d in PRED_DIRS.items()
+        for name, d in pred_dirs.items()
     }
 
     for p in [src_path, tgt_path]:
@@ -116,13 +147,13 @@ def generate_figure(subject: str, modality: str, src: str, tgt: str):
     pred_vols = {name: _load(p, ref_nii=src_nii) for name, p in pred_files.items()}
 
     rows_axes = len(AXES)
-    cols = 5
+    cols = 2 + len(method_names)
     # Double rows per axis: FOV + zoom
     fig, axes = plt.subplots(rows_axes * 2, cols, figsize=(cols * 3, rows_axes * 6))
     if rows_axes == 1:
         axes = axes.reshape(2, cols)
 
-    col_labels = ["Source", "GT", "MLP", "UNet V1", "UNet V2"]
+    col_labels = ["Source", "GT"] + method_names
     for c, lab in enumerate(col_labels):
         axes[0, c].set_title(lab, fontsize=13, fontweight="bold")
 
@@ -136,10 +167,7 @@ def generate_figure(subject: str, modality: str, src: str, tgt: str):
         ims = [
             _mid_slice(src_vol, axis),
             _mid_slice(tgt_vol, axis),
-            _mid_slice(pred_vols["mlp"], axis),
-            _mid_slice(pred_vols["unet_v1"], axis),
-            _mid_slice(pred_vols["unet_v2"], axis),
-        ]
+        ] + [_mid_slice(pred_vols[name], axis) for name in method_names]
 
         # Compute bbox from GT slice for zoom
         bbox = _bbox_nonzero_2d(ims[1], margin=10)
@@ -165,16 +193,72 @@ def generate_figure(subject: str, modality: str, src: str, tgt: str):
     plt.suptitle(f"{modality} | {subject} | {src} → {tgt}", fontsize=14, fontweight="bold")
     plt.tight_layout(rect=[0, 0.03, 1, 0.97])
 
-    out_path = OUT_DIR / f"compare_{modality}_{subject}_{src}_to_{tgt}.png"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"compare_{modality}_{subject}_{src}_to_{tgt}.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved: {out_path}")
 
 
-if __name__ == "__main__":
-    for modality in MODALITIES:
-        for subject in SUBJECTS:
-            for src, tgt in PAIRS:
+def _parse_pred_dir(spec: str) -> tuple[str, Path]:
+    if "=" not in spec:
+        raise argparse.ArgumentTypeError(
+            f"--pred-dir attend 'name=path', reçu: {spec!r}"
+        )
+    name, path = spec.split("=", 1)
+    return name, Path(path)
+
+
+def _parse_pair(spec: str) -> tuple[str, str]:
+    if ":" not in spec:
+        raise argparse.ArgumentTypeError(
+            f"--pairs attend 'SRC:TGT', reçu: {spec!r}"
+        )
+    src, tgt = spec.split(":", 1)
+    return src, tgt
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Figures comparatives qualitatives multi-méthodes")
+    p.add_argument(
+        "--pred-dir", action="append", default=[], metavar="NAME=PATH",
+        help="Ajoute/remplace une méthode comparée (répétable), ex: "
+             "mmfm_v2=outputs/predictions/mmfm_v2/task3/T1W",
+    )
+    p.add_argument(
+        "--no-default-methods", action="store_true",
+        help="N'utilise que les méthodes passées via --pred-dir (ignore les 3 défauts)",
+    )
+    p.add_argument(
+        "--pairs", nargs="+", default=None, metavar="SRC:TGT",
+        help="Paires source:cible (défaut: 0.1T:7T 1.5T:7T 0.1T:1.5T 7T:0.1T)",
+    )
+    p.add_argument("--subjects", nargs="+", default=DEFAULT_SUBJECTS)
+    p.add_argument("--modalities", nargs="+", default=DEFAULT_MODALITIES,
+                    choices=["T1W", "T2W", "T2FLAIR"])
+    p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    pred_dirs = {} if args.no_default_methods else dict(DEFAULT_PRED_DIRS)
+    for spec in args.pred_dir:
+        name, path = _parse_pred_dir(spec)
+        pred_dirs[name] = path
+    if not pred_dirs:
+        raise SystemExit("Aucune méthode à comparer : fournir --pred-dir NAME=PATH")
+
+    pairs = [_parse_pair(s) for s in args.pairs] if args.pairs else DEFAULT_PAIRS
+
+    for modality in args.modalities:
+        for subject in args.subjects:
+            for src, tgt in pairs:
                 print(f"Generating {modality} {subject} {src}->{tgt}...")
-                generate_figure(subject, modality, src, tgt)
-    print(f"\nAll comparative figures saved in {OUT_DIR}")
+                generate_figure(subject, modality, src, tgt, pred_dirs, args.out_dir)
+    print(f"\nAll comparative figures saved in {args.out_dir}")
+
+
+if __name__ == "__main__":
+    main()

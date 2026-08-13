@@ -57,16 +57,16 @@ cat <<EOF
 
 Pour se connecter :  ssh jeanzay
 
-Sur Jean Zay, lancer l'entraînement Run 2 (reprise depuis Run 1) :
+Sur Jean Zay, poursuivre l'entraînement UNet (reprise depuis un checkpoint) :
   cd \$WORK/MRIX/mrixfields_2026
   sbatch src/slurm/train_mmfm_multimarginal_jeanzay.slurm \\
-    configs/mmfm3d_multimarginal_medvae_run2.yaml \\
-    outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/model_final.pth
+    configs/mmfm/unet.yaml \\
+    outputs/mmfm/unet/weights/model_final.pth
 
 Ou l'inférence Task 3 (soumission validation) :
   sbatch src/slurm/infer_mmfm_jeanzay.slurm \\
-    configs/mmfm3d_multimarginal_medvae_run1.yaml \\
-    outputs/cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/model_final.pth \\
+    configs/mmfm/unet.yaml \\
+    outputs/mmfm/unet/weights/model_final.pth \\
     outputs/submission_candidates/mmfm_multimarginal_val \\
     Validating_prospective
 EOF

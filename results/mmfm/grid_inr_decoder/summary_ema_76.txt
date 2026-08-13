@@ -1,0 +1,27 @@
+RÉSUMÉ (76 volumes hors échantillon)
+==============================================================================
+variante         nRMSE (fg)      nRMSE       SSIM
+conv@1mm             0.1282     0.1284     0.9394
+inr@1mm              0.1455     0.1488     0.9093
+conv@0.5mm           0.1346     0.1354     0.9154
+inr@0.5mm            0.1511     0.1563     0.8836
+
+À 1mm, contre le décodeur qu'il remplace : l'INR PERD  (ΔSSIM=-0.0302, ΔnRMSE=+0.0173)
+
+À 0.5mm — LA MESURE QUI DÉCIDE (même latent, restitution différente) : l'INR PERD  (ΔSSIM=-0.0318, ΔnRMSE=+0.0165)
+
+--- @0.5mm par contraste ---
+contraste    n  conv SSIM  inr SSIM        Δ  conv nRMSE  inr nRMSE        Δ
+T1W         29     0.9158    0.8827  -0.0331      0.1529     0.1612  +0.0083
+T2FLAIR     23     0.9079    0.8864  -0.0216      0.1076     0.1162  +0.0086
+T2W         24     0.9222    0.8820  -0.0401      0.1385     0.1723  +0.0338
+
+--- @0.5mm par champ ---
+champ        n  conv SSIM  inr SSIM        Δ  conv nRMSE  inr nRMSE        Δ
+0.1T        23     0.9286    0.9179  -0.0107      0.1078     0.0970  -0.0108
+1.5T        28     0.9121    0.8780  -0.0341      0.1282     0.1485  +0.0204
+3T           6     0.8933    0.8508  -0.0424      0.1811     0.2233  +0.0421
+5T           9     0.9003    0.8563  -0.0439      0.1673     0.1975  +0.0302
+7T          10     0.9212    0.8646  -0.0566      0.1571     0.1975  +0.0404
+
+CSV : results/mmfm/grid_inr_decoder/reconstruction_ema_full.csv

@@ -38,8 +38,7 @@ conda activate mrixfields2026   # environnement dédié
 | Méthode | Description | Doc |
 |---------|-------------|-----|
 | StarGAN 2D | Baseline any-to-any du challenge | `AGENTS.md` |
-| MMFM v1 vectorisé | Baseline MMFM sur latent aplati | `docs/MMFM_V1_VECTORIZED.md` |
-| **MMFM-UNet multi-marginal** | UNet 3D + formulation multi-marginale continue | `docs/MMFM3D_UNET_MULTIMARGINAL.md` |
+| **MMFM** (vectorisé / UNet / INR) | Multi-Marginal Flow Matching, 3 architectures comparables à code identique | `docs/MMFM_ARCHITECTURE.md` |
 
 ## Évaluation
 

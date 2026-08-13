@@ -10,7 +10,7 @@ Chemin de cache : outputs/latent_cache/<vae_id>/<split>/<mod>/<field>/<subject>.
 
 Usage :
     PYTHONPATH=src python src/cfm/precompute_latents.py \
-        --config configs/mmfm3d_multimarginal_medvae.yaml --env local
+        --config configs/mmfm/unet.yaml --env local
 """
 
 from __future__ import annotations

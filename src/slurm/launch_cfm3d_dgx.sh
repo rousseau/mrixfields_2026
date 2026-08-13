@@ -15,8 +15,8 @@
 #   bash src/launch_cfm3d_dgx.sh vae T1W          # auto-détection GPUs
 #   bash src/launch_cfm3d_dgx.sh vae T1W 1        # single-GPU, débug rapide
 #   bash src/slurm/launch_cfm3d_dgx.sh cfm T1W 4  # multi-GPU sur DGX GB10
-#   bash src/slurm/launch_cfm3d_dgx.sh mmfm T1W 4 configs/mmfm3d_medvae_multimodal.yaml
-#   bash src/slurm/launch_cfm3d_dgx.sh mmfm_unet T1W 4 configs/mmfm3d_unet_medvae_multimodal.yaml
+#   bash src/slurm/launch_cfm3d_dgx.sh mmfm T1W 4 configs/mmfm/vectorized.yaml
+#   bash src/slurm/launch_cfm3d_dgx.sh mmfm_unet T1W 4 configs/mmfm/unet.yaml
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -38,6 +38,7 @@ print(e.get('python', 'python3'))
 " 2>/dev/null || echo "python3")
 
 # ── Config selon la phase ────────────────────────────────────────────────────
+METHOD_ARG=""
 if [[ "$PHASE" == "vae" ]]; then
     CONFIG="${CONFIG_OVERRIDE:-configs/vae3d_multimodal.yaml}"
     SCRIPT="src/vae3d/train_vae_3d.py"
@@ -45,11 +46,13 @@ elif [[ "$PHASE" == "cfm" ]]; then
     CONFIG="${CONFIG_OVERRIDE:-configs/cfm3d_T1W_medvae_finetuned.yaml}"
     SCRIPT="src/cfm/train_cfm_3d.py"
 elif [[ "$PHASE" == "mmfm" ]]; then
-    CONFIG="${CONFIG_OVERRIDE:-configs/mmfm3d_medvae_multimodal.yaml}"
-    SCRIPT="src/cfm/train_mmfm_3d.py"
+    CONFIG="${CONFIG_OVERRIDE:-configs/mmfm/vectorized.yaml}"
+    SCRIPT="src/cfm/train_mmfm_unified.py"
+    METHOD_ARG="--method mmfm3d_vectorized"
 elif [[ "$PHASE" == "mmfm_unet" ]]; then
-    CONFIG="${CONFIG_OVERRIDE:-configs/mmfm3d_unet_medvae_multimodal.yaml}"
-    SCRIPT="src/cfm/train_mmfm_unet_3d.py"
+    CONFIG="${CONFIG_OVERRIDE:-configs/mmfm/unet.yaml}"
+    SCRIPT="src/cfm/train_mmfm_unified.py"
+    METHOD_ARG="--method mmfm3d_unet"
 else
     echo "ERREUR : PHASE doit être 'vae', 'cfm', 'mmfm' ou 'mmfm_unet' (reçu : '$PHASE')" >&2
     exit 1
@@ -101,19 +104,21 @@ MAX_SECONDS=$((MAX_HOURS * 3600))
 echo "  Durée max : ${MAX_HOURS}h (MAX_HOURS=${MAX_HOURS})"
 
 if [[ "$N_GPUS" -gt 1 ]]; then
-    echo "  torchrun --nproc_per_node=$N_GPUS $SCRIPT"
+    echo "  torchrun --nproc_per_node=$N_GPUS $SCRIPT $METHOD_ARG"
     timeout --signal=TERM --kill-after=120s "${MAX_SECONDS}s" \
         torchrun \
             --nproc_per_node="$N_GPUS" \
             --master_port=$(( RANDOM % 10000 + 29500 )) \
             "$SCRIPT" \
+            $METHOD_ARG \
             --config "$CONFIG" \
             --env local \
             $RESUME_ARG
 else
-    echo "  $PYTHON $SCRIPT (single-GPU)"
+    echo "  $PYTHON $SCRIPT $METHOD_ARG (single-GPU)"
     timeout --signal=TERM --kill-after=120s "${MAX_SECONDS}s" \
         $PYTHON "$SCRIPT" \
+            $METHOD_ARG \
             --config "$CONFIG" \
             --env local \
             $RESUME_ARG
