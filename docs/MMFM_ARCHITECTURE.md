@@ -160,6 +160,26 @@ encodage par tuiles :
 | UNet | 0.4617 | 0.8955 | 0.1014 |
 | INR (z=4096) | 0.6223 | 0.8002 | 0.2051 |
 
+**⚠ Ces chiffres portent sur T1W SEUL.** Évalué le 2026-08-14 sur les trois
+contrastes (vectorisé de production, même protocole) :
+
+| contraste | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| T1W | 0.4353 | 0.8997 | 0.0983 |
+| **T2W** | **0.3376** | 0.8980 | **0.0911** |
+| T2FLAIR | 0.3654 | 0.8949 | 0.0927 |
+| **moyenne 3 contrastes** | **0.3794** | **0.8975** | **0.0941** |
+
+**T1W est le contraste le plus DIFFICILE** : le projet a optimisé sur son pire
+cas et le score réel toutes modalités est meilleur de 13 %. Surtout, le « mur du
+7T » (nRMSE 0.7542 en T1W) **n'existe pas en T2W** (0.3620) — la difficulté du
+haut champ est propre au contraste, pas au problème. Le volume de données ne
+l'explique pas : T1W@7T est la classe la MIEUX dotée (235 volumes) et la plus
+mauvaise. Détails : `results/mmfm/comparison_20260814_all_contrasts/manifest.md`.
+
+Les comparaisons d'architectures ci-dessus n'ont été faites que sur T1W ; rien
+ne garantit que le classement tienne sur les deux autres contrastes.
+
 > **Mise à jour 2026-08-14** — ces chiffres du vectorisé proviennent du run
 > réentraîné AVEC l'augmentation par flip. Jusqu'au 2026-08-13, `flip_lr_prob: 0.5`
 > était déclaré dans sa config mais **silencieusement ignoré** (`FlatLatentCacheDataset`
