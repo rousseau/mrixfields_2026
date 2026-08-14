@@ -67,6 +67,7 @@ from common.io import (
     load_nifti_volume,
     resample_volume,
 )
+from models.tiled_vae import tiled_encode
 from models.vae_loader import load_vae
 
 from torchcfm.conditional_flow_matching import (
@@ -150,6 +151,34 @@ def _infer_latent_shape(vae, volume_size: Tuple[int, ...], device: torch.device)
     with torch.no_grad():
         z = vae.encode(dummy)
     return tuple(int(v) for v in z.shape[1:])
+
+
+def _encode_like_cache(vae, x: Tensor, tile, margin: int, use_amp: bool,
+                       amp_dtype: torch.dtype) -> Tensor:
+    """Encode EXACTEMENT comme le precompute et l'inférence.
+
+    Sans ce détour, l'entraînement sans cache (`use_latent_cache: false`)
+    appelait `vae.encode()` — donc la fenêtre glissante interne de MedVAE —
+    alors que `precompute_*_latents.py` et `infer_mmfm_unified.py` utilisent
+    `tiled_encode` (tuiles + marge de contexte). Deux schémas d'encodage
+    différents produisent des latents de distributions différentes : le modèle
+    se serait entraîné sur l'un et aurait été évalué sur l'autre, SANS le
+    moindre signal — les formes coïncident, seules les valeurs diffèrent.
+    L'encodage par tuiles n'est pas un détail de performance : mesuré, il donne
+    SSIM 0.980/0.959 contre 0.934/0.919 pour un découpage naïf.
+
+    `tiled_encode` ne traite qu'un volume à la fois (sa sortie est allouée avec
+    une dimension de lot de 1) : on boucle donc sur le lot plutôt que de lui
+    passer un tenseur qu'il n'accepte pas.
+    """
+    if not tile:
+        return vae.encode(x)
+    return torch.cat(
+        [tiled_encode(vae, x[i:i + 1], tile=tuple(tile), margin=margin,
+                      use_amp=use_amp, amp_dtype=amp_dtype)
+         for i in range(x.shape[0])],
+        dim=0,
+    )
 
 
 def _sample_class(ds, i: int) -> int:
@@ -413,6 +442,12 @@ def train(
 
     data_root = data_cfg.get("data_root")
     use_latent_cache = bool(data_cfg.get("use_latent_cache", False))
+    # Tuilage de l'encodage : DOIT valoir exactement ce qu'ont utilisé le
+    # precompute et l'inférence, sinon les latents d'entraînement ne seraient
+    # pas dans la même distribution (voir _encode_like_cache).
+    raw_tile = data_cfg.get("encode_tile")
+    encode_tile = tuple(int(v) for v in raw_tile) if raw_tile else None
+    encode_tile_margin = int(data_cfg.get("encode_tile_margin", 16))
     if data_root is None and not use_latent_cache:
         raise RuntimeError("data_root requis dans la config ou l'env (sauf use_latent_cache=True).")
 
@@ -690,8 +725,10 @@ def train(
                     with torch.no_grad(), torch.amp.autocast(
                         "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
                     ):
-                        z_src_enc = vae.encode(src_item)
-                        z_tgt_enc = z_src_enc if same else vae.encode(tgt_item)
+                        z_src_enc = _encode_like_cache(
+                            vae, src_item, encode_tile, encode_tile_margin, use_amp, amp_dtype)
+                        z_tgt_enc = z_src_enc if same else _encode_like_cache(
+                            vae, tgt_item, encode_tile, encode_tile_margin, use_amp, amp_dtype)
                 z_src, meta = adapter.prep_latent(vae, z_src_enc)
                 z_tgt = z_src if same else adapter.prep_latent(vae, z_tgt_enc)[0]
 
