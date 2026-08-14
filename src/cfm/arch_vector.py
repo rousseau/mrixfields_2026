@@ -49,10 +49,6 @@ def _validate_cache_shape(ds, latent_shape: Tuple[int, ...]) -> None:
         )
 
 
-def _build_cache_dataset(cache_dir: Path, cache_root: Path, data_cfg: dict):
-    return FlatLatentCacheDataset(cache_dir=cache_dir, cache_root=cache_root, preload_ram=True)
-
-
 def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
     from cfm.mmfm_core import ArchAdapter  # deferred: avoids a circular import at module load
 
@@ -83,6 +79,21 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
 
     def arch_meta_dict() -> dict:
         return {"latent_shape": tuple(int(v) for v in latent_shape)}
+
+    def _build_cache_dataset(cache_dir: Path, cache_root: Path, data_cfg: dict):
+        # Fermeture (et non fonction de module) pour capturer `latent_shape` :
+        # le cache plat n'enregistre que `flat_dim`, or retourner un latent
+        # aplati exige de connaître sa forme spatiale. C'est ce qui manquait —
+        # `flip_lr_prob` était déclaré dans la config mais la classe ne
+        # l'acceptait pas, donc seul l'UNet recevait l'augmentation.
+        return FlatLatentCacheDataset(
+            cache_dir=cache_dir,
+            cache_root=cache_root,
+            preload_ram=bool(data_cfg.get("latent_preload_ram", True)),
+            flip_lr_prob=float(data_cfg.get("flip_lr_prob", 0.0)),
+            flip_axis=int(data_cfg.get("flip_axis", 0)),
+            latent_shape=tuple(int(v) for v in latent_shape),
+        )
 
     return ArchAdapter(
         name="mmfm3d_vectorized",

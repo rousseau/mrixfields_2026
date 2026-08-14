@@ -156,9 +156,20 @@ encodage par tuiles :
 
 | Architecture @1mm | nRMSE | SSIM | LPIPS |
 |---|---|---|---|
-| **Vectorisé** | **0.4354** | **0.8995** | **0.0985** |
+| **Vectorisé** | **0.4353** | **0.8997** | **0.0983** |
 | UNet | 0.4617 | 0.8955 | 0.1014 |
 | INR (z=4096) | 0.6223 | 0.8002 | 0.2051 |
+
+> **Mise à jour 2026-08-14** — ces chiffres du vectorisé proviennent du run
+> réentraîné AVEC l'augmentation par flip. Jusqu'au 2026-08-13, `flip_lr_prob: 0.5`
+> était déclaré dans sa config mais **silencieusement ignoré** (`FlatLatentCacheDataset`
+> n'acceptait pas l'argument) : seul l'UNet en bénéficiait, ce qui invalidait
+> l'affirmation « configs identiques hors du bloc `model:` ». Après correction et
+> réentraînement, le flip s'avère **neutre** (0.4354 → 0.4353) et l'écart avec l'UNet
+> est **inchangé** (-0.0264, 16/20 paires). Le classement ne dépendait pas du bug —
+> c'est désormais mesuré. Voir `results/mmfm/comparison_20260814_vectorized_flip/`.
+> L'INR, lui, ne peut PAS recevoir cette augmentation : son latent est un vecteur de
+> modulation global sans structure spatiale (`arch_inr.py` lève une erreur).
 | INR (z=129024) | 0.6383 | 0.7966 | 0.2061 |
 
 - Le **vectorisé reste le meilleur**, y compris à 1mm (16/20 paires devant l'UNet en nRMSE), tout en
@@ -243,7 +254,7 @@ l'architecture du flow diffère. Détail complet :
 
 | Modèle | nRMSE | SSIM | LPIPS | Mémoire | Vitesse |
 |---|---|---|---|---|---|
-| **Vectorisé @1mm** | **0.4354** | **0.8995** | **0.0985** | 8.6 GB | 3.48 it/s |
+| **Vectorisé @1mm** | **0.4353** | **0.8997** | **0.0983** | 8.6 GB | 3.48 it/s |
 | UNet @1mm | 0.4617 | 0.8955 | 0.1014 | 46.5 GB | 0.42 it/s |
 | *Vectorisé @2mm (ancienne réf., 50k iters)* | *0.4288* | *0.8730* | *0.1407* | — | — |
 

@@ -93,7 +93,26 @@ def _validate_cache_shape(ds, latent_shape: Tuple[int, ...]) -> None:
 
 
 def _build_cache_dataset(cache_dir: Path, cache_root: Path, data_cfg: dict):
-    return FlatLatentCacheDataset(cache_dir=cache_dir, cache_root=cache_root, preload_ram=True)
+    # PAS de flip ici, et ce n'est pas un oubli : le latent de cette
+    # architecture est le `z` ajusté par l'Algorithme 2 de NOIR, un vecteur de
+    # modulation GLOBAL sans aucune structure spatiale. Le retourner n'a pas de
+    # sens géométrique — la seule façon correcte d'augmenter par symétrie
+    # serait de réajuster `z` sur le volume retourné, donc de refaire le
+    # precompute (~6 h) avec des volumes retournés.
+    # `latent_shape` vaut ici (C, *volume_size) et non la forme d'un latent
+    # spatial (cf. make_adapter) : l'utiliser pour un flip remettrait `z` dans
+    # une forme qui n'est pas la sienne.
+    if float(data_cfg.get("flip_lr_prob", 0.0)) > 0:
+        raise ValueError(
+            "flip_lr_prob > 0 est incompatible avec l'architecture INR : son latent "
+            "est un vecteur de modulation global, pas un latent spatial — le "
+            "retourner n'a pas de sens. Mettre flip_lr_prob: 0.0 dans "
+            "configs/mmfm/inr.yaml (voir le commentaire de cette clé)."
+        )
+    return FlatLatentCacheDataset(
+        cache_dir=cache_dir, cache_root=cache_root,
+        preload_ram=bool(data_cfg.get("latent_preload_ram", True)),
+    )
 
 
 def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):

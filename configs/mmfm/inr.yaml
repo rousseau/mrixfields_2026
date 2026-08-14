@@ -113,7 +113,12 @@ data:
   latent_cache_root: outputs/mmfm/latent_cache/inr
   latent_cache_dir: outputs/mmfm/latent_cache/inr/inr_932b0b37/retro_train
   latent_preload_ram: true
-  flip_lr_prob: 0.5
+  # 0.0 et NON 0.5 : le latent de cette architecture est le `z` ajusté par
+  # l'Algorithme 2 de NOIR, un vecteur de modulation GLOBAL sans structure
+  # spatiale. Le retourner n'a aucun sens géométrique — augmenter par symétrie
+  # exigerait de réajuster `z` sur les volumes retournés, donc de refaire le
+  # precompute. arch_inr.py lève une erreur si cette clé est > 0.
+  flip_lr_prob: 0.0
   flip_axis: 0
   random_crop_prob: 0.0
 

@@ -89,6 +89,13 @@ data:
   encode_tile: [96, 112, 96]
   encode_tile_margin: 16
   split: retro_train
+  # Le checkpoint de production (nRMSE 0.4353) est celui du run 2026-08-14,
+  # le PREMIER à recevoir réellement l'augmentation par flip : jusque-là
+  # `flip_lr_prob: 0.5` était déclaré mais silencieusement ignoré côté
+  # vectorisé (FlatLatentCacheDataset n'acceptait pas l'argument). L'ancienne
+  # référence 0.4354, obtenue sans augmentation, n'était pas reproductible
+  # depuis cette config ; elle a été remplacée. Voir
+  # results/mmfm/comparison_20260814_vectorized_flip/manifest.md
   output_subdir: mmfm/vectorized
   percentile_lower: 0.5
   percentile_upper: 99.5

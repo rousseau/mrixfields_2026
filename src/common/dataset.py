@@ -545,12 +545,40 @@ class FlatLatentCacheDataset(Dataset):
     la boucle d'entraînement.
 
     Retourne (latent_vec, mod_idx, field_idx, class_idx).
+
+    Augmentation par flip : le vecteur étant un latent SPATIAL aplati, le flip
+    ne peut se faire qu'en le remettant en forme, d'où `latent_shape`. Il est
+    donc OBLIGATOIRE dès que `flip_lr_prob > 0` — sans lui on ne saurait pas
+    quel axe retourner. Ce paramètre a longtemps manqué : `flip_lr_prob` était
+    déclaré dans les configs vectorisée et INR mais la classe ne l'acceptait
+    pas, si bien qu'il était silencieusement ignoré et que seul l'UNet
+    bénéficiait de l'augmentation (écart mesuré : 26 % de L2 relatif sur un
+    latent retourné). Une exception vaut mieux qu'un paramètre avalé.
+
+    ATTENTION — ne convient PAS à un latent non spatial. Le `z` d'un INR est un
+    vecteur de modulation GLOBAL, sans structure spatiale : le retourner n'a
+    aucun sens géométrique (il faudrait réajuster `z` sur le volume retourné).
+    Voir `cfm/arch_inr.py`, qui refuse explicitement cette augmentation.
     """
 
-    def __init__(self, cache_dir: Path, cache_root: Path, preload_ram: bool = True):
+    def __init__(self, cache_dir: Path, cache_root: Path, preload_ram: bool = True,
+                 flip_lr_prob: float = 0.0, flip_axis: int = 0,
+                 latent_shape: Optional[Tuple[int, ...]] = None):
         self.cache_dir = Path(cache_dir)
         self.cache_root = Path(cache_root)
         self.preload_ram = preload_ram
+        self.flip_lr_prob = float(flip_lr_prob)
+        self.flip_axis = int(flip_axis)
+        self.latent_shape = tuple(latent_shape) if latent_shape else None
+        if self.flip_lr_prob > 0:
+            if self.latent_shape is None or len(self.latent_shape) != 4:
+                raise ValueError(
+                    "flip_lr_prob > 0 exige latent_shape=(C, H, W, D) : un vecteur "
+                    "aplati ne peut être retourné sans savoir comment le remettre "
+                    "en forme. Reçu latent_shape=" + repr(self.latent_shape)
+                )
+            if not 0 <= self.flip_axis <= 2:
+                raise ValueError(f"flip_axis doit être dans [0, 2], reçu {self.flip_axis}")
 
         index_path = self.cache_dir / "index.json"
         if not index_path.exists():
@@ -562,6 +590,14 @@ class FlatLatentCacheDataset(Dataset):
         if not self.samples:
             raise RuntimeError(f"Cache vide : {index_path}")
         self.flat_dim = self.meta.get("flat_dim")
+        if self.flip_lr_prob > 0:
+            expected = int(np.prod(self.latent_shape))
+            if self.flat_dim is not None and self.flat_dim != expected:
+                raise ValueError(
+                    f"latent_shape={self.latent_shape} donne {expected} éléments, "
+                    f"mais le cache annonce flat_dim={self.flat_dim} — le flip "
+                    "remettrait le vecteur dans une forme qui n'est pas la sienne."
+                )
         n_fields = len(self.meta["fields"])
         for s in self.samples:
             s["class_idx"] = s["mod_idx"] * n_fields + s["field_idx"]
@@ -574,12 +610,26 @@ class FlatLatentCacheDataset(Dataset):
     def _load_disk(self, rel_path: str) -> torch.Tensor:
         return torch.load(self.cache_root / rel_path, map_location="cpu").to(torch.float32)
 
+    def _get_latent(self, rel_path: str) -> torch.Tensor:
+        # `.clone()` quand le tenseur vient de la RAM partagée : le flip crée un
+        # nouveau tenseur, mais sans copie une modification en place ultérieure
+        # corromprait le cache pour tous les échantillons suivants.
+        if self.preload_ram:
+            return self._ram[rel_path].clone()
+        return self._load_disk(rel_path)
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
         s = self.samples[idx]
-        z = self._ram[s["path"]] if self.preload_ram else self._load_disk(s["path"])
+        z = self._get_latent(s["path"])
+        if self.flip_lr_prob > 0 and random.random() < self.flip_lr_prob:
+            # Le vecteur est un latent spatial aplati : on le remet en forme,
+            # on retourne l'axe demandé, puis on ré-aplatit. `+1` car dim 0 =
+            # canaux, exactement comme LatentCacheDataset — les deux
+            # architectures voient ainsi la MÊME augmentation.
+            z = torch.flip(z.view(self.latent_shape), dims=[self.flip_axis + 1]).reshape(-1)
         return (
             z,
             torch.tensor(s["mod_idx"], dtype=torch.long),
