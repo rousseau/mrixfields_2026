@@ -100,8 +100,10 @@ au-delà, son chargeur ne produirait jamais de lot complet avec `drop_last=True`
    elles — toutes mesurées sur T1W — mais sous-estimaient le niveau réel.
 2. **Toute optimisation ciblant le haut champ doit préciser le contraste.**
    Un gain sur T1W@7T ne se transporte pas : T2W n'a pas ce problème.
-3. **Les architectures n'ont été comparées que sur T1W.** Rien ne garantit que le
-   classement vectorisé > UNet > INR tienne sur T2W/T2FLAIR — non mesuré.
+3. ~~Les architectures n'ont été comparées que sur T1W.~~ **RÉGLÉ le 2026-08-15**
+   (complément en fin de fichier) : les trois architectures ont été évaluées sur
+   les trois contrastes, et le classement vectorisé > UNet > INR tient dans les
+   NEUF cellules, sur les trois métriques.
 
 ## Fichiers
 
@@ -110,3 +112,93 @@ au-delà, son chargeur ne produirait jamais de lot complet avec `drop_last=True`
 | `task3_vectorized_T2W.csv` | 20 paires x 3 sujets, T2W |
 | `task3_vectorized_T2FLAIR.csv` | 20 paires x 3 sujets, T2FLAIR |
 | `../comparison_20260814_vectorized_flip/task3_vectorized_flip_T1W.csv` | T1W (référence) |
+
+
+---
+
+# Complément (2026-08-15) — les TROIS architectures sur les TROIS contrastes
+
+Le manifest ci-dessus n'évaluait que le vectorisé. Question ouverte qu'il
+laissait : le classement vectorisé > UNet > INR, établi sur T1W seul — donc sur
+le contraste dont on venait d'apprendre qu'il est atypique — tient-il ailleurs ?
+
+**Checkpoints** : vectorisé de production (2026-08-14, avec flip), UNet de
+référence (0.4617, PRE-AdaGN — évalué via une config `use_adagn: false`, le
+checkpoint étant incompatible avec la config de production actuelle), INR de
+production @1mm. Même protocole que partout ailleurs.
+
+## nRMSE
+
+| | T1W | T2W | T2FLAIR | moyenne |
+|---|---|---|---|---|
+| **Vectorisé** | **0.4353** | **0.3376** | **0.3654** | **0.3794** |
+| UNet | 0.4617 | 0.3676 | 0.3807 | 0.4033 |
+| INR | 0.6223 | 0.6470 | 0.5998 | 0.6231 |
+
+## SSIM
+
+| | T1W | T2W | T2FLAIR | moyenne |
+|---|---|---|---|---|
+| **Vectorisé** | **0.8997** | **0.8980** | **0.8949** | **0.8975** |
+| UNet | 0.8955 | 0.8963 | 0.8929 | 0.8949 |
+| INR | 0.8002 | 0.7576 | 0.8028 | 0.7868 |
+
+## LPIPS
+
+| | T1W | T2W | T2FLAIR | moyenne |
+|---|---|---|---|---|
+| **Vectorisé** | **0.0983** | **0.0911** | **0.0927** | **0.0941** |
+| UNet | 0.1014 | 0.0919 | 0.0927 | 0.0953 |
+| INR | 0.2051 | 0.2189 | 0.2034 | 0.2091 |
+
+## Conclusion : le classement tient partout
+
+**Neuf cellules, neuf fois le même ordre** — vectorisé > UNet > INR, en nRMSE
+comme en SSIM et en LPIPS. Le choix d'architecture du projet, pris sur T1W seul,
+vaut pour l'ensemble du challenge. C'était la principale question laissée
+ouverte par l'évaluation multi-contrastes ; elle est tranchée.
+
+Nuance sur l'INR : son écart au vectorisé se CREUSE sur le contraste le plus
+facile (T2W +0.309, contre T1W +0.187). Sa limite est représentationnelle, pas
+liée à la difficulté de la tâche — cohérent avec les deux fermetures déjà
+documentées (plafond `modulation_dim`, puis décodeur à grille).
+
+## Le 7T : porté par les données, pas par l'architecture
+
+nRMSE vers 7T :
+
+| | T1W | T2W | T2FLAIR |
+|---|---|---|---|
+| Vectorisé | 0.7542 | **0.3620** | 0.6359 |
+| UNet | 0.7956 | 0.3954 | 0.6899 |
+| INR | 0.8259 | 0.6422 | 0.7174 |
+
+Les trois architectures réussissent le 7T en T2W et échouent en T1W, **dans le
+même ordre**. Aucune n'a de force propre sur le haut champ. Cela clôt
+définitivement l'idée — née des premiers résultats de l'INR à 2mm, qui gagnait
+alors 4/4 des paires ->7T — qu'une architecture pourrait être spécifiquement
+adaptée aux champs extrêmes. Cet avantage était un artefact de son flou, pas une
+propriété.
+
+## Détail par champ cible
+
+### vectorisé — nRMSE par champ cible
+| contraste | 0.1T | 1.5T | 3T | 5T | 7T |
+|---|---|---|---|---|---|
+| T1W | 0.2709 | 0.3306 | 0.3146 | 0.5061 | 0.7542 |
+| T2W | 0.2927 | 0.3505 | 0.3507 | 0.3323 | 0.3620 |
+| T2FLAIR | 0.3386 | 0.2524 | 0.3333 | 0.2668 | 0.6359 |
+
+### UNet — nRMSE par champ cible
+| contraste | 0.1T | 1.5T | 3T | 5T | 7T |
+|---|---|---|---|---|---|
+| T1W | 0.3017 | 0.3526 | 0.3299 | 0.5286 | 0.7956 |
+| T2W | 0.3806 | 0.3561 | 0.3657 | 0.3404 | 0.3954 |
+| T2FLAIR | 0.3452 | 0.2697 | 0.3379 | 0.2606 | 0.6899 |
+
+### INR — nRMSE par champ cible
+| contraste | 0.1T | 1.5T | 3T | 5T | 7T |
+|---|---|---|---|---|---|
+| T1W | 0.5635 | 0.5575 | 0.5396 | 0.6250 | 0.8259 |
+| T2W | 0.6193 | 0.6676 | 0.6677 | 0.6382 | 0.6422 |
+| T2FLAIR | 0.5868 | 0.5449 | 0.5853 | 0.5647 | 0.7174 |

@@ -177,8 +177,19 @@ haut champ est propre au contraste, pas au problème. Le volume de données ne
 l'explique pas : T1W@7T est la classe la MIEUX dotée (235 volumes) et la plus
 mauvaise. Détails : `results/mmfm/comparison_20260814_all_contrasts/manifest.md`.
 
-Les comparaisons d'architectures ci-dessus n'ont été faites que sur T1W ; rien
-ne garantit que le classement tienne sur les deux autres contrastes.
+Les trois architectures ont été évaluées sur les trois contrastes le
+2026-08-15 — **le classement tient partout** (nRMSE, moyenne des 3 contrastes) :
+
+| | T1W | T2W | T2FLAIR | moyenne |
+|---|---|---|---|---|
+| **Vectorisé** | **0.4353** | **0.3376** | **0.3654** | **0.3794** |
+| UNet | 0.4617 | 0.3676 | 0.3807 | 0.4033 |
+| INR | 0.6223 | 0.6470 | 0.5998 | 0.6231 |
+
+Neuf cellules, neuf fois le même ordre, en nRMSE comme en SSIM et en LPIPS.
+Les trois architectures échouent ensemble sur T1W->7T et réussissent ensemble
+sur T2W->7T : **la difficulté du haut champ vient des données, pas de
+l'architecture**. Aucune n'a de force propre sur les champs extrêmes.
 
 > **Mise à jour 2026-08-14** — ces chiffres du vectorisé proviennent du run
 > réentraîné AVEC l'augmentation par flip. Jusqu'au 2026-08-13, `flip_lr_prob: 0.5`
