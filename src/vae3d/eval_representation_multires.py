@@ -30,7 +30,7 @@ import csv
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -116,12 +116,19 @@ def patched_reconstruct(
 # ---------------------------------------------------------------------------
 
 
-def _build_model(device, finetuned: bool):
+def _build_model(device, ckpt_path: Optional[str] = None):
+    """MedVAE pré-entraîné, ou chargé depuis `ckpt_path` (fine-tuning maison).
+
+    `ckpt_path=None` = poids Stanford bruts — c'est la RÉFÉRENCE de production
+    depuis le 2026-08-07 : mesuré, notre fine-tuning L1 plafonne le SSIM
+    d'auto-reconstruction à ~0.88 à toute résolution là où le pré-entraîné
+    atteint 0.915 à 1mm et 0.948 à 0.5mm.
+    """
     from medvae import MVAE
 
     model = MVAE(model_name="medvae_4_1_3d", modality="mri").to(device)
-    if finetuned:
-        ckpt = torch.load(FINETUNED_CKPT, map_location=device, weights_only=False)
+    if ckpt_path:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
     model.eval()
     for p in model.parameters():
@@ -135,6 +142,9 @@ def main():
     ap.add_argument("--patch", type=int, nargs=3, default=[64, 64, 64])
     ap.add_argument("--overlap", type=float, default=0.5)
     ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--checkpoints", nargs="+", default=None, metavar="NOM=CHEMIN",
+                    help="Variantes a comparer au pre-entraine, ex. "
+                         "lpips=outputs/medvae/runs/medvae_finetune_lpips/weights/model_best.pth")
     ap.add_argument("--output", default=str(OUT_CSV))
     args = ap.parse_args()
 
@@ -145,9 +155,20 @@ def main():
     out_csv = Path(args.output)
 
     print(f"Patch {patch}  stride {stride}  (overlap {args.overlap})")
-    variants = {"pretrained": _build_model(device, False)}
-    if Path(FINETUNED_CKPT).exists():
-        variants["finetuned_l1"] = _build_model(device, True)
+    # `--checkpoints nom=chemin ...` permet de comparer plusieurs recettes de
+    # fine-tuning en une passe, sur exactement les mêmes volumes et le même
+    # découpage en patches — c'est la seule facon d'attribuer un écart à la
+    # recette plutot qu'au protocole.
+    variants = {"pretrained": _build_model(device, None)}
+    for spec in (args.checkpoints or []):
+        if "=" not in spec:
+            raise SystemExit(f"--checkpoints attend nom=chemin, recu : {spec!r}")
+        name, path = spec.split("=", 1)
+        if not Path(path).exists():
+            raise SystemExit(f"checkpoint introuvable : {path}")
+        variants[name] = _build_model(device, path)
+    if not args.checkpoints and Path(FINETUNED_CKPT).exists():
+        variants["finetuned_l1"] = _build_model(device, FINETUNED_CKPT)
 
     rows = []
     for spacing in args.resolutions:
