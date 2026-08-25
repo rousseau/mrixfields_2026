@@ -184,12 +184,35 @@ Les trois architectures ont été évaluées sur les trois contrastes le
 |---|---|---|---|---|
 | **Vectorisé** | **0.4353** | **0.3376** | **0.3654** | **0.3794** |
 | UNet | 0.4617 | 0.3676 | 0.3807 | 0.4033 |
-| INR | 0.6223 | 0.6470 | 0.5998 | 0.6231 |
+| INR | 0.6383 | 0.6470 | 0.5998 | 0.6284 |
+| *Identité (témoin)* | *0.9273* | *0.3859* | *0.5574* | *0.6235* |
 
 Neuf cellules, neuf fois le même ordre, en nRMSE comme en SSIM et en LPIPS.
 Les trois architectures échouent ensemble sur T1W->7T et réussissent ensemble
 sur T2W->7T : **la difficulté du haut champ vient des données, pas de
 l'architecture**. Aucune n'a de force propre sur les champs extrêmes.
+
+> **Mise à jour 2026-08-25** — deux corrections et trois réserves, toutes
+> mesurées dans `results/mmfm/qualitative_20260824/manifest.md` :
+> - La case INR/T1W valait **0.6223**, chiffre du run `latent_dim = 4096`, alors
+>   que le checkpoint de production a `latent_dim = 129024` et donne **0.6383**
+>   (recalculé sur les prédictions présentes sur disque). La ligne INR mélangeait
+>   deux modèles. Corrigée ci-dessus ; le classement n'en dépend pas.
+> - Le **témoin identité** existe désormais sur les 3 contrastes. Il change la
+>   lecture : le gain paire-à-paire du vectorisé sur « ne rien faire » vaut
+>   +34.1 % en T1W, **+5.6 %** en T2W et **−1.2 %** en T2FLAIR (battu sur 11
+>   paires sur 20). En SSIM, le témoin bat les trois architectures sur T2W.
+> - L'écart vectorisé/UNet (0.015-0.030) est **plus petit que l'écart-type
+>   inter-sujet** (0.06-0.16) ; il n'est significatif ni sur T2W ni sur T2FLAIR.
+> - Le « mur du 7T » en T1W vient pour **46 %** d'un seul volume (sujet 0009,
+>   T1W@7T, 2.6x plus sombre que celui du sujet 0006). Sans lui : 0.4048.
+> - **80 % de l'énergie de l'erreur** en T1W et T2FLAIR disparaît avec un seul
+>   facteur d'échelle par volume : l'anatomie est juste, le niveau est faux.
+>   La part SYSTÉMATIQUE en est récupérable sans oracle : une constante de
+>   recalage par paire (source→cible), estimée en laissant le sujet évalué de
+>   côté, ferait passer le vectorisé de **0.3794 à 0.3231 (−15 %) sans
+>   réentraînement**. C'est la piste à instruire avant tout travail
+>   supplémentaire sur l'architecture.
 
 > **Mise à jour 2026-08-14** — ces chiffres du vectorisé proviennent du run
 > réentraîné AVEC l'augmentation par flip. Jusqu'au 2026-08-13, `flip_lr_prob: 0.5`
