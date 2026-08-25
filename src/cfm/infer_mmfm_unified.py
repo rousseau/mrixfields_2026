@@ -260,6 +260,7 @@ def process_volume_unified(
     tgt_lo: Optional[float] = None,
     tgt_hi: Optional[float] = None,
     target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    compat_precompute: bool = False,
     encode_tile=None,
     encode_tile_margin: int = 16,
 ):
@@ -305,6 +306,27 @@ def process_volume_unified(
         vol_1mm_norm = _normalize_global(vol_1mm, p_lo, p_hi)
         lo = hi = None
 
+    if compat_precompute:
+        # DRAPEAU D'AUDIT — aligne le prétraitement d'inférence sur celui du
+        # PRECOMPUTE, qui est ce sur quoi le flow a réellement été entraîné.
+        #
+        # Deux écarts, tous deux mesurés (results/mmfm/audit_20260825/) :
+        #   1. ORIENTATION. `resample_to_output` ci-dessus réoriente en canonique
+        #      RAS ; le precompute (`common.io.load_nifti_volume` ->
+        #      `resample_volume`, scipy.zoom sur le tableau brut) garde la native
+        #      LAS. L'axe 0 est donc INVERSÉ entre les deux. On le retourne ici
+        #      et on le remet à l'endroit sur la prédiction, ce qui préserve la
+        #      comptabilité d'affine de nibabel (le precompute, lui, ne
+        #      maintient pas d'affine, on ne peut donc pas simplement l'appeler).
+        #   2. NORMALISATION. Le cache INR (`inr_932b0b37`) porte
+        #      `field_norm_stats_path: None` : il a été construit avec les
+        #      percentiles PAR VOLUME. La dénormalisation de SORTIE reste, elle,
+        #      celle du champ cible — c'est la seule échelle disponible à
+        #      l'inférence.
+        vol_1mm_norm = np.ascontiguousarray(vol_1mm_norm[::-1])
+        if norm_mode == "field_fixed":
+            vol_1mm_norm = np.ascontiguousarray(_normalize_global(vol_1mm, p_lo, p_hi)[::-1])
+
     if center_crop_only:
         # center_crop_or_pad_np (not raw slicing) so this also handles the
         # "fullfov" case where patch_size exceeds the native resampled FOV
@@ -343,6 +365,9 @@ def process_volume_unified(
         pred_1mm = _blend_patches(
             patch_outputs, positions, blend_weights, padded_shape, vol_1mm_norm.shape, pad
         )
+
+    if compat_precompute:
+        pred_1mm = np.ascontiguousarray(pred_1mm[::-1])
 
     img_pred_1mm = nib.Nifti1Image(pred_1mm.astype(np.float32), img_src_1mm.affine)
     img_pred_05mm = nib_proc.resample_from_to(img_pred_1mm, img_src, order=1)
@@ -391,6 +416,7 @@ def infer_single(
     use_ema: bool = True,
     device: str = "cuda",
     field_norm_stats_path: Optional[str] = None,
+    compat_precompute: bool = False,
 ):
     input_path = Path(input_path)
     if not input_path.exists():
@@ -488,6 +514,7 @@ def infer_single(
         p_lo=p_lo, p_hi=p_hi, device=dev, use_amp=use_amp, amp_dtype=amp_dtype,
         norm_mode=norm_mode, center_crop_only=center_crop_only,
         fixed_lo=fixed_lo, fixed_hi=fixed_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
+                    compat_precompute=compat_precompute,
         target_spacing=target_spacing,
         encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
     )
@@ -519,6 +546,7 @@ def infer_batch(
     skip_existing: bool = False,
     device: str = "cuda",
     field_norm_stats_path: Optional[str] = None,
+    compat_precompute: bool = False,
 ):
     field_norm_stats = None
     if field_norm_stats_path:
@@ -629,6 +657,7 @@ def infer_batch(
                     p_lo=p_lo, p_hi=p_hi, device=dev, use_amp=use_amp, amp_dtype=amp_dtype,
                     norm_mode=norm_mode, center_crop_only=center_crop_only,
                     fixed_lo=fixed_lo, fixed_hi=fixed_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
+                    compat_precompute=compat_precompute,
                     target_spacing=target_spacing,
                     encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
                 )
@@ -664,6 +693,9 @@ def parse_args():
     p.add_argument("--center_crop_only", action="store_true")
     p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--no_ema", action="store_true")
+    p.add_argument("--compat_precompute", action="store_true",
+                   help="AUDIT : aligne l'orientation et la normalisation source de "
+                        "l'inference sur celles du precompute (voir process_volume_unified).")
     p.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     return p.parse_args()
 
@@ -678,6 +710,7 @@ def main():
             n_steps=args.n_steps, norm_mode=args.norm_mode,
             center_crop_only=args.center_crop_only,
             use_ema=not args.no_ema, device=args.device,
+            compat_precompute=args.compat_precompute,
             field_norm_stats_path=args.field_norm_stats,
         )
     else:
@@ -696,6 +729,7 @@ def main():
             env_path=args.env, n_steps=args.n_steps, norm_mode=args.norm_mode,
             center_crop_only=args.center_crop_only,
             use_ema=not args.no_ema, skip_existing=args.skip_existing, device=args.device,
+            compat_precompute=args.compat_precompute,
             field_norm_stats_path=args.field_norm_stats,
         )
 
