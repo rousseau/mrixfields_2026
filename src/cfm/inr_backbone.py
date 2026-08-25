@@ -93,6 +93,15 @@ def sample_points(
     n = coords.shape[0]
     if num_points >= n:
         return coords, values
+    if generator is None:
+        # Le tirage doit être REPRODUCTIBLE : le cache de latents est construit
+        # une fois par `precompute_inr_latents.py` et le `z` est re-ajusté à
+        # l'inférence. Sans graine, deux ajustements du même volume diffèrent de
+        # ~4.4 % en L2 relatif (mesuré, results/mmfm/audit_20260825/latent_drift.csv),
+        # ce qui constituait le plancher irréductible de l'audit. La graine est
+        # dérivée du contenu pour rester indépendante de l'ordre d'appel.
+        generator = torch.Generator(device=coords.device)
+        generator.manual_seed(int(n) * 1_000_003 + int(num_points))
     idx = torch.randperm(n, device=coords.device, generator=generator)[:num_points]
     return coords[idx], values[:, idx]
 

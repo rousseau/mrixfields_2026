@@ -35,6 +35,9 @@ def build_vector_mmfm(cfg: dict, latent_dim: int, n_classes: int) -> VectorMMFM:
         time_embed_dim=int(m.get("time_embed_dim", 256)),
         class_embed_dim=int(m.get("class_embed_dim", 128)),
         dropout=float(m.get("dropout", 0.0)),
+        # (0, 1) par defaut : sans effet, les checkpoints existants restent valides.
+        latent_mean=float(m.get("latent_mean", 0.0)),
+        latent_scale=float(m.get("latent_scale", 1.0)),
     )
 
 

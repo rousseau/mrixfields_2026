@@ -109,6 +109,8 @@ class VectorMMFM(nn.Module):
         time_embed_dim: int = 256,
         class_embed_dim: int = 128,
         dropout: float = 0.0,
+        latent_mean: float = 0.0,
+        latent_scale: float = 1.0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -130,6 +132,22 @@ class VectorMMFM(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, latent_dim),
         )
+        # Standardisation de l'ENTREE. Les LayerNorm ci-dessus sont toutes APRES
+        # `input_proj`, donc aucune ne peut rattraper un ecart d'echelle entre
+        # latents : elles normalisent la SOMME projetee. Mesure : le latent INR a
+        # un ecart-type par element de 1.92e-4 contre 18.1 pour MedVAE (94 000x).
+        # Avec les plongements temps+classe en O(1), la contribution du latent au
+        # pre-activation est ~150x plus faible que celle du conditionnement, et le
+        # reseau devient aveugle a son entree -- mesure sur le checkpoint INR de
+        # production : changer de sujet ne change la vitesse que de 0.43 %
+        # (cos = 0.999993). Voir results/mmfm/audit_20260825/manifest.md.
+        #
+        # Les tampons sont NON PERSISTANTS : ils n'entrent pas dans le state_dict,
+        # donc les checkpoints anterieurs se chargent inchanges. Les valeurs
+        # viennent de la config et sont consignees dans `arch_meta`.
+        # Defauts (0, 1) = strictement sans effet.
+        self.register_buffer("latent_mean", torch.tensor(float(latent_mean)), persistent=False)
+        self.register_buffer("latent_scale", torch.tensor(float(latent_scale)), persistent=False)
 
     def forward(
         self,
@@ -140,11 +158,16 @@ class VectorMMFM(nn.Module):
     ) -> torch.Tensor:
         time_feat = sinusoidal_time_embedding(timesteps, self.time_embed_dim)
         class_feat = self.class_embed(class_labels)
-        h = torch.cat([z_t_vec, z_src_vec, time_feat, class_feat], dim=1)
+        z_t_n = (z_t_vec - self.latent_mean) / self.latent_scale
+        z_src_n = (z_src_vec - self.latent_mean) / self.latent_scale
+        h = torch.cat([z_t_n, z_src_n, time_feat, class_feat], dim=1)
         h = self.input_proj(h)
         for block in self.blocks:
             h = block(h)
-        return self.output_head(h)
+        # La vitesse est une difference de latents divisee par dt : elle porte
+        # l'echelle du latent, pas son decalage. On remultiplie donc par `scale`
+        # SANS rajouter `mean`.
+        return self.output_head(h) * self.latent_scale
 
 
 def cycle_rollout_vector(

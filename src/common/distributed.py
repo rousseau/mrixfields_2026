@@ -105,17 +105,40 @@ class EMAModel:
         ema_model = ema.shadow  # or ema.apply_shadow(model)
     """
 
-    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999, warmup: bool = True):
         self.decay = decay
+        self.warmup = warmup
+        self.num_updates = 0
         self.shadow = deepcopy(model).eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
 
+    def current_decay(self) -> float:
+        """Décroissance effective au pas courant.
+
+        Sans échauffement, l'ombre part des poids ALÉATOIRES et n'en sort qu'en
+        `1/(1-decay)` pas : à `decay=0.9999` et 25000 pas, `0.9999**25000 = 0.082`,
+        soit **8.2 % de l'initialisation aléatoire encore présente** dans les poids
+        servis à l'inférence. Mesuré : fatal pour un latent de faible amplitude
+        (l'INR, écart-type 1.92e-4, où ce résidu vaut 216x le signal — nRMSE 0.6383
+        contre 0.4430 sans EMA), inoffensif pour MedVAE (écart-type 18.1, 0.4359
+        contre 0.4353). Voir results/mmfm/audit_20260825/manifest.md.
+
+        L'échauffement (Diffusers) démarre à une décroissance faible et rejoint
+        `decay` : le résidu d'initialisation disparaît en quelques centaines de pas
+        au lieu de survivre à tout l'entraînement.
+        """
+        if not self.warmup:
+            return self.decay
+        return min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+
     @torch.no_grad()
     def update(self, model: torch.nn.Module):
         src = model.module if hasattr(model, "module") else model
+        d = self.current_decay()
+        self.num_updates += 1
         for s_param, param in zip(self.shadow.parameters(), src.parameters()):
-            s_param.copy_(s_param * self.decay + param.data * (1.0 - self.decay))
+            s_param.copy_(s_param * d + param.data * (1.0 - d))
 
     def state_dict(self) -> dict:
         return self.shadow.state_dict()

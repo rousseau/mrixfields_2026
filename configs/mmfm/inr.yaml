@@ -24,7 +24,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 method: mmfm3d_inr
-task_name: mmfm_inr
+task_name: mmfm_inr_std
 
 vae:
   vae_type: identity
@@ -76,6 +76,15 @@ inr_backbone:
 # latent KL/perceptuel de MedVAE), pas sa taille ni la capacité du flow qui
 # l'exploite. Voir docs/MMFM_ARCHITECTURE.md et memory pour le détail.
 model:
+  # Standardisation de l'entree du flow (VectorMMFM). Mesure sur le cache
+  # inr_932b0b37 : moyenne -1.4e-07, ecart-type 2.16e-04 (dispersion par
+  # dimension de 2.9x seulement, un scalaire suffit). Sans elle, le latent pese
+  # ~150x moins que les plongements temps+classe dans le pre-activation et le
+  # reseau est aveugle a son entree (0.43 % de variation de vitesse en changeant
+  # de sujet). Reparametrisation exacte : elle ne change pas la fonction, elle
+  # remet l'optimisation dans un regime ou lr=2e-5 a un sens.
+  latent_mean: 0.0
+  latent_scale: 2.16e-4
   hidden_dim: 1024
   num_blocks: 4
   time_embed_dim: 256
@@ -104,7 +113,9 @@ data:
   - 1.0
   - 1.0
   split: retro_train
-  output_subdir: mmfm/inr
+  # Run du 2026-08-25 : standardisation de l'entree du flow (voir model.latent_scale)
+  # + EMA avec echauffement. L'ancien checkpoint reste sous outputs/mmfm/inr.
+  output_subdir: mmfm/inr_std
   percentile_lower: 0.5
   percentile_upper: 99.5
   max_volumes_per_class:
@@ -148,6 +159,15 @@ train:
   ema_decay: 0.9999
 
 inference:
+  # Le cache de production (inr_932b0b37) a ete bati SANS field_norm_stats
+  # (percentiles PAR VOLUME) et par le chemin de reechantillonnage du precompute,
+  # qui garde l'orientation native LAS. L'inference doit s'y conformer, sinon le
+  # flow recoit un latent deplace de 69 % en L2 relatif -- il n'a jamais vu de
+  # cerveau mirrore (arch_inr.py refuse le flip, donc aucune tolerance).
+  # Mesure : nRMSE T1W 0.6383 -> 0.3787 avec ces deux cles + EMA corrigee.
+  # Voir results/mmfm/audit_20260825/manifest.md.
+  compat_orientation: true
+  compat_source_norm: true
   n_steps: 20
   ode_solver: euler
   norm_mode: field_fixed

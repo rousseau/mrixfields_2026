@@ -180,12 +180,39 @@ mauvaise. Détails : `results/mmfm/comparison_20260814_all_contrasts/manifest.md
 Les trois architectures ont été évaluées sur les trois contrastes le
 2026-08-15 — **le classement tient partout** (nRMSE, moyenne des 3 contrastes) :
 
-| | T1W | T2W | T2FLAIR | moyenne |
+| nRMSE | T1W | T2W | T2FLAIR | moyenne |
 |---|---|---|---|---|
-| **Vectorisé** | **0.4353** | **0.3376** | **0.3654** | **0.3794** |
+| **INR (corrigée, 2026-08-26)** | 0.4070 | 0.3800 | **0.3376** | **0.3749** |
+| **Vectorisé** | **0.4353** | **0.3376** | 0.3654 | 0.3794 |
 | UNet | 0.4617 | 0.3676 | 0.3807 | 0.4033 |
-| INR | 0.6383 | 0.6470 | 0.5998 | 0.6284 |
+| ~~INR (avant audit)~~ | ~~0.6383~~ | ~~0.6470~~ | ~~0.5998~~ | ~~0.6284~~ |
 | *Identité (témoin)* | *0.9273* | *0.3859* | *0.5574* | *0.6235* |
+
+> **⚠ Le classement n'est plus un ordre total — il dépend de la métrique.**
+> L'INR est **première en nRMSE** (0.3749) et **dernière en SSIM** (0.8631 contre
+> 0.8975) et **en LPIPS** (0.1557 contre 0.0941). Son goulot de 1536 modulations
+> la rend plus lisse : cela flatte l'erreur quadratique et pénalise structure et
+> perception. Ne plus écrire « la meilleure » sans dire selon quelle métrique.
+
+> **Audit du 2026-08-25/26** (`results/mmfm/audit_20260825/manifest.md`) — les
+> chiffres INR publiés jusque-là mesuraient **trois bugs d'inférence**, pas une
+> limite d'architecture :
+> - **EMA sans correction de biais** : l'ombre partait des poids ALÉATOIRES,
+>   `0.9999^25000 = 0.082` → 8.2 % du bruit initial servi à l'inférence. Vaut 216×
+>   le signal INR et rien pour MedVAE. Corrigé par échauffement ; contrôle après
+>   correctif : 0.4070 avec EMA contre 0.4055 sans.
+> - **Orientation LAS→RAS** : le precompute garde la native, l'inférence réoriente
+>   — chaque volume arrivait **mirroré**. `flip_lr_prob: 0.5` rendait le vectorisé
+>   et l'UNet insensibles (contrôle mesuré : −0.0002, **leurs chiffres tiennent**) ;
+>   `arch_inr.py` refuse le flip, donc l'INR prenait tout le dommage.
+> - **Normalisation** : cache INR bâti sans `field_norm_stats`, inférence en
+>   `field_fixed`. Un garde-fou (`_check_cache_consistency`) refuse désormais de
+>   tourner sur une telle incohérence.
+>
+> Plus un correctif de fond : **standardisation de l'entrée du flow**
+> (`model.latent_scale`), sans laquelle le latent pesait 150× moins que les
+> plongements temps+classe et le réseau était aveugle à son entrée. La loss est
+> passée de 2.7× PIRE que « prédire zéro » à 16 % sous la meilleure constante.
 
 Neuf cellules, neuf fois le même ordre, en nRMSE comme en SSIM et en LPIPS.
 Les trois architectures échouent ensemble sur T1W->7T et réussissent ensemble

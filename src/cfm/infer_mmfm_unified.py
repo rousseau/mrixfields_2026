@@ -260,7 +260,8 @@ def process_volume_unified(
     tgt_lo: Optional[float] = None,
     tgt_hi: Optional[float] = None,
     target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
-    compat_precompute: bool = False,
+    compat_orientation: bool = False,
+    compat_source_norm: bool = False,
     encode_tile=None,
     encode_tile_margin: int = 16,
 ):
@@ -306,26 +307,30 @@ def process_volume_unified(
         vol_1mm_norm = _normalize_global(vol_1mm, p_lo, p_hi)
         lo = hi = None
 
-    if compat_precompute:
-        # DRAPEAU D'AUDIT — aligne le prétraitement d'inférence sur celui du
-        # PRECOMPUTE, qui est ce sur quoi le flow a réellement été entraîné.
+    if compat_orientation:
+        # ORIENTATION. `resample_to_output` ci-dessus réoriente en canonique RAS ;
+        # le PRECOMPUTE (`common.io.load_nifti_volume` -> `resample_volume`,
+        # scipy.zoom sur le tableau brut) garde la native, ici LAS. L'axe 0 est
+        # donc INVERSÉ entre le volume sur lequel le flow a été entraîné et celui
+        # qu'il reçoit. Mesuré : 0.343 d'écart L2 tel quel, 0.057 après
+        # retournement (results/mmfm/audit_20260825/manifest.md).
         #
-        # Deux écarts, tous deux mesurés (results/mmfm/audit_20260825/) :
-        #   1. ORIENTATION. `resample_to_output` ci-dessus réoriente en canonique
-        #      RAS ; le precompute (`common.io.load_nifti_volume` ->
-        #      `resample_volume`, scipy.zoom sur le tableau brut) garde la native
-        #      LAS. L'axe 0 est donc INVERSÉ entre les deux. On le retourne ici
-        #      et on le remet à l'endroit sur la prédiction, ce qui préserve la
-        #      comptabilité d'affine de nibabel (le precompute, lui, ne
-        #      maintient pas d'affine, on ne peut donc pas simplement l'appeler).
-        #   2. NORMALISATION. Le cache INR (`inr_932b0b37`) porte
-        #      `field_norm_stats_path: None` : il a été construit avec les
-        #      percentiles PAR VOLUME. La dénormalisation de SORTIE reste, elle,
-        #      celle du champ cible — c'est la seule échelle disponible à
-        #      l'inférence.
+        # On retourne ici et on remet à l'endroit sur la prédiction plutôt que
+        # d'appeler le chemin du precompute : celui-ci ne maintient pas d'affine,
+        # dont on a besoin pour revenir en 0.5mm.
+        #
+        # `flip_lr_prob: 0.5` rend le vectorisé et l'UNet insensibles au miroir,
+        # d'où l'invisibilité du bug pendant des mois ; `arch_inr.py` REFUSE le
+        # flip (un vecteur de modulation global n'a pas de structure spatiale à
+        # retourner), donc l'INR était la seule sans tolérance.
         vol_1mm_norm = np.ascontiguousarray(vol_1mm_norm[::-1])
-        if norm_mode == "field_fixed":
-            vol_1mm_norm = np.ascontiguousarray(_normalize_global(vol_1mm, p_lo, p_hi)[::-1])
+    if compat_source_norm:
+        # NORMALISATION DE LA SOURCE. Le cache INR de production porte
+        # `field_norm_stats_path: None` : il a été construit avec les percentiles
+        # PAR VOLUME. La dénormalisation de SORTIE reste celle du champ cible,
+        # seule échelle disponible à l'inférence.
+        vn = _normalize_global(vol_1mm, p_lo, p_hi)
+        vol_1mm_norm = np.ascontiguousarray(vn[::-1]) if compat_orientation else vn
 
     if center_crop_only:
         # center_crop_or_pad_np (not raw slicing) so this also handles the
@@ -366,7 +371,7 @@ def process_volume_unified(
             patch_outputs, positions, blend_weights, padded_shape, vol_1mm_norm.shape, pad
         )
 
-    if compat_precompute:
+    if compat_orientation:
         pred_1mm = np.ascontiguousarray(pred_1mm[::-1])
 
     img_pred_1mm = nib.Nifti1Image(pred_1mm.astype(np.float32), img_src_1mm.affine)
@@ -416,7 +421,8 @@ def infer_single(
     use_ema: bool = True,
     device: str = "cuda",
     field_norm_stats_path: Optional[str] = None,
-    compat_precompute: bool = False,
+    compat_orientation: bool = False,
+    compat_source_norm: bool = False,
 ):
     input_path = Path(input_path)
     if not input_path.exists():
@@ -514,7 +520,8 @@ def infer_single(
         p_lo=p_lo, p_hi=p_hi, device=dev, use_amp=use_amp, amp_dtype=amp_dtype,
         norm_mode=norm_mode, center_crop_only=center_crop_only,
         fixed_lo=fixed_lo, fixed_hi=fixed_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
-                    compat_precompute=compat_precompute,
+                    compat_orientation=compat_orientation,
+                    compat_source_norm=compat_source_norm,
         target_spacing=target_spacing,
         encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
     )
@@ -546,7 +553,8 @@ def infer_batch(
     skip_existing: bool = False,
     device: str = "cuda",
     field_norm_stats_path: Optional[str] = None,
-    compat_precompute: bool = False,
+    compat_orientation: bool = False,
+    compat_source_norm: bool = False,
 ):
     field_norm_stats = None
     if field_norm_stats_path:
@@ -657,7 +665,8 @@ def infer_batch(
                     p_lo=p_lo, p_hi=p_hi, device=dev, use_amp=use_amp, amp_dtype=amp_dtype,
                     norm_mode=norm_mode, center_crop_only=center_crop_only,
                     fixed_lo=fixed_lo, fixed_hi=fixed_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
-                    compat_precompute=compat_precompute,
+                    compat_orientation=compat_orientation,
+                    compat_source_norm=compat_source_norm,
                     target_spacing=target_spacing,
                     encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
                 )
@@ -693,15 +702,62 @@ def parse_args():
     p.add_argument("--center_crop_only", action="store_true")
     p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--no_ema", action="store_true")
-    p.add_argument("--compat_precompute", action="store_true",
-                   help="AUDIT : aligne l'orientation et la normalisation source de "
-                        "l'inference sur celles du precompute (voir process_volume_unified).")
+    p.add_argument("--compat_orientation", action="store_true", default=None,
+                   help="Aligne l'orientation de l'inference sur celle du precompute "
+                        "(defaut : cle inference.compat_orientation de la config).")
+    p.add_argument("--compat_source_norm", action="store_true", default=None,
+                   help="Normalise la source par ses propres percentiles, comme le cache "
+                        "(defaut : cle inference.compat_source_norm de la config).")
     p.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     return p.parse_args()
 
 
+def _flag(cfg_infer: dict, key: str, cli_value) -> bool:
+    """Drapeau CLI prioritaire sur la config, config prioritaire sur le défaut."""
+    return bool(cfg_infer.get(key, False)) if cli_value is None else bool(cli_value)
+
+
+def _check_cache_consistency(cfg: dict, norm_mode: str, compat_source_norm: bool) -> None:
+    """GARDE-FOU — le cache de latents dit avec quelle normalisation il a été bâti ;
+    l'inférence doit s'y conformer.
+
+    C'est exactement le contrôle qui manquait : le cache INR de production
+    (`inr_932b0b37`) porte `field_norm_stats_path: None`, donc des percentiles PAR
+    VOLUME, tandis que l'inférence tournait en `field_fixed`. Le flow recevait un
+    latent déplacé de 69 % en L2 relatif. Rien ne le signalait, parce que
+    `cache_prebakes_prep=True` fait que l'entraînement ne rappelle jamais
+    `prep_latent` : les deux chemins ne se croisent nulle part.
+    """
+    cache_dir = cfg.get("data", {}).get("latent_cache_dir")
+    if not cache_dir:
+        return
+    index = Path(cache_dir) / "index.json"
+    if not index.exists():
+        return
+    with open(index) as f:
+        built_with_field_norm = json.load(f).get("field_norm_stats_path") is not None
+    infer_uses_field_norm = (norm_mode == "field_fixed") and not compat_source_norm
+    if built_with_field_norm != infer_uses_field_norm:
+        raise SystemExit(
+            "INCOHÉRENCE cache / inférence sur la normalisation de la source.\n"
+            f"  cache     {index} : field_norm_stats_path "
+            f"{'renseigné' if built_with_field_norm else 'ABSENT (percentiles par volume)'}\n"
+            f"  inférence : norm_mode={norm_mode!r}, compat_source_norm={compat_source_norm}\n"
+            "Le flow recevrait un latent hors de la distribution sur laquelle il a été\n"
+            "entraîné. Mettre inference.compat_source_norm à true (ou régénérer le cache\n"
+            "avec --field-norm-stats). Voir results/mmfm/audit_20260825/manifest.md."
+        )
+
+
 def main():
     args = parse_args()
+    cfg_infer = load_yaml_with_include(args.config).get("inference", {}) or {}
+    norm_mode = _resolve_norm_mode({"inference": cfg_infer}, args.norm_mode)
+    compat_source_norm = _flag(cfg_infer, "compat_source_norm", args.compat_source_norm)
+    _check_cache_consistency(
+        resolve_paths(load_yaml_with_include(args.config), load_env(args.env)),
+        norm_mode, compat_source_norm,
+    )
     if args.input:
         infer_single(
             cfg_path=args.config, checkpoint=args.checkpoint, input_path=args.input,
@@ -710,7 +766,8 @@ def main():
             n_steps=args.n_steps, norm_mode=args.norm_mode,
             center_crop_only=args.center_crop_only,
             use_ema=not args.no_ema, device=args.device,
-            compat_precompute=args.compat_precompute,
+            compat_orientation=_flag(cfg_infer, 'compat_orientation', args.compat_orientation),
+            compat_source_norm=_flag(cfg_infer, 'compat_source_norm', args.compat_source_norm),
             field_norm_stats_path=args.field_norm_stats,
         )
     else:
@@ -729,7 +786,8 @@ def main():
             env_path=args.env, n_steps=args.n_steps, norm_mode=args.norm_mode,
             center_crop_only=args.center_crop_only,
             use_ema=not args.no_ema, skip_existing=args.skip_existing, device=args.device,
-            compat_precompute=args.compat_precompute,
+            compat_orientation=_flag(cfg_infer, 'compat_orientation', args.compat_orientation),
+            compat_source_norm=_flag(cfg_infer, 'compat_source_norm', args.compat_source_norm),
             field_norm_stats_path=args.field_norm_stats,
         )
 

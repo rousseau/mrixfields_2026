@@ -219,3 +219,163 @@ sa source que le vectorisé. Elle n'est pas une identité déguisée.
 | `task3_vectorized_noema_T1W.csv` | A5 — témoin |
 | `latent_drift.csv` | A2–A4 — dérive du latent par variante |
 | `src/cfm/audit_inr_latent.py` | l'outil de mesure de la dérive |
+
+---
+
+# Phase B — correctifs de fond (2026-08-25/26)
+
+Quatre correctifs, chacun vérifié séparément.
+
+## B3 — EMA avec échauffement : validé par un contrôle direct
+
+`common/distributed.py::EMAModel.current_decay` : la décroissance démarre à
+`(1+t)/(10+t)` et rejoint `decay`. Le résidu d'initialisation aléatoire disparaît
+en quelques centaines de pas au lieu de survivre à tout l'entraînement.
+`ema_num_updates` est sauvegardé au checkpoint pour qu'une reprise ne
+réinitialise pas l'échauffement.
+
+| modèle réentraîné, T1W | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| avec EMA (échauffée) | 0.4070 | 0.8606 | 0.1572 |
+| sans EMA | 0.4055 | 0.8603 | 0.1575 |
+
+**Écart 0.0015 — du bruit.** Avant correctif, le même écart valait **0.195**
+(0.6383 contre 0.4430). L'EMA est redevenue utilisable.
+
+## B4 — Tirage de points graîné
+
+`inr_backbone.sample_points` tirait avec `generator=None` : deux ajustements du
+même volume différaient de 4.4 % en L2 relatif, ce qui constituait le plancher
+irréductible de l'audit. La graine est dérivée du contenu (taille du nuage,
+budget de points), donc indépendante de l'ordre d'appel. Déterminisme vérifié.
+
+## B1 — Prétraitement aligné, et le garde-fou qui manquait
+
+Le drapeau d'audit est devenu deux clés de config orthogonales,
+`inference.compat_orientation` et `inference.compat_source_norm`, activées dans
+`configs/mmfm/inr.yaml` avec la mesure en commentaire.
+
+**Décision d'architecture** : aligner l'inférence sur le precompute, et non
+l'inverse. Réorienter le precompute en canonique serait plus propre mais imposerait
+de régénérer les trois caches et invaliderait le vectorisé et l'UNet.
+
+Surtout, `_check_cache_consistency` lit l'`index.json` du cache et **refuse de
+tourner** si la normalisation d'inférence contredit celle qui a servi à le bâtir.
+Testé dans les deux sens. C'est le contrôle qui manquait : `cache_prebakes_prep=True`
+fait que l'entraînement ne rappelle jamais `prep_latent`, donc les deux chemins ne
+se croisent nulle part et rien ne pouvait signaler leur dérive.
+
+### Contrôle : le vectorisé gagne-t-il à ne plus tourner mirroré ?
+
+| Vectorisé, T1W | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| production (miroir toléré) | 0.4353 | 0.8997 | 0.0983 |
+| orientation alignée | 0.4351 | 0.8998 | 0.0984 |
+
+**Neutre (−0.0002).** L'augmentation par flip l'avait réellement rendu invariant.
+**Les chiffres publiés du vectorisé et de l'UNet n'ont pas à être révisés** — ce
+que le périmètre « les trois architectures » laissait craindre.
+
+## B2 — Standardisation de l'entrée du flow
+
+`VectorMMFM` ne normalisait pas ses entrées : les `LayerNorm` sont toutes APRÈS
+`input_proj`, donc elles normalisent la somme projetée et ne peuvent pas rattraper
+un écart d'échelle. Ajout de `latent_mean`/`latent_scale` en tampons **non
+persistants** (les checkpoints existants se chargent inchangés) avec défauts
+`(0, 1)` strictement sans effet — vérifié, ainsi que l'équivariance d'échelle.
+
+Mesuré sur le cache : moyenne −1.4e-07, écart-type **2.16e-04**, dispersion par
+dimension de 2.9× seulement — un scalaire suffit.
+
+### La loss d'entraînement, enfin
+
+| | prédire zéro | meilleure constante | loss finale | min |
+|---|---|---|---|---|
+| ancien run | 4.02e-4 | 3.88e-4 | **1.10e-3** (2.7× PIRE) | — |
+| **standardisé** | 4.02e-4 | 3.88e-4 | **3.37e-4** | **2.92e-4** |
+
+Le flow passe de « 2.7× pire que prédire zéro » à 16 % sous la meilleure
+constante. C'est une reparamétrisation exacte : elle ne change pas la classe de
+fonctions, elle remet l'optimisation dans un régime où `lr=2e-5` a un sens.
+
+## B6 — Le tableau final, trois architectures x trois contrastes
+
+### nRMSE
+
+| | T1W | T2W | T2FLAIR | moyenne |
+|---|---|---|---|---|
+| *Identité* | *0.9273* | *0.3859* | *0.5574* | *0.6235* |
+| INR publiée (avant audit) | 0.6383 | 0.6470 | 0.5998 | 0.6284 |
+| INR phase A (correctifs d'inférence seuls) | **0.3787** | 0.4296 | 0.3391 | 0.3824 |
+| **INR phase B (réentraînée standardisée)** | 0.4070 | 0.3800 | **0.3376** | **0.3749** |
+| Vectorisé | 0.4353 | **0.3376** | 0.3654 | 0.3794 |
+| UNet | 0.4617 | 0.3676 | 0.3807 | 0.4033 |
+
+### SSIM
+
+| | T1W | T2W | T2FLAIR | moyenne |
+|---|---|---|---|---|
+| *Identité* | *0.8699* | *0.9084* | *0.8864* | *0.8882* |
+| INR publiée | 0.7966 | 0.7576 | 0.8028 | 0.7856 |
+| INR phase B | 0.8606 | 0.8579 | 0.8708 | 0.8631 |
+| **Vectorisé** | **0.8997** | 0.8980 | **0.8949** | **0.8975** |
+| UNet | 0.8955 | 0.8963 | 0.8929 | 0.8949 |
+
+### LPIPS
+
+| | T1W | T2W | T2FLAIR | moyenne |
+|---|---|---|---|---|
+| INR publiée | 0.2061 | 0.2189 | 0.2034 | 0.2095 |
+| INR phase B | 0.1572 | 0.1592 | 0.1507 | 0.1557 |
+| **Vectorisé** | **0.0983** | **0.0911** | **0.0927** | **0.0941** |
+| UNet | 0.1014 | 0.0919 | 0.0927 | 0.0953 |
+
+## Conclusions de la phase B
+
+1. **L'INR devient la meilleure architecture en nRMSE** (0.3749 contre 0.3794 pour
+   le vectorisé) et **reste nettement la dernière en SSIM et LPIPS** (0.8631 contre
+   0.8975 ; 0.1557 contre 0.0941). Le classement du projet n'est plus un ordre
+   total : il dépend de la métrique. Son goulot de 1536 modulations la rend plus
+   lisse, ce qui flatte l'erreur quadratique et pénalise structure et perception.
+2. **Le réentraînement aide en moyenne mais pas sur T1W** : phase B 0.3749 contre
+   phase A 0.3824, alors que sur T1W seul la phase A gagne (0.3787 contre 0.4070).
+   T1W est le contraste atypique, comme déjà établi le 2026-08-14.
+3. **Sixième occurrence, la plus nette : la loss d'entraînement ne prédit rien.**
+   Elle a été divisée par 3.3 (1.10e-3 → 3.37e-4) et a franchi le seuil du
+   prédicteur constant ; le score T1W s'est **dégradé** (0.3787 → 0.4070). Dans un
+   espace latent à faible structure commune, un flow qui bouge davantage prend
+   plus de risques qu'il n'en gagne.
+4. **Le vrai plafond restant est représentationnel, et il est mesuré** :
+
+   | | énergie portée par la moyenne commune | dispersion du nuage |
+   |---|---|---|
+   | MedVAE | **91.3 %** | 0.416 (amas serré) |
+   | INR | **25.1 %** | 1.221 (quasi isotrope) |
+
+   Le latent INR est un nuage presque isotrope autour de zéro : chaque volume
+   pointe dans une direction quasi aléatoire, conséquence d'ajuster chaque volume
+   indépendamment depuis `z = 0` en 20 pas. Il y a intrinsèquement peu de structure
+   commune à exploiter — ce n'est plus un bug, c'est la géométrie du latent.
+   **Piste suivante s'il y en a une** : canoniser l'ajustement (initialiser `z`
+   depuis un prior appris ou depuis le latent source) pour créer de la structure
+   partagée. C'est une modification du precompute (~6 h).
+
+## Décision : quel checkpoint devient la référence INR
+
+`outputs/mmfm/inr_std/weights/model_final.pth` (phase B). Non pour sa marge sur
+T1W — la phase A y fait mieux — mais parce qu'il est **meilleur en moyenne sur les
+trois contrastes** et surtout **le seul reproductible depuis sa config** : la
+phase A dépend d'un ancien checkpoint plus un `--no_ema` qui n'existe que pour
+contourner un bug désormais corrigé. Même raisonnement que pour la promotion du
+checkpoint vectorisé avec flip le 2026-08-14.
+
+## Ce qui reste ouvert
+
+- **B5, régénérer le cache INR** sous le prétraitement corrigé (~6 h) : non fait.
+  Le plancher de dérive résiduel (4.4 %) vient du tirage non graîné de l'ancien
+  cache ; il disparaîtra à la prochaine régénération, désormais déterministe.
+- **La géométrie du latent** (point 4) : la seule piste à fort levier restante.
+- **Le garde-fou permanent** : `test_inr_backbone_smoke.py` assère toujours
+  `nrmse_fg < 0.6` à 2 mm. À remplacer par un test à la résolution de production,
+  avec un seuil dérivé des mesures, et un test qui compare la loss finale à
+  « prédire zéro ». Ce dernier tient en trois lignes et aurait tout arrêté.

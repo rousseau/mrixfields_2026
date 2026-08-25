@@ -174,6 +174,8 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
     def arch_meta_dict() -> dict:
         return {
             "latent_dim": int(latent_dim),
+            "latent_mean": float(cfg.get("model", {}).get("latent_mean", 0.0)),
+            "latent_scale": float(cfg.get("model", {}).get("latent_scale", 1.0)),
             "volume_size": tuple(int(v) for v in volume_size),
             "inr_backbone_checkpoint": str(cfg.get("inr_backbone", {}).get("checkpoint", "")),
             "fit_points": fit_points,

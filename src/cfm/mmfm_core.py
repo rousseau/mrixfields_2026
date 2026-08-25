@@ -356,6 +356,10 @@ def _save_checkpoint(
             "iter": step,
             "model": model.state_dict(),
             "ema": ema.state_dict(),
+            # `num_updates` pilote l'échauffement de l'EMA (voir EMAModel.current_decay) :
+            # sans lui, une reprise repartirait d'une décroissance faible et
+            # écraserait la moyenne accumulée.
+            "ema_num_updates": ema.num_updates,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict() if use_scaler else None,
@@ -637,6 +641,9 @@ def train(
         raw_model.load_state_dict(adapter.checkpoint_key_remap(state["model"]))
         if "ema" in state:
             ema.load_state_dict(adapter.checkpoint_key_remap(state["ema"]))
+            # checkpoints antérieurs au correctif : pas de compteur, on prend
+            # l'itération, qui en est le bon substitut.
+            ema.num_updates = int(state.get("ema_num_updates", state.get("iter", 0)))
         if resume_weights_only:
             if is_main_process():
                 print(f"Reprise (poids seuls) depuis : {resume_path}")
