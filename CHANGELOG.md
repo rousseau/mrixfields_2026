@@ -57,6 +57,29 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-08-26 — Audit du code : le flow est entraîné sur des cibles contradictoires
+
+**Verdict : un défaut structurel trouvé, une attribution obtenue, deux hypothèses
+réfutées par la mesure.** Détail :
+`results/mmfm/audit_20260826_order3/manifest.md`.
+
+| # | piste | résultat |
+|---|---|---|
+| 1 | Marginales non alignées vs droites entre TOUTES les paires | **DÉFAUT** — le point intermédiaire s'écarte de la corde de **0.72 à 1.32 fois sa longueur** (2.3 à 5.6× le bruit). Les cibles d'entraînement se contredisent. `adjacent_only: true` existe et **n'a jamais été testé**. |
+| 2 | D'où vient le flou de l'INR ? | **ATTRIBUÉ** — auto-reconstruction sans flow 0.036-0.090, pipeline complet 0.047-0.090, plafond 0.61. **Le flow n'ajoute aucun flou** ; aucun correctif de flow ne la rendra nette. |
+| 3 | Loss L1 au lieu de L2 | **RÉFUTÉ** — écart théorique réel (le flow matching exige une espérance, donc un coût quadratique), mais mesuré : ‖médiane‖/‖moyenne‖ = 0.98-1.01 et la médiane conserve **106-144 %** des hautes fréquences. N'explique pas le lissage. |
+| 4 | Interpolation finale `order=1` → `order=3` | **RÉFUTÉ** — le plafond monte fort (netteté 0.615 → 0.910, nRMSE 0.0382 → 0.0251 sur un volume parfait) mais **de bout en bout c'est neutre** : vectorisé 0.4353 → 0.4374 en nRMSE, 0.0983 → 0.0969 en LPIPS. Le modèle n'a rien à mettre dans la bande gagnée. Défaut laissé à 1. |
+
+**Correction d'une conclusion antérieure** : « les modèles ne restituent qu'un
+tiers de la finesse » confondait la **résolution de travail** et un défaut de
+modèle. Rapporté au plafond atteignable à 1 mm, le vectorisé est à **66 % / 108 %
+/ 50 %** — il le dépasse sur T2W. L'INR est à 12 %. Conséquence pour la décision
+MedVAE-LPIPS : **un meilleur VAE à 1 mm ne peut pas franchir 0.61**.
+
+**Vérifié sans défaut** : intégration d'Euler, convention d'intervalle
+décodeur→dénormalisation, remplissage `reflect`, masque par le support de la
+source (0.01-0.09 % d'énergie), tuiles disjointes sans moyennage.
+
 ## 2026-08-26 (soir) — Évaluation refaite sur l'INR corrigée
 
 **Verdict : INR et vectorisé sont indiscernables en nRMSE ; le vectorisé reste
@@ -337,3 +360,5 @@ une lacune que ce journal existe pour ne plus reproduire.
 | 4 | Constante de recalage d'intensité par paire (−15 % mesuré, sans réentraîner) : pas de données appariées pour l'ajuster hors des 3 sujets d'évaluation ; voie non testée = comparer les distributions d'intensité prédites et réelles, sans appariement | à instruire |
 | 5 | Adoption du MedVAE perceptuel : régénérer les caches + réentraîner les deux flows | >1 jour |
 | 6 | Géométrie du latent INR (25 % de structure commune contre 91 %) : canoniser l'ajustement | ~6 h |
+| 7 | **`adjacent_only: true` jamais testé** alors que les marginales ne sont pas alignées (écart 0.72-1.32× la corde) — cibles d'entraînement contradictoires | ~2 h + éval |
+| 8 | Loss L1 au lieu de L2 : écart à la dérivation du flow matching, effet mesuré nul sur les symptômes, à corriger par correction | 15 min + réentraînement |

@@ -262,6 +262,7 @@ def process_volume_unified(
     target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     compat_orientation: bool = False,
     compat_source_norm: bool = False,
+    upsample_order: int = 1,
     encode_tile=None,
     encode_tile_margin: int = 16,
 ):
@@ -375,7 +376,24 @@ def process_volume_unified(
         pred_1mm = np.ascontiguousarray(pred_1mm[::-1])
 
     img_pred_1mm = nib.Nifti1Image(pred_1mm.astype(np.float32), img_src_1mm.affine)
-    img_pred_05mm = nib_proc.resample_from_to(img_pred_1mm, img_src, order=1)
+    # Dernier reechantillonnage de la chaine : de la resolution de travail vers la
+    # grille native 0.5mm sur laquelle l'evaluateur compare. `upsample_order` par
+    # defaut a 1 (lineaire) -- c'est ce qui a produit TOUS les chiffres publies.
+    #
+    # L'ordre 3 a ete teste le 2026-08-26 et le resultat est NEUTRE, contrairement a
+    # ce que le plafond laissait esperer :
+    #   - sur un volume PARFAIT (aller-retour 0.5 -> 1 -> 0.5mm), l'ordre 3 fait
+    #     passer la nettete de 0.615 a 0.910 et le nRMSE de 0.0382 a 0.0251 : le
+    #     plafond de la chaine monte nettement ;
+    #   - de bout en bout, il ne se passe presque rien. Vectorise T1W nRMSE
+    #     0.4353 -> 0.4374, SSIM 0.8997 -> 0.8966, LPIPS 0.0983 -> 0.0969 ; INR
+    #     0.4070 -> 0.4075 / 0.8606 -> 0.8602 / 0.1572 -> 0.1561.
+    # Lecture : le plafond n'est PAS contraignant, le modele n'a rien a mettre dans
+    # la bande de frequences que l'ordre 3 laisse passer. Un peu de LPIPS gagne, un
+    # peu de nRMSE perdu -- un arbitrage perception/distorsion, pas un gain.
+    # Le defaut reste donc 1, pour ne pas invalider les resultats en place.
+    # Voir results/mmfm/audit_20260826_order3/manifest.md.
+    img_pred_05mm = nib_proc.resample_from_to(img_pred_1mm, img_src, order=upsample_order)
     pred_05mm = img_pred_05mm.get_fdata(dtype=np.float32)
 
     if norm_mode == "field_fixed":
@@ -423,6 +441,7 @@ def infer_single(
     field_norm_stats_path: Optional[str] = None,
     compat_orientation: bool = False,
     compat_source_norm: bool = False,
+    upsample_order: int = 1,
 ):
     input_path = Path(input_path)
     if not input_path.exists():
@@ -522,6 +541,7 @@ def infer_single(
         fixed_lo=fixed_lo, fixed_hi=fixed_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
                     compat_orientation=compat_orientation,
                     compat_source_norm=compat_source_norm,
+                    upsample_order=upsample_order,
         target_spacing=target_spacing,
         encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
     )
@@ -555,6 +575,7 @@ def infer_batch(
     field_norm_stats_path: Optional[str] = None,
     compat_orientation: bool = False,
     compat_source_norm: bool = False,
+    upsample_order: int = 1,
 ):
     field_norm_stats = None
     if field_norm_stats_path:
@@ -667,6 +688,7 @@ def infer_batch(
                     fixed_lo=fixed_lo, fixed_hi=fixed_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
                     compat_orientation=compat_orientation,
                     compat_source_norm=compat_source_norm,
+                    upsample_order=upsample_order,
                     target_spacing=target_spacing,
                     encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
                 )
@@ -702,6 +724,9 @@ def parse_args():
     p.add_argument("--center_crop_only", action="store_true")
     p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--no_ema", action="store_true")
+    p.add_argument("--upsample_order", type=int, default=None,
+                   help="ordre d'interpolation du dernier reechantillonnage vers 0.5mm "
+                        "(defaut 1 = celui de tous les chiffres publies ; 3 teste et NEUTRE)")
     p.add_argument("--compat_orientation", action="store_true", default=None,
                    help="Aligne l'orientation de l'inference sur celle du precompute "
                         "(defaut : cle inference.compat_orientation de la config).")
@@ -768,6 +793,8 @@ def main():
             use_ema=not args.no_ema, device=args.device,
             compat_orientation=_flag(cfg_infer, 'compat_orientation', args.compat_orientation),
             compat_source_norm=_flag(cfg_infer, 'compat_source_norm', args.compat_source_norm),
+            upsample_order=int(args.upsample_order if args.upsample_order is not None
+                               else cfg_infer.get('upsample_order', 1)),
             field_norm_stats_path=args.field_norm_stats,
         )
     else:
@@ -788,6 +815,8 @@ def main():
             use_ema=not args.no_ema, skip_existing=args.skip_existing, device=args.device,
             compat_orientation=_flag(cfg_infer, 'compat_orientation', args.compat_orientation),
             compat_source_norm=_flag(cfg_infer, 'compat_source_norm', args.compat_source_norm),
+            upsample_order=int(args.upsample_order if args.upsample_order is not None
+                               else cfg_infer.get('upsample_order', 1)),
             field_norm_stats_path=args.field_norm_stats,
         )
 
