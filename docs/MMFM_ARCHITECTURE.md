@@ -135,6 +135,11 @@ PYTHONPATH=src python src/evaluation/evaluate.py \
 
 ## Résultats de référence
 
+> L'historique complet des expériences — chaque test, son chiffre, son verdict et
+> son manifeste — est dans **[`../CHANGELOG.md`](../CHANGELOG.md)**. Les tableaux
+> ci-dessous en sont l'extrait « état courant ».
+
+
 La comparaison à trois architectures, à code strictement identique (même dataloader, sampler,
 couplage OT-CFM, loss, pipeline d'inférence — seule l'architecture diffère) est documentée dans
 `results/mmfm/comparison_20260801_final/manifest.md` (checkpoints de production, 20 paires × 3
