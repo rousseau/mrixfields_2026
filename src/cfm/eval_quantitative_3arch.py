@@ -56,7 +56,12 @@ FIELDS = ["0.1T", "1.5T", "3T", "5T", "7T"]
 MODALITIES = ["T1W", "T2W", "T2FLAIR"]
 PAIRS = [f"{a}_to_{b}" for a in FIELDS for b in FIELDS if a != b]
 
-OUTDIR = Path("results/mmfm/qualitative_20260824")
+# Répertoire de sortie PAR DÉFAUT seulement — surchargeable par `--outdir`.
+# Codé en dur, il a fait écraser les CSV d'une campagne précédente par une
+# nouvelle : les chiffres cités par son manifeste n'étaient plus étayés par les
+# fichiers du dépôt. Toujours passer --outdir pour une nouvelle campagne.
+DEFAULT_OUTDIR = Path("results/mmfm/qualitative_20260824")
+OUTDIR = DEFAULT_OUTDIR
 FIELD_NORM_STATS = Path("configs/mmfm/field_norm_stats.json")
 REF_IDENTITY_T1W = Path("results/mmfm/comparison_20260813_unet_adagn/task3_identity_baseline_T1W.csv")
 
@@ -532,7 +537,12 @@ def main():
                          "(1.0 = cerveau entier ; 0.5 = interieur seul, sans les bords)")
     ap.add_argument("--check-pairs", nargs="+", default=["3T_to_7T", "0.1T_to_1.5T", "7T_to_0.1T"])
     ap.add_argument("--tol", type=float, default=5e-4)
+    ap.add_argument("--outdir", default=str(DEFAULT_OUTDIR),
+                    help="repertoire de sortie ; en passer un NOUVEAU par campagne, "
+                         "sous peine d'ecraser les CSV d'une campagne precedente")
     args = ap.parse_args()
+    global OUTDIR
+    OUTDIR = Path(args.outdir)
     {"identity": mode_identity, "sharpness": mode_sharpness,
      "calibration": mode_calibration, "recalib": mode_recalib,
      "table": mode_table}[args.mode](args)
