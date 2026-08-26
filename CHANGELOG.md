@@ -57,6 +57,37 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-08-26 — `adjacent_only: true` : NÉGATIF, et le mécanisme est réfuté
+
+**Verdict : neutre (34/60 paires, p = 0.18), et PIRE là où le gain était prédit.**
+Détail : `results/mmfm/audit_20260826_adjacent/manifest.md`.
+
+| nRMSE | T1W | T2W | T2FLAIR | moyenne |
+|---|---|---|---|---|
+| toutes paires (production) | 0.4353 | **0.3376** | **0.3654** | **0.3794** |
+| adjacent seulement | **0.4326** | 0.3419 | 0.3691 | 0.3812 |
+
+SSIM et LPIPS : identiques à 0.0002 près.
+
+**La ventilation par longueur de saut inverse la prédiction** — c'est sur les
+sauts longs que l'incohérence des droites devait mordre :
+
+| longueur | n | toutes paires | adjacent | écart | victoires |
+|---|---|---|---|---|---|
+| 1 | 24 | 0.3211 | 0.3211 | +0.0000 | 13/24 |
+| 2 | 18 | 0.4161 | 0.4156 | −0.0005 | 12/18 |
+| 3 | 12 | 0.4298 | 0.4317 | +0.0019 | 7/12 |
+| **4 (0.1T↔7T)** | 6 | **0.4022** | **0.4175** | **+0.0153** | **2/6** |
+
+Monotone et inverse : plus le saut est long, plus la variante cohérente est
+pénalisée. **Entraîner directement la transition longue vaut mieux que l'obtenir
+en intégrant à travers la chaîne.** Le fait mesuré (marginales non alignées,
+écart 0.72-1.32× la corde) reste vrai ; la conséquence que j'en tirais est fausse.
+
+**Ordre de grandeur à retenir** : deux runs de 25 000 itérations de la même
+architecture, ne différant que par ce drapeau, terminent à 0.3794 et 0.3812.
+**Tout écart sous ~0.002 dans ce projet est indistinguable du bruit de run.**
+
 ## 2026-08-26 — Audit du code : le flow est entraîné sur des cibles contradictoires
 
 **Verdict : un défaut structurel trouvé, une attribution obtenue, deux hypothèses
@@ -360,5 +391,4 @@ une lacune que ce journal existe pour ne plus reproduire.
 | 4 | Constante de recalage d'intensité par paire (−15 % mesuré, sans réentraîner) : pas de données appariées pour l'ajuster hors des 3 sujets d'évaluation ; voie non testée = comparer les distributions d'intensité prédites et réelles, sans appariement | à instruire |
 | 5 | Adoption du MedVAE perceptuel : régénérer les caches + réentraîner les deux flows | >1 jour |
 | 6 | Géométrie du latent INR (25 % de structure commune contre 91 %) : canoniser l'ajustement | ~6 h |
-| 7 | **`adjacent_only: true` jamais testé** alors que les marginales ne sont pas alignées (écart 0.72-1.32× la corde) — cibles d'entraînement contradictoires | ~2 h + éval |
 | 8 | Loss L1 au lieu de L2 : écart à la dérivation du flow matching, effet mesuré nul sur les symptômes, à corriger par correction | 15 min + réentraînement |
