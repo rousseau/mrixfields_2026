@@ -54,9 +54,11 @@ RESULTS = Path("results/mmfm")
 V_FLIP = "outputs/mmfm/vectorized_flip/predictions/task3"
 V_PROD = "outputs/mmfm/vectorized/predictions/task3"
 U_PROD = "outputs/mmfm/unet/predictions/task3"
-I_PROD = "outputs/mmfm/inr/predictions/task3"
+I_PROD = "outputs/mmfm/inr_std/predictions/task3"   # INR CORRIGEE (audit phase B)
+I_OLD = "outputs/mmfm/inr/predictions/task3"        # INR d'avant l'audit, gardee comme temoin
 C14 = RESULTS / "comparison_20260814_all_contrasts"
 C07 = RESULTS / "comparison_20260807_1mm"
+AUD = RESULTS / "audit_20260825"
 
 METHODS: List[Tuple[str, Dict[str, Tuple[str, str]]]] = [
     ("Vectorise", {
@@ -69,16 +71,25 @@ METHODS: List[Tuple[str, Dict[str, Tuple[str, str]]]] = [
         "T2W": (U_PROD, str(C14 / "task3_unet_T2W.csv")),
         "T2FLAIR": (U_PROD, str(C14 / "task3_unet_T2FLAIR.csv")),
     }),
+    # INR de reference depuis l'audit du 2026-08-25/26 : checkpoint inr_std
+    # (EMA echauffee + entree du flow standardisee) servi par une inference dont
+    # l'orientation et la normalisation sont alignees sur le precompute.
     ("INR", {
-        # z=129024 et NON task3_inr_1mm_T1W.csv (z=4096, 0.6223) : le checkpoint
-        # de production (arch_meta.latent_dim = 129024) est celui de l'experience
-        # de capacite du 2026-08-11, et c'est lui qui a produit les predictions
-        # presentes sur disque — verifie en recalculant le nRMSE (0.6383).
-        "T1W": (I_PROD, str(C07 / "task3_inr_129k_T1W.csv")),
-        "T2W": (I_PROD, str(C14 / "task3_inr_T2W.csv")),
-        "T2FLAIR": (I_PROD, str(C14 / "task3_inr_T2FLAIR.csv")),
+        "T1W": (I_PROD, str(AUD / "task3_inr_std_T1W.csv")),
+        "T2W": (I_PROD, str(AUD / "task3_inr_std_T2W.csv")),
+        "T2FLAIR": (I_PROD, str(AUD / "task3_inr_std_T2FLAIR.csv")),
     }),
 ]
+
+# Temoin AVANT correctifs, pour montrer sur une meme figure ce que les trois bugs
+# faisaient (EMA sans correction de biais, orientation LAS/RAS, normalisation).
+# `latent_dim = 129024` : ces predictions viennent bien du checkpoint de
+# production de l'epoque, pas du run z=4096 (verifie en recalculant, 0.6383).
+INR_AVANT = ("INR avant audit", {
+    "T1W": (I_OLD, str(C07 / "task3_inr_129k_T1W.csv")),
+    "T2W": (I_OLD, str(C14 / "task3_inr_T2W.csv")),
+    "T2FLAIR": (I_OLD, str(C14 / "task3_inr_T2FLAIR.csv")),
+})
 
 SUBJECTS = ["0006", "0007", "0009"]
 FIELDS = ["0.1T", "1.5T", "3T", "5T", "7T"]
@@ -222,7 +233,8 @@ def make_panel(args, data_root: Path, out: Path) -> None:
     gt = load_vol(gt_path(data_root, mod, tgt_f, sid))
     src = load_vol(gt_path(data_root, mod, src_f, sid))
     preds = []
-    for label, per_mod in METHODS:
+    methods = METHODS + ([INR_AVANT] if args.with_before else [])
+    for label, per_mod in methods:
         if mod not in per_mod:
             raise SystemExit(f"{label} : modalite {mod} non declaree")
         root, csv_path = per_mod[mod]
@@ -431,6 +443,8 @@ def main():
     ap.add_argument("--subject", default="0006")
     ap.add_argument("--slice", type=int, default=None)
     ap.add_argument("--zoom", type=int, nargs=4, default=None, metavar=("Y0", "Y1", "X0", "X1"))
+    ap.add_argument("--with-before", action="store_true",
+                    help="ajoute une colonne avec l'INR d'AVANT l'audit (temoin visuel des bugs)")
     ap.add_argument("--err-scale", type=float, default=0.6,
                     help="haut de l'echelle des cartes d'erreur, en fraction du 99e centile de la verite")
     ap.add_argument("--n-slices", type=int, default=24)

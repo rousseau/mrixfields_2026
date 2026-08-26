@@ -24,8 +24,12 @@ Task 3, 20 paires × 3 sujets, évaluateur officiel, 1 mm, prédictions écrites
 | UNet (`outputs/mmfm/unet`) | 0.4617 | 0.3676 | 0.3807 | 0.4033 | 0.8949 | 0.0953 |
 | *Témoin identité (recopier la source)* | *0.9273* | *0.3859* | *0.5574* | *0.6235* | *0.8882* | — |
 
-**Le classement n'est pas un ordre total** : l'INR est première en nRMSE et
-dernière en SSIM et LPIPS. Ne jamais écrire « la meilleure » sans la métrique.
+**Le classement n'est pas un ordre total.** En moyenne agrégée l'INR devance le
+vectorisé en nRMSE (0.3749 contre 0.3794) — **mais cet avantage n'est pas soutenu
+paire par paire : 29 victoires sur 60, p = 0.65 au test des signes, Wilcoxon
+p = 0.38.** Les deux sont statistiquement indiscernables en nRMSE. Le vectorisé,
+lui, est **nettement devant en SSIM et en LPIPS**. Ne jamais écrire « la
+meilleure » sans la métrique — ni sans le test apparié.
 
 **Planchers connus, à soustraire de toute conclusion** : écrêtage à `hi`
 (0.10–0.13 de nRMSE pour un prédicteur parfait), interpolation 1 mm → 0.5 mm
@@ -53,10 +57,47 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-08-26 (soir) — Évaluation refaite sur l'INR corrigée
+
+**Verdict : INR et vectorisé sont indiscernables en nRMSE ; le vectorisé reste
+nettement devant en SSIM et LPIPS.** Détail :
+`results/mmfm/qualitative_20260826/manifest.md`.
+
+| mesure | résultat |
+|---|---|
+| Tests appariés, 60 paires | INR < vectorisé **29/60** (p = 0.65) ; INR < UNet 35/60 (p = 0.02 Wilcoxon) ; vectorisé < UNet 38/60 (p = 1.4e-4) |
+| Gain sur le témoin identité | INR **+34.9 % T1W, −7.7 % T2W, +3.1 % T2FLAIR** — battue par la recopie sur T2W |
+| Correction d'échelle oracle, INR | **70.4 % T1W / 30.4 % T2W / 66.4 % T2FLAIR** de l'énergie de l'erreur |
+| Netteté, intérieur du cerveau (médiane) | INR **0.09 / 0.05 / 0.06** contre vectorisé 0.36 / 0.40 / 0.26, témoin 1.00 |
+
+**Deux conclusions du 2026-08-25 sont renversées** — toutes deux parce qu'elles
+portaient sur le modèle bogué :
+- « Seuls 20-24 % de l'erreur INR sont d'échelle, sa limite est structurelle » →
+  **66-70 % après correction**. Les trois architectures partagent la même limite
+  dominante : la calibration d'intensité.
+- « L'INR est la plus floue d'un facteur 1.5 à 2 » → **d'un facteur 4 à 8**. Le
+  goulot de 1536 modulations, isolé sans confusion avec les artefacts de bord.
+
+**Correction de framing** : le commit `d8db590` écrivait « l'INR devient première
+en nRMSE ». Vrai de la moyenne agrégée, faux au sens statistique. Corrigé dans le
+manifeste d'audit et dans l'état de référence de ce journal.
+
+Le manifeste du 2026-08-25 (`results/mmfm/qualitative_20260824/manifest.md`) est
+**annoté, pas effacé** : il porte ce qu'on croyait, et l'écart entre les deux
+dates est lui-même un résultat.
+
 ## 2026-08-26 — Audit phase B : correctifs de fond `d8db590`
 
-**Verdict : l'INR passe première en nRMSE (0.3749) et reste dernière en SSIM et
-LPIPS.** Détail : `results/mmfm/audit_20260825/manifest.md`.
+**Verdict : l'INR rejoint le vectorisé en nRMSE (0.3749 contre 0.3794) et reste
+nettement dernière en SSIM et LPIPS.** Détail :
+`results/mmfm/audit_20260825/manifest.md`.
+
+> **Correction du 2026-08-26 (soir)** — le message de commit et le manifeste
+> écrivaient « l'INR devient première en nRMSE ». C'est vrai de la moyenne agrégée
+> et **faux au sens statistique** : 29 victoires sur 60 paires, p = 0.65 au test
+> des signes. Les deux architectures sont indiscernables en nRMSE ; la moyenne est
+> portée par quelques paires à fort écart. Mesuré dans
+> `results/mmfm/qualitative_20260826/manifest.md`.
 
 | correctif | test | résultat |
 |---|---|---|

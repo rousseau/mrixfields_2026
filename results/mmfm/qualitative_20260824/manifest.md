@@ -1,5 +1,28 @@
 # Évaluation qualitative et quantitative des trois architectures — versions de production
 
+> # ⚠ CE DOCUMENT EST PARTIELLEMENT PÉRIMÉ (annoté le 2026-08-26)
+> **Tout ce qui concerne l'INR décrit un modèle qui n'existe plus.** L'audit des
+> 2026-08-25/26 (`../audit_20260825/manifest.md`) a trouvé que ses chiffres
+> mesuraient **trois bugs d'inférence** — EMA sans correction de biais, orientation
+> LAS→RAS, normalisation — et non une limite d'architecture. Après correction,
+> l'INR passe de 0.6383 à **0.4070** sur T1W et de 0.6284 à **0.3749** en moyenne
+> sur les trois contrastes : elle devient **première en nRMSE** au lieu de dernière.
+>
+> Sont périmés ici : toutes les figures montrant l'INR en blobs, sa colonne dans
+> les tableaux, sa part d'erreur d'échelle (20-24 %), son indice de netteté, et
+> les tests appariés vectorisé/INR (58/60 paires — cet écart s'est effondré).
+> L'évaluation refaite sur le modèle corrigé est dans
+> `../qualitative_20260826/manifest.md`.
+>
+> **Restent valides et non remis en cause** : tout ce qui concerne le vectorisé et
+> l'UNet (leurs chiffres ont été explicitement re-contrôlés — orientation alignée :
+> 0.4351 contre 0.4353, EMA : 0.4359 contre 0.4353, tous deux neutres), le témoin
+> identité, les planchers d'écrêtage et d'interpolation, le constat sur n = 3, et
+> la découverte que 80 % de l'erreur du vectorisé est une erreur d'échelle.
+>
+> Ce document n'est pas effacé : il porte ce qu'on croyait, et l'écart entre les
+> deux dates est lui-même le résultat.
+
 **Date** : 2026-08-25
 **Objet** : évaluer les trois approches *dans leur dernière version*, sur les trois
 contrastes, en regardant enfin les images et pas seulement les moyennes.

@@ -332,11 +332,17 @@ fonctions, elle remet l'optimisation dans un régime où `lr=2e-5` a un sens.
 
 ## Conclusions de la phase B
 
-1. **L'INR devient la meilleure architecture en nRMSE** (0.3749 contre 0.3794 pour
-   le vectorisé) et **reste nettement la dernière en SSIM et LPIPS** (0.8631 contre
-   0.8975 ; 0.1557 contre 0.0941). Le classement du projet n'est plus un ordre
-   total : il dépend de la métrique. Son goulot de 1536 modulations la rend plus
-   lisse, ce qui flatte l'erreur quadratique et pénalise structure et perception.
+1. **L'INR rejoint le vectorisé en nRMSE** (0.3749 contre 0.3794) et **reste
+   nettement la dernière en SSIM et LPIPS** (0.8631 contre 0.8975 ; 0.1557 contre
+   0.0941). Son goulot de 1536 modulations la rend plus lisse, ce qui flatte
+   l'erreur quadratique et pénalise structure et perception.
+
+   > **Correction du 2026-08-26 (soir)** — cette section a d'abord écrit « l'INR
+   > devient la meilleure architecture en nRMSE ». C'est vrai de la moyenne
+   > agrégée et **faux au sens statistique** : le test apparié sur les 60 paires
+   > donne **29 victoires sur 60** (signes p = 0.65, Wilcoxon p = 0.38). Les deux
+   > sont indiscernables en nRMSE ; la moyenne est portée par quelques paires à
+   > fort écart. Mesure dans `../qualitative_20260826/manifest.md`.
 2. **Le réentraînement aide en moyenne mais pas sur T1W** : phase B 0.3749 contre
    phase A 0.3824, alors que sur T1W seul la phase A gagne (0.3787 contre 0.4070).
    T1W est le contraste atypique, comme déjà établi le 2026-08-14.
