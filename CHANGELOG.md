@@ -57,6 +57,71 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-08-27 — CAUSE RACINE : le temps n'atteint pas le modèle
+
+**Verdict : défaut trouvé, mesuré à chaque maillon, commun aux TROIS
+architectures.** Détail : `results/mmfm/audit_20260827_refcompare/manifest.md`.
+
+Comparaison demandée à `Genentech/MMFM` (le papier lui-même) et
+`NVIDIA-Medtech/NV-Generate-CTMR`. Les trois codes utilisent *la même* fonction
+`timestep_embedding` (origine `atong01/conditional-flow-matching`), avec
+`max_period = 10000`. **Les deux références multiplient `t` par 1000 avant de
+l'appeler ; nous passons `t ∈ [0,1]` brut.** Introduit au premier commit du flow
+vectorisé (`2f96c13`), jamais revisité depuis.
+
+Avec `t ∈ [0,1]`, l'argument des sinusoïdes ne dépasse jamais 1 : `cos ≈ 1`
+partout, `sin(x) ≈ x`. L'embedding multi-échelle s'effondre en une rampe scalaire.
+
+**La chaîne, mesurée maillon par maillon :**
+
+| # | mesure | actuel | référence (×1000) |
+|---|---|---|---|
+| 1 | rang effectif de l'embedding aux 5 temps (max 4) | **1.22** | 3.98 |
+| 1 | distance entre champs adjacents | 0.682 | 13.024 (**×19**) |
+| 1 | σ3, σ4 en fp32 | 8.3e-3, **2.3e-4** | 9.00, 9.00 |
+| 1 | σ3, σ4 en **bf16** (l'AMP de l'entraînement) | 1.2e-2, 8.1e-3 — *remontées* : le signal est remplacé par du bruit de quantification | inchangées |
+| 2 | part de variance du temps à la 1ʳᵉ couche, EMA de production | **0.0000 %** (1.2e-7) | — |
+| 3 | variation de `v` selon `t`, vectorisé | **0.00 %**, cos(v(0),v(1)) = **1.000000** | — |
+| 3 | *idem selon le SUJET* (témoin) | *10.96 / 14.25 / 29.80 %* | — |
+| 3 | variation de `v` selon `t`, UNet MONAI | 1.71 % / 2.59 % (sujet : 14.65 / 22.30 %) | — |
+| 4 | courbure de la trajectoire / courbure exigée par les données | **1 à 5 %** | — |
+
+**Le vectorisé de production est littéralement aveugle au temps** : sa vitesse
+est numériquement identique à `t = 0` et à `t = 1`. Une vitesse constante intègre
+une droite — et c'est ce qu'on observe : déviation à la corde 0.1T→7T de
+0.005–0.023 aux ancres intermédiaires, quand les marginales réelles s'en écartent
+de **0.37 à 0.90**. Les champs intermédiaires sont donc rendus comme des points
+d'un segment entre 0.1T et 7T : **contraste faux et apparence moyennée, donc
+lissée**. Les deux symptômes signalés, un seul défaut, les trois architectures.
+
+Portée : `mmfm_vectorized.py` sert le vectorisé **et** l'INR (`arch_inr.py`
+importe `build_vector_mmfm`) ; l'UNet passe le même `t` à MONAI, dont
+`get_timestep_embedding` est la même formule. L'UNet s'en tire un peu mieux
+(MONAI additionne l'embedding dans chaque resblock via un MLP appris, au lieu de
+le noyer dans une concaténation à 258 432 canaux) mais reste ~9× plus sensible
+au sujet qu'au champ visé.
+
+**Second déséquilibre, même famille** : `latent_scale` n'existe que dans
+`inr.yaml`. Le vectorisé et l'UNet tournent avec latent d'écart-type **21.98**
+contre un embedding de temps à **0.027**. C'est l'image en miroir du bug INR
+corrigé en phase B ; ce côté-ci n'avait jamais été regardé.
+
+**Correctif** : une ligne dans `mmfm_vectorized.py`, une dans `arch_unet.py`.
+**Mais il invalide les trois checkpoints** (le sens de l'entrée temporelle
+change) et impose ~25 000 itérations de réentraînement chacun. **Non appliqué,
+décision à prendre.**
+
+**Écarts secondaires relevés, non testés** : loss L1 alors que les **9** scripts
+d'entraînement de la référence utilisent MSE (dette n°7, corroborée de
+l'extérieur) · **aucune guidance sans classifieur** chez nous, présente et
+*sélectionnée* dans les deux références · interpolant : la référence enchaîne des
+transports OT pour former une trajectoire couplée et y ajuste **une spline
+cubique** (cible continue en `t`), nous tirons des droites par paire (cible
+discontinue aux ancres) — en linéaire les deux coïncident, l'ingrédient non
+testé est donc le **cubique** · `identity_prob: 0.1` apprend `v = 0` à un `t`
+uniforme, sans équivalent dans aucune des deux références · NVIDIA dénormalise
+l'IRM sur une plage globale **fixe** `[0, 1000]`, nous par percentiles.
+
 ## 2026-08-26 — `adjacent_only: true` : NÉGATIF, et le mécanisme est réfuté
 
 **Verdict : neutre (34/60 paires, p = 0.18), et PIRE là où le gain était prédit.**
@@ -83,6 +148,18 @@ Monotone et inverse : plus le saut est long, plus la variante cohérente est
 pénalisée. **Entraîner directement la transition longue vaut mieux que l'obtenir
 en intégrant à travers la chaîne.** Le fait mesuré (marginales non alignées,
 écart 0.72-1.32× la corde) reste vrai ; la conséquence que j'en tirais est fausse.
+
+> **Relecture du 2026-08-27 — « le mécanisme est réfuté » était une erreur de
+> lecture.** `adjacent_only` oblige le saut long à s'obtenir en intégrant un
+> chemin *courbé* à travers les intermédiaires : précisément ce qu'un modèle
+> aveugle au temps ne peut pas faire (mesuré depuis : cos(v(0),v(1)) = 1.000000).
+> Entraîner la paire directement lui donne une cible en ligne droite qu'il *peut*
+> représenter. L'échec sur le saut 4 est donc un **second symptôme** du défaut
+> d'échelle du temps, pas une réfutation de la non-colinéarité. Le remède était
+> bloqué par un défaut situé en amont de lui. À vitesse constante, « adjacent » et
+> « toutes paires » convergent d'ailleurs vers la même droite — d'où l'écart de
+> 0.0018, cohérent avec du bruit de run. Voir
+> `results/mmfm/audit_20260827_refcompare/manifest.md` §6.
 
 **Ordre de grandeur à retenir** : deux runs de 25 000 itérations de la même
 architecture, ne différant que par ce drapeau, terminent à 0.3794 et 0.3812.
@@ -392,3 +469,7 @@ une lacune que ce journal existe pour ne plus reproduire.
 | 5 | Adoption du MedVAE perceptuel : régénérer les caches + réentraîner les deux flows | >1 jour |
 | 6 | Géométrie du latent INR (25 % de structure commune contre 91 %) : canoniser l'ajustement | ~6 h |
 | 7 | Loss L1 au lieu de L2 : écart à la dérivation du flow matching, effet mesuré nul sur les symptômes, à corriger par correction | 15 min + réentraînement |
+| 8 | **Échelle du temps (`t * 1000` avant l'embedding) — cause racine mesurée le 2026-08-27.** 2 lignes, mais invalide les 3 checkpoints | 10 min + 3 réentraînements |
+| 9 | Standardisation du latent pour le vectorisé et l'UNet (`latent_scale` n'existe que dans `inr.yaml` ; latent σ=21.98 contre temps σ=0.027) | 10 min + réentraînement |
+| 10 | Guidance sans classifieur : absente chez nous, présente dans les deux références | ~2 h + réentraînement |
+| 11 | Interpolant cubique sur trajectoire couplée par chaînage OT (méthode réelle du papier MMFM) au lieu de droites par paire | ~1 jour |
