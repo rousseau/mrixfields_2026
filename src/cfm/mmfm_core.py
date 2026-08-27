@@ -850,7 +850,12 @@ def train(
             record = {
                 "iter": step + 1,
                 "loss": round(avg_recent, 6),
-                "grad_norm": round(float(grad_norm), 4),
+                # 4 CHIFFRES SIGNIFICATIFS, pas 4 decimales : avec round(x, 4)
+                # toute norme < 5e-5 s'ecrivait "0.0". Le flow INR (latent a
+                # l'echelle 2.6e-4, donc gradients ~1e-4) apparaissait ainsi avec
+                # 103 gradients "nuls" sur 250 points, ce qui a ete pris pour un
+                # entrainement mort le 2026-08-27 alors que le gradient etait sain.
+                "grad_norm": float(f"{float(grad_norm):.4g}"),
                 "lr": round(lr_cur, 8),
                 "speed_it_s": round(it_s, 3),
                 "elapsed_s": round(elapsed, 1),

@@ -111,12 +111,30 @@ class VectorMMFM(nn.Module):
         dropout: float = 0.0,
         latent_mean: float = 0.0,
         latent_scale: float = 1.0,
+        time_scale: float = 1.0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         self.time_embed_dim = time_embed_dim
         self.class_embed_dim = class_embed_dim
+        # Facteur d'echelle applique a `t` AVANT l'embedding sinusoidal.
+        # `sinusoidal_time_embedding` a max_period=10000 : elle attend des
+        # INDICES de pas de diffusion dans [0, 1000), pas un temps dans [0,1].
+        # Avec t brut, l'argument des sinusoides ne depasse jamais 1 : cos ~ 1
+        # partout, sin(x) ~ x, et l'embedding multi-echelle s'effondre en une
+        # rampe scalaire. Mesure du 2026-08-27 : rang effectif 1.22 sur 4 aux
+        # 5 temps de champ (contre 3.98 a time_scale=1000), et sur le
+        # checkpoint de production cos(v(t=0), v(t=1)) = 1.000000 -- le modele
+        # est litteralement aveugle au temps. Les deux references font ce
+        # produit (Genentech/MMFM : step_scale=1000 ; NVIDIA/MONAI : timesteps
+        # entiers dans [0,1000)). Voir
+        # results/mmfm/audit_20260827_refcompare/manifest.md.
+        #
+        # DEFAUT 1.0 = comportement historique strictement inchange, pour que
+        # les configs et checkpoints anterieurs reproduisent leurs chiffres.
+        # Les configs corrigees posent explicitement time_scale: 1000.
+        self.time_scale = float(time_scale)
 
         input_dim = 2 * latent_dim + time_embed_dim + class_embed_dim
         self.class_embed = nn.Embedding(num_classes, class_embed_dim)
@@ -156,7 +174,7 @@ class VectorMMFM(nn.Module):
         timesteps: torch.Tensor,
         class_labels: torch.Tensor,
     ) -> torch.Tensor:
-        time_feat = sinusoidal_time_embedding(timesteps, self.time_embed_dim)
+        time_feat = sinusoidal_time_embedding(timesteps * self.time_scale, self.time_embed_dim)
         class_feat = self.class_embed(class_labels)
         z_t_n = (z_t_vec - self.latent_mean) / self.latent_scale
         z_src_n = (z_src_vec - self.latent_mean) / self.latent_scale

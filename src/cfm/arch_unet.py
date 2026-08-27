@@ -174,10 +174,18 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
     def build_model() -> nn.Module:
         return build_unet_3d(cfg, latent_channels, n_classes)
 
+    # Facteur d'echelle du temps AVANT l'embedding de MONAI. `get_timestep_embedding`
+    # (max_period=10000) attend des INDICES de pas de diffusion dans [0, 1000) --
+    # c'est ce que fait le pipeline NVIDIA (torch.randint(0, num_train_timesteps)).
+    # Lui passer t dans [0,1] effondre l'embedding (rang effectif 1.22 sur 4).
+    # Defaut 1.0 = comportement historique inchange. Voir mmfm_vectorized.py et
+    # results/mmfm/audit_20260827_refcompare/manifest.md.
+    time_scale = float(cfg["model"].get("time_scale", 1.0))
+
     def make_model_fn(raw_model: nn.Module) -> Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]:
         def _fn(z_t: Tensor, z_src: Tensor, t: Tensor, y: Tensor) -> Tensor:
             z_in = torch.cat([z_t, z_src], dim=1)
-            return raw_model(x=z_in, timesteps=t, class_labels=y)
+            return raw_model(x=z_in, timesteps=t * time_scale, class_labels=y)
         return _fn
 
     def prep_latent(vae, z: Tensor) -> Tuple[Tensor, Any]:

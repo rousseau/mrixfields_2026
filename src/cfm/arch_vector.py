@@ -38,6 +38,8 @@ def build_vector_mmfm(cfg: dict, latent_dim: int, n_classes: int) -> VectorMMFM:
         # (0, 1) par defaut : sans effet, les checkpoints existants restent valides.
         latent_mean=float(m.get("latent_mean", 0.0)),
         latent_scale=float(m.get("latent_scale", 1.0)),
+        # 1.0 par defaut = comportement historique (voir VectorMMFM.__init__).
+        time_scale=float(m.get("time_scale", 1.0)),
     )
 
 
