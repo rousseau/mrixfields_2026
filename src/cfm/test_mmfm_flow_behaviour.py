@@ -121,6 +121,13 @@ def _time_cosine(model, z: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def test_time_sensitivity(model, latent_dim: int, seed: int = 0) -> float:
+    """ATTENTION au moment de la mesure. Avec `time_cond: film`, la projection de
+    modulation part de ZERO (initialisation AdaLN-Zero, standard et voulue) :
+    a l'initialisation le modele est time-blind PAR CONSTRUCTION et ce test
+    echouerait toujours. Il n'a de sens qu'apres entrainement -- le run R-best
+    donne cos = -0.24 / 0.80 / 0.03 sur les trois contrastes. L'appelant doit
+    donc passer un modele ENTRAINE quand time_cond vaut 'film'.
+    """
     g = torch.Generator().manual_seed(seed)
     z = torch.randn(4, latent_dim, generator=g)
     y = torch.zeros(4, dtype=torch.long)
@@ -188,10 +195,19 @@ def test_trajectory_can_bend(model, latent_dim: int, n_steps: int = 100,
 # ---------------------------------------------------------------------------
 
 def zero_baseline_from_cache(cache_dir: str, modality: str = "T2W",
-                             n: int = 8, loss: str = "l1") -> float:
+                             n: int = 8, loss: str = "l1",
+                             adjacent_only: bool = False) -> float:
     """Loss d'un predicteur qui renvoie 0 partout, sur les vraies cibles
     u = (z_j - z_i)/dt. Trois lignes qui auraient arrete le projet des le debut :
     un flow dont la loss ne bat pas la constante nulle n'a rien appris.
+
+    REGIME DE PAIRES. `adjacent_only` change l'echelle des cibles : `dt` y vaut
+    toujours 0.25 au lieu d'aller jusqu'a 1.0, donc `u = (z_j - z_i)/dt` est ~4x
+    plus grand et la loss n'est PAS comparable a celle du regime toutes-paires
+    (deja constate le 2026-08-26 : 18.43 contre 12.08 pour des modeles de qualite
+    voisine). La base doit donc etre calculee sur le MEME ensemble de paires que
+    l'entrainement, sans quoi le test echoue sur un artefact d'echelle -- ce qui
+    est arrive a R-best.
 
     UNITES. La loss journalisee par mmfm_core est calculee sur des latents BRUTS :
     `ut_global` vient du cache sans transformation, et le modele remultiplie sa
@@ -228,6 +244,8 @@ def zero_baseline_from_cache(cache_dir: str, modality: str = "T2W",
     for i in range(len(fields)):
         for j in range(len(fields)):
             if i == j:
+                continue
+            if adjacent_only and abs(i - j) != 1:
                 continue
             # Unites BRUTES, cf. docstring : la loss journalisee l'est aussi.
             zi, zj = load(fields[i], n, 0), load(fields[j], n, 1)
@@ -312,7 +330,12 @@ def run(cfg_path: str, checkpoint: str | None, metrics: str | None) -> int:
     check("plongement du temps en bf16", lambda: test_time_embedding_survives_bf16(ts) and None)
 
     model = _build(cfg, latent_dim).eval()
-    check("sensibilite au temps (init)", lambda: round(test_time_sensitivity(model, latent_dim), 6))
+    if cfg["model"].get("time_cond", "concat") == "film":
+        print("  n/a  sensibilite au temps (init) : time_cond='film' part d'une "
+              "modulation nulle (AdaLN-Zero), la mesure n'a de sens qu'apres "
+              "entrainement — voir src/cfm/measure_flow_geometry.py")
+    else:
+        check("sensibilite au temps (init)", lambda: round(test_time_sensitivity(model, latent_dim), 6))
     check("la trajectoire peut se courber", lambda: [round(x, 4) for x in test_trajectory_can_bend(model, latent_dim)])
 
     if metrics and Path(metrics).exists():
@@ -320,8 +343,9 @@ def run(cfg_path: str, checkpoint: str | None, metrics: str | None) -> int:
         cache = cfg["data"].get("latent_cache_dir")
         if cache and Path(cache).exists():
             loss_kind = "l2" if cfg["train"].get("loss", "l1") == "l2" else "l1"
+            adj = bool(cfg["train"].get("adjacent_only", False))
             try:
-                base = zero_baseline_from_cache(cache, loss=loss_kind)
+                base = zero_baseline_from_cache(cache, loss=loss_kind, adjacent_only=adj)
             except Exception as exc:                      # schema de cache inattendu
                 print(f"  n/a  la loss bat « predire zero » : cache illisible ({exc})")
             else:
