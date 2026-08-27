@@ -57,6 +57,87 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-08-27 (soir) — Le correctif de temps SEUL ne change rien : le mécanisme de conditionnement domine
+
+**Verdict : R1 (`time_scale: 1000` seul, 25 000 itérations, 2 h) est TOUJOURS
+aveugle au temps sur données réelles.** Détail :
+`results/mmfm/synthetic_20260827/manifest.md`.
+
+| mesure sur latents réels | production | **R1 (`ts=1000`)** |
+|---|---|---|
+| cos(v(t=0), v(t=1)) | 1.000000 | **1.000000** |
+| courbure / courbure exigée, T1W | 0.006 | **0.003** |
+| courbure / courbure exigée, T2W | 0.051 | **0.054** |
+| courbure / courbure exigée, T2FLAIR | 0.031 | **0.027** |
+| part de variance du temps à la 1ʳᵉ couche | 0.00000 % | **0.00037 %** |
+
+Le correctif multiplie bien le signal temporel par ~3700, et le réseau *essaie*
+de s'en servir (poids par canal sur le temps ×1.34 → ×2.27 relativement au
+latent). **Cela reste 0.0004 % de l'entrée.** Le défaut trouvé le matin (rang
+effectif 1.22 sur 4) était réel et mesurable, mais ce n'était pas la contrainte
+active.
+
+**L'instrument qui manquait l'avait prédit avant la fin du run.** Un harnais
+synthétique à réponse connue (`src/cfm/synthetic_marginals.py`, branché sur la
+VRAIE boucle d'entraînement, 2 minutes par run) donnait en régime fidèle
+`ts=1` → 0.001 et `ts=1000` → 0.016 : ×16, et toujours 50× sous la porte.
+
+**Ce qui domine : concaténer au lieu de moduler.** Le temps pèse 256 canaux
+contre 258 048 de latent. Le harnais montre qu'il faut ~6 % de la variance
+d'entrée pour que la trajectoire se courbe ; y parvenir par concaténation
+demanderait **~65 000 dimensions de temps**. En modulation (FiLM : `scale, shift`
+appris par bloc résiduel), la force du conditionnement **ne dépend plus de la
+dimension du latent** — 256 dimensions suffisent là où la concaténation en exige
+2048.
+
+C'est le mécanisme des deux références (MONAI additionne l'embedding dans chaque
+resblock ; Genentech/MMFM a `sum_time_embed`), et **cela explique la mesure du
+matin** : l'UNet variait de 1.7–2.6 % selon `t` quand le vectorisé était à 0.00 %.
+
+**`adjacent_only` réhabilité.** Testé seul le 2026-08-26 et mesuré neutre
+(34/60, p = 0.18) — sur un modèle aveugle au temps, incapable de courber sa
+trajectoire quoi qu'on fasse de ses cibles. Dans le harnais : FiLM **sans**
+adjacent échoue (0.516), FiLM **avec** adjacent franchit la porte (1.031).
+**Les deux sont complémentaires, aucun ne suffit seul.** Le test du 26 était
+valide ; sa conclusion ne l'était pas. Deuxième relecture de cette entrée.
+
+**Balayage complet, régime fidèle (dim 4096, bf16, bruit à SNR constant) :**
+
+| variante | courbure atteinte | porte ≥ 0.80 |
+|---|---|---|
+| `time_scale=1` | 0.001 | non |
+| `time_scale=1000` | 0.016 | non |
+| + `adjacent_only` | 0.053 | non |
+| + `adjacent_only`, fp32 | 0.316 | non |
+| + `adjacent_only`, 16 000 itérations | 0.584 | non |
+| + `adjacent_only`, `time_embed_dim` 2048 | 1.019 | **oui** |
+| + `adjacent_only`, **FiLM** (`time_embed_dim` 256) | **1.031** | **oui** |
+| FiLM mais TOUTES les paires | 0.516 | non |
+
+L'AMP bf16 coûte un facteur 6 ; ce n'est pas un problème de budget
+d'optimisation (16 000 itérations ne suffisent pas).
+
+**DETTE n°2 SOLDÉE** — loss finale contre « prédire zéro », unités brutes :
+vectorisé 11.94 / 15.07 = **0.792** · UNet 7.89 / 15.07 = **0.524** · INR
+3.50e-4 / 4.94e-4 = **0.713**. Les trois battent la constante nulle. L'UNet est
+le meilleur sur cet axe et le pire au score final — **septième occurrence de
+« la loss ne prédit rien »**.
+
+**CORRECTION** — le flow INR n'avait pas 103 gradients nuls sur 250 :
+`mmfm_core` journalisait `round(grad_norm, 4)`, donc toute norme < 5e-5
+s'écrivait `0.0`, et le latent INR est à l'échelle 2.6e-4. Mesure directe à
+l'initialisation : 2.7e-4 en bf16 comme en fp32. Journalisation passée à 4
+chiffres significatifs.
+
+**RÉSERVE sur la métrique.** En dimension 4096, le nRMSE du harnais est **plat**
+(0.0114 à 0.0119) sur des variantes dont la courbure varie d'un facteur **53**.
+Si la courbure s'améliore sur données réelles, **le nRMSE peut à peine bouger**.
+Cohérent avec les 80 % d'erreur d'échelle d'intensité du 2026-08-25. Ne pas
+conclure à l'échec sur le seul nRMSE.
+
+**En cours** : R-best (`time_scale` 1000 + FiLM + `adjacent_only`) sur le
+vectorisé ; évaluation Task 3 de R1.
+
 ## 2026-08-27 — CAUSE RACINE : le temps n'atteint pas le modèle
 
 **Verdict : défaut trouvé, mesuré à chaque maillon, commun aux TROIS
@@ -110,6 +191,13 @@ corrigé en phase B ; ce côté-ci n'avait jamais été regardé.
 **Mais il invalide les trois checkpoints** (le sens de l'entrée temporelle
 change) et impose ~25 000 itérations de réentraînement chacun. **Non appliqué,
 décision à prendre.**
+
+> **Relecture du 2026-08-27 (soir).** Le correctif a été appliqué et mesuré :
+> **il ne change rien à lui seul** (R1 : cos = 1.000000 inchangé, courbure
+> 0.003–0.054). Le défaut décrit ici est réel — le rang effectif de 1.22 est
+> mesuré — mais il n'était pas la contrainte active. Ce qui domine est le
+> MÉCANISME de conditionnement (concaténer 256 canaux face à 258 048 au lieu de
+> moduler). Voir l'entrée du soir.
 
 **Écarts secondaires relevés, non testés** : loss L1 alors que les **9** scripts
 d'entraînement de la référence utilisent MSE (dette n°7, corroborée de
@@ -469,7 +557,8 @@ une lacune que ce journal existe pour ne plus reproduire.
 | 5 | Adoption du MedVAE perceptuel : régénérer les caches + réentraîner les deux flows | >1 jour |
 | 6 | Géométrie du latent INR (25 % de structure commune contre 91 %) : canoniser l'ajustement | ~6 h |
 | 7 | Loss L1 au lieu de L2 : écart à la dérivation du flow matching, effet mesuré nul sur les symptômes, à corriger par correction | 15 min + réentraînement |
-| 8 | **Échelle du temps (`t * 1000` avant l'embedding) — cause racine mesurée le 2026-08-27.** 2 lignes, mais invalide les 3 checkpoints | 10 min + 3 réentraînements |
+| 8 | ~~Échelle du temps~~ **FAIT** (`model.time_scale`, défaut 1.0) — mesuré SANS effet seul | — |
+| 8b | **Conditionnement par modulation (`time_cond: film`) — le facteur dominant.** Fait pour le vectorisé/INR ; reste à porter sur l'UNet (MONAI le fait déjà nativement) | fait + réentraînements |
 | 9 | Standardisation du latent pour le vectorisé et l'UNet (`latent_scale` n'existe que dans `inr.yaml` ; latent σ=21.98 contre temps σ=0.027) | 10 min + réentraînement |
 | 10 | Guidance sans classifieur : absente chez nous, présente dans les deux références | ~2 h + réentraînement |
 | 11 | Interpolant cubique sur trajectoire couplée par chaînage OT (méthode réelle du papier MMFM) au lieu de droites par paire | ~1 jour |
