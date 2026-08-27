@@ -54,8 +54,10 @@ def _parse() -> argparse.Namespace:
     )
     p.add_argument("--mode", default="train", choices=["train", "infer"])
     p.add_argument(
-        "--method", required=True, choices=["mmfm3d_vectorized", "mmfm3d_unet", "mmfm3d_inr"],
-        help="Architecture : MLP vectoriel, UNet 3D spatial (MONAI), ou latent INR (SIREN+hypernetwork)",
+        "--method", required=True,
+        choices=["mmfm3d_vectorized", "mmfm3d_unet", "mmfm3d_inr", "mmfm3d_synthetic"],
+        help="Architecture : MLP vectoriel, UNet 3D spatial (MONAI), latent INR "
+             "(SIREN+hypernetwork), ou harnais synthetique a reponse connue",
     )
     p.add_argument("--config", required=True, help="Chemin vers le YAML de configuration")
     p.add_argument("--env", default=None, help="Env YAML (local / remote / chemin)")

@@ -1,0 +1,88 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# HARNAIS DE VALIDATION — probleme multi-marginal a reponse connue.
+#
+# Ce n'est PAS une architecture candidate : c'est l'instrument qui manquait au
+# projet. Il fait tourner la VRAIE boucle d'entrainement (mmfm_core.train, via
+# la branche `mmfm3d_synthetic`) sur 5 marginales dont la carte exacte est
+# calculable, et qui reproduisent nos trois contraintes reelles : marginales non
+# colineaires (deviation a la corde 0.6, au milieu des 0.37-0.90 mesures sur nos
+# donnees), donnees NON APPARIEES, et un facteur « sujet » a preserver.
+#
+# Un echec se lit en minutes au lieu de 25 000 iterations. Voir
+# src/cfm/synthetic_marginals.py et results/mmfm/audit_20260827_refcompare/.
+#
+# Usage :
+#   PYTHONPATH=src python src/cfm/train_mmfm_unified.py \
+#       --method mmfm3d_synthetic --config configs/mmfm/synthetic.yaml --env local
+#   PYTHONPATH=src python src/cfm/eval_synthetic.py \
+#       --config configs/mmfm/synthetic.yaml
+#
+# NOTE sur le lr. 1e-3 au lieu des 2e-5 de production : le probleme est en
+# dimension 64 avec un latent d'ecart-type ~1, pas 129 024 dimensions a
+# l'echelle 22. Le harnais valide la MACHINERIE du flow, pas le reglage
+# d'optimisation des runs reels.
+# ─────────────────────────────────────────────────────────────────────────────
+
+task_name: mmfm_synthetic
+method: mmfm3d_synthetic
+
+vae:
+  vae_type: identity
+
+# Parametres du processus generateur (cfm/synthetic_marginals.py::SyntheticSpec)
+synthetic:
+  dim: 64
+  bend: 0.6            # 0.0 = marginales colineaires (temoin : reussi meme aveugle au temps)
+  subject_scale: 1.0
+  noise: 0.05          # plancher irreductible du nRMSE
+  seed: 0
+
+model:
+  # Le correctif du 2026-08-27. 1.0 reproduit l'etat d'avant (aveugle au temps),
+  # ce qui fait de ce fichier une CONTRE-EPREUVE utilisable telle quelle.
+  time_scale: 1000.0
+  hidden_dim: 512
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  latent_mean: 0.0
+  latent_scale: 1.0
+
+data:
+  # Les noms importent peu : ils fixent n_contrasts = 3 et n_fields = 5, donc
+  # les memes 5 temps {0, 0.25, 0.5, 0.75, 1} que le probleme reel.
+  modalities: [c0, c1, c2]
+  fields: [f0, f1, f2, f3, f4]
+  output_subdir: mmfm/synthetic
+  split: retro_train
+  # volume_size sert uniquement a _infer_latent_shape via le VAE identite ;
+  # l'adaptateur synthetique impose ensuite sa propre dimension (synthetic.dim).
+  volume_size: [4, 4, 4]
+  target_spacing: [1.0, 1.0, 1.0]
+  num_workers: 0
+  # Branchement, pas un vrai cache disque : arch_synthetic.build_cache_dataset
+  # ignore les chemins et genere les donnees.
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/synthetic
+  latent_cache_dir: outputs/mmfm/synthetic/generated
+  n_per_class: 256     # jeu FINI, comme les 1939 volumes reels
+  data_seed: 1
+
+train:
+  total_iters: 4000
+  batch_size: 64
+  num_targets_per_step: 1
+  lr: 1.0e-3
+  warmup_steps: 100
+  sigma: 0.0
+  ot_method: exact
+  identity_prob: 0.1   # comme la production, pour tester la recette telle quelle
+  adjacent_only: false
+  accumulation_steps: 1
+  use_amp: false       # fp32 : le harnais isole le flow, pas la precision
+  grad_clip: 1.0
+  ema_decay: 0.999
+  save_every: 2000
+  print_every: 200
+  keep_checkpoints: 1

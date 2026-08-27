@@ -106,9 +106,16 @@ def _resolve_arch_module(method: str):
         from cfm import arch_unet as arch_module
     elif method == "mmfm3d_inr":
         from cfm import arch_inr as arch_module
+    elif method == "mmfm3d_synthetic":
+        # Harnais de validation : probleme a 5 marginales dont la reponse est
+        # connue analytiquement (cfm/synthetic_marginals.py). Branche ICI pour
+        # que le harnais exerce la VRAIE boucle d'entrainement plutot qu'une
+        # copie qui pourrait diverger du code de production.
+        from cfm import arch_synthetic as arch_module
     else:
         raise ValueError(
-            f"method='{method}' inconnu — attendu 'mmfm3d_vectorized', 'mmfm3d_unet' ou 'mmfm3d_inr'."
+            f"method='{method}' inconnu — attendu 'mmfm3d_vectorized', "
+            f"'mmfm3d_unet', 'mmfm3d_inr' ou 'mmfm3d_synthetic'."
         )
     return arch_module
 

@@ -69,17 +69,30 @@ class LatentVectorizer:
 class ResidualMLPBlock(nn.Module):
     """Simple residual MLP block used by the vector field model."""
 
-    def __init__(self, hidden_dim: int, dropout: float = 0.0):
+    def __init__(self, hidden_dim: int, dropout: float = 0.0,
+                 cond_dim: int = 0):
         super().__init__()
         inner_dim = hidden_dim * 4
         self.norm = nn.LayerNorm(hidden_dim)
         self.fc1 = nn.Linear(hidden_dim, inner_dim)
         self.fc2 = nn.Linear(inner_dim, hidden_dim)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        # Modulation (FiLM) : projection APPRISE du conditionnement, appliquee
+        # apres la normalisation de chaque bloc. cond_dim = 0 -> desactive, le
+        # bloc est alors bit a bit celui d'avant (aucun parametre cree).
+        self.cond_proj = nn.Linear(cond_dim, 2 * hidden_dim) if cond_dim > 0 else None
+        if self.cond_proj is not None:
+            # Depart a l'identite : scale=1, shift=0, donc l'ajout de FiLM ne
+            # perturbe pas l'initialisation du reste du reseau.
+            nn.init.zeros_(self.cond_proj.weight)
+            nn.init.zeros_(self.cond_proj.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
         residual = x
         x = self.norm(x)
+        if self.cond_proj is not None and cond is not None:
+            scale, shift = self.cond_proj(cond).chunk(2, dim=-1)
+            x = x * (1.0 + scale) + shift
         x = F.silu(self.fc1(x))
         x = self.dropout(x)
         x = self.fc2(x)
@@ -112,6 +125,7 @@ class VectorMMFM(nn.Module):
         latent_mean: float = 0.0,
         latent_scale: float = 1.0,
         time_scale: float = 1.0,
+        time_cond: str = "concat",
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -136,16 +150,40 @@ class VectorMMFM(nn.Module):
         # Les configs corrigees posent explicitement time_scale: 1000.
         self.time_scale = float(time_scale)
 
-        input_dim = 2 * latent_dim + time_embed_dim + class_embed_dim
+        # MECANISME DE CONDITIONNEMENT.
+        #
+        # "concat" (defaut, historique) : temps et classe sont concatenes au
+        # latent a l'entree. Mesure du 2026-08-27 : sur le probleme reel cela
+        # met 256 canaux de temps face a 258 048 canaux de latent, soit une part
+        # de variance de 0.026 % meme apres le correctif time_scale. Le harnais
+        # synthetique montre qu'il faut ~6 % pour que la trajectoire se courbe
+        # correctement, ce qui exigerait ~65 000 dimensions de temps par
+        # concatenation -- non viable.
+        #
+        # "film" : le conditionnement module (scale, shift) l'etat normalise de
+        # CHAQUE bloc residuel, via une projection apprise par bloc. Sa force ne
+        # depend plus de la dimension du latent. C'est le mecanisme des deux
+        # references (MONAI additionne l'embedding dans chaque resblock ;
+        # Genentech/MMFM a l'option sum_time_embed).
+        if time_cond not in ("concat", "film"):
+            raise ValueError(f"time_cond doit valoir 'concat' ou 'film', pas {time_cond!r}")
+        self.time_cond = time_cond
+        cond_dim = time_embed_dim + class_embed_dim
+
+        input_dim = 2 * latent_dim + (cond_dim if time_cond == "concat" else 0)
         self.class_embed = nn.Embedding(num_classes, class_embed_dim)
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
             nn.LayerNorm(hidden_dim),
         )
-        self.blocks = nn.ModuleList(
-            [ResidualMLPBlock(hidden_dim, dropout=dropout) for _ in range(depth)]
-        )
+        self.blocks = nn.ModuleList([
+            ResidualMLPBlock(
+                hidden_dim, dropout=dropout,
+                cond_dim=(cond_dim if time_cond == "film" else 0),
+            )
+            for _ in range(depth)
+        ])
         self.output_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, latent_dim),
@@ -178,10 +216,15 @@ class VectorMMFM(nn.Module):
         class_feat = self.class_embed(class_labels)
         z_t_n = (z_t_vec - self.latent_mean) / self.latent_scale
         z_src_n = (z_src_vec - self.latent_mean) / self.latent_scale
-        h = torch.cat([z_t_n, z_src_n, time_feat, class_feat], dim=1)
+        cond = torch.cat([time_feat, class_feat], dim=1)
+        if self.time_cond == "concat":
+            h = torch.cat([z_t_n, z_src_n, cond], dim=1)
+            cond = None
+        else:
+            h = torch.cat([z_t_n, z_src_n], dim=1)
         h = self.input_proj(h)
         for block in self.blocks:
-            h = block(h)
+            h = block(h, cond)
         # La vitesse est une difference de latents divisee par dt : elle porte
         # l'echelle du latent, pas son decalage. On remultiplie donc par `scale`
         # SANS rajouter `mean`.

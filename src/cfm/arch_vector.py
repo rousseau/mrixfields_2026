@@ -40,6 +40,8 @@ def build_vector_mmfm(cfg: dict, latent_dim: int, n_classes: int) -> VectorMMFM:
         latent_scale=float(m.get("latent_scale", 1.0)),
         # 1.0 par defaut = comportement historique (voir VectorMMFM.__init__).
         time_scale=float(m.get("time_scale", 1.0)),
+        # "concat" par defaut = comportement historique, checkpoints valides.
+        time_cond=str(m.get("time_cond", "concat")),
     )
 
 
