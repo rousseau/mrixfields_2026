@@ -1,0 +1,199 @@
+# Variante d'EXPERIENCE : time_scale 1000 + adjacent_only (UNet) — 2026-08-27
+#
+# Copie de configs/mmfm/unet.yaml (qui est la variante AdaGN). Trois cles
+# changees : time_scale, adjacent_only, output_subdir/task_name.
+#
+# POURQUOI PAS time_cond: film ICI. MONAI injecte deja le temps par MODULATION :
+# chaque DiffusionUNetResnetBlock fait norm1(x), puis ajoute time_emb_proj(emb)
+# apres conv1 -- une projection APPRISE, par bloc. La force du conditionnement
+# n'y depend donc PAS de la taille du latent, contrairement a la concatenation
+# du vectorise qui met 256 canaux face a 258 048.
+#
+# C'est ce qui explique la mesure du 2026-08-27 : l'UNet variait de 1.7-2.6 %
+# selon t la ou le vectorise etait a 0.00 %. Il ne lui manque que le RANG du
+# plongement (1.22 sur 4), que time_scale corrige.
+#
+# PREDICTION A VERIFIER : time_scale devrait rapporter nettement plus a l'UNet
+# qu'au vectorise, ou il n'a RIEN rapporte (R1 : cos = 1.000000 inchange,
+# courbure 0.003-0.054). Si ce n'est pas le cas, le raisonnement ci-dessus est
+# faux et il faudra le dire.
+#
+# use_adagn RESTE a true, et ce n'est pas neutre. AdaGN est de la modulation
+# adaptative -- exactement le mecanisme que le harnais synthetique designe comme
+# facteur dominant. Il avait ete mesure NEUTRE le 2026-08-13 (0.4623 contre
+# 0.4617)... sur un modele aveugle au temps, donc dans des conditions qui ne
+# pouvaient pas le reveler. C'est le meme piege qu'adjacent_only. A relire.
+#
+# ATTENTION : ce fichier ne reproduit PAS le checkpoint de reference
+# outputs/mmfm/unet (0.4033), qui est ANTERIEUR a AdaGN. La comparaison a la
+# reference melange donc time_scale, adjacent_only et AdaGN ; pour attribuer, il
+# faudrait une variante a use_adagn: false.
+#
+# COUT : 16.7 h pour 25 000 iterations. A ne lancer qu'apres la porte de R-best.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM-UNet — config d'entraînement canonique.
+#
+# Ce fichier et configs/mmfm/vectorized.yaml sont IDENTIQUES hors du bloc
+# `model:` — même data/train/inference — pour que toute différence de résultat
+# ne puisse venir que de l'architecture (MLP vectoriel vs UNet spatial). Voir
+# docs/MMFM_ARCHITECTURE.md pour le design partagé (src/cfm/mmfm_core.py +
+# ArchAdapter) et results/mmfm/analysis/protocol_20260730_harmonized_comparison/
+# pour les résultats de référence.
+#
+# Convention : ce fichier est édité SUR PLACE pour chaque nouvelle phase
+# d'entraînement — pas de copie _v2/_ext/_test à chaque essai. L'historique
+# des essais reste dans git log ; le résultat de chaque essai significatif est
+# consigné dans un results/mmfm/comparison_<date>_<slug>/.
+#
+# Entraîné via train_mmfm_unified.py --method mmfm3d_unet. La reprise depuis un
+# ancien checkpoint (--resume_weights_only), auparavant légitime, ne l'est PLUS
+# depuis l'activation d'AdaGN : `time_emb_proj` (sortie C) a été remplacé par
+# `emb_proj` (sortie 2C), donc les poids d'avant sont incompatibles. Vérifié :
+# PyTorch refuse bruyamment (RuntimeError, clés manquantes ET inattendues), il
+# n'y a pas de risque de chargement silencieusement partiel. Entraîner from
+# scratch — c'est de toute façon la seule comparaison honnête avec la référence
+# 0.4617, elle-même obtenue from scratch sur 25k itérations.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_unet
+task_name: mmfm_unet_ts_adj
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  # checkpoint VOLONTAIREMENT VIDE = poids MedVAE pré-entraînés (Stanford) bruts.
+  # Notre ancien fine-tuning L1 (outputs/medvae/runs/medvae_finetune_all/) est
+  # ABANDONNÉ : mesuré sur 9 volumes (manifest, section « LA RÉSOLUTION EST LE
+  # VRAI GOULOT »), il plafonne le SSIM d'auto-reconstruction à ~0.88 à toute
+  # résolution, là où le pré-entraîné atteint 0.915 à 1mm et 0.948 à 0.5mm.
+  # La L1 gagne en nRMSE (ce qu'elle optimise) mais détruit la structure.
+  # ATTENTION : à 2mm la hiérarchie est INVERSÉE (le fine-tuné y paraît
+  # meilleur) — la vérité terrain à 2mm est trop lissée pour révéler l'écart.
+  checkpoint:
+  latent_channels: 1
+
+
+model:
+  # Correctif du 2026-08-27 : t est multiplie par ce facteur avant
+  # get_timestep_embedding de MONAI, qui attend des indices dans [0,1000).
+  time_scale: 1000.0
+  model_channels: 128
+  channel_mult:
+  - 1
+  - 2
+  - 4
+  num_res_blocks: 2
+  attention_levels:
+  - false
+  - true
+  - true
+  num_head_channels: 64
+  norm_num_groups: 32
+  use_flash_attention: false
+  use_gradient_checkpointing: false
+  num_class_embeds: 3
+  use_factorized_attention: false
+  # AdaGN (Dhariwal & Nichol, arXiv:2105.05233, `use_scale_shift_norm`) : la
+  # seconde group-norm de chaque bloc résiduel est MODULÉE (gain + décalage)
+  # par l'embedding champ+contraste, au lieu de recevoir un simple décalage
+  # additif juste AVANT une normalisation qui en efface une partie.
+  # Voir src/models/adagn_conditioning.py pour le détail du mécanisme.
+  # C'est la seule différence d'architecture avec la phase précédente
+  # (référence nRMSE 0.4617, checkpoint conservé dans outputs/mmfm/unet/).
+  use_adagn: true
+  # Modulation nulle à l'initialisation (convention DiT, arXiv:2212.09748) :
+  # le réseau démarre exactement comme son équivalent non conditionné. DiT
+  # montre une convergence nettement meilleure ainsi, ce qui compte ici où le
+  # budget est de 25k itérations.
+  adagn_zero_init: true
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  # RÉSOLUTION 1mm (2026-08-07) — passage depuis 2mm/96x112x96.
+  # Mesuré sur 9 volumes (manifest, « LA RÉSOLUTION EST LE VRAI GOULOT ») :
+  # l'auto-reconstruction MedVAE passe de SSIM 0.800 @2mm à 0.915 @1mm
+  # (nRMSE 0.187 -> 0.082). La grille native du challenge est 364x436x364 @0.5mm :
+  # travailler à 2mm jetait ~98% des voxels acquis, et l'évaluateur ré-interpole
+  # ensuite x4, donc tout le détail au-dessus du Nyquist de 2mm était absent par
+  # construction au moment du scoring.
+  # 1mm et pas 0.5mm : à 0.5mm l'attention de l'UNet de flow (niveau 1 =
+  # 129k tokens) demanderait ~33 GB pour sa seule matrice d'attention. À 1mm :
+  # 16k tokens, 0.5 GB. 1mm est la résolution maximale exploitable de bout en bout.
+  # 192x224x192 = 2x2x2 tuiles de 96x112x96 (cf. models/tiled_vae.py) -> latent
+  # 48x56x48 = 129k valeurs (vs 16k @2mm).
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  # Tuilage de l'encodage MedVAE (models/tiled_vae.py) : 2x2x2 tuiles de
+  # 96x112x96 + marge de contexte de 16 voxels, retirée du latent après encodage.
+  # Mesuré à 1mm sur 0006 : SSIM 0.980 (0.1T) / 0.959 (7T), nRMSE 0.039 / 0.118 —
+  # nettement mieux qu'un découpage en patches 64x64x64 fusionnés par fenêtre de
+  # Hann en espace image (0.934 / 0.919), qui lissait les détails.
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: retro_train
+  # Déplacé pour NE PAS écraser le checkpoint de référence (nRMSE 0.4617)
+  # qui reste dans outputs/mmfm/unet/ — c'est le terme de comparaison.
+  output_subdir: mmfm/unet_ts_adj
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/unet
+  # Cache 1mm (latents 48x56x48), encodé par tuiles depuis le MedVAE
+  # PRÉ-ENTRAÎNÉ — nouveau cache_id car le VAE ET la résolution ont changé.
+  latent_cache_dir: outputs/mmfm/latent_cache/unet/medvae_finetune_c4d1e200/retro_train
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  batch_size: 1
+  # 25000 (et non 50000) : à 1mm l'UNet tourne à 0.42 it/s (mesuré au smoke,
+  # 45.9 GB, latent 48x56x48 = 8x celui de 2mm) => 50k itérations coûteraient
+  # 33h. La validation plafonne de toute façon vers 20-30k d'après les runs
+  # antérieurs (protocol_20260730_harmonized_comparison), et prolonger au-delà
+  # avait DÉGRADÉ les résultats. 25k ≈ 16.5h, avec checkpoint tous les 2500.
+  total_iters: 25000
+  num_targets_per_step: 1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  adjacent_only: true
+  identity_prob: 0.1
+  accumulation_steps: 1
+  save_every: 2500
+  # Nombre de checkpoints INTERMÉDIAIRES conservés (rotation par numéro
+  # d'itération). `model_final.pth` n'est jamais concerné. 0 = tout garder
+  # (ancien comportement). Un checkpoint UNet pèse 2.9 Go : sans rotation, un
+  # entraînement de 25000 itérations à save_every=2500 laisse 30 Go derrière lui.
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed
