@@ -262,6 +262,7 @@ def process_volume_unified(
     target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     compat_orientation: bool = False,
     compat_source_norm: bool = False,
+    recalib_factor: float = 1.0,
     upsample_order: int = 1,
     encode_tile=None,
     encode_tile_margin: int = 16,
@@ -409,6 +410,19 @@ def process_volume_unified(
             )
         pred_05mm = denormalize_from_01(pred_05mm, tgt_lo, tgt_hi)
 
+    # RECALAGE D'INTENSITE. La denormalisation ci-dessus multiplie par un `hi`
+    # FIXE par (modalite, champ cible), calcule sur les 1939 volumes
+    # d'entrainement : chaque sujet recoit l'echelle MOYENNE de sa classe. Le
+    # facteur global qu'un oracle choisirait enleve alors 80 % de l'energie de
+    # l'erreur en T1W et en T2FLAIR (mesure du 2026-08-25). `recalib_factor`
+    # corrige la part SYSTEMATIQUE de ce biais ; il est estime en appariant les
+    # DISTRIBUTIONS d'intensite des volumes predits et reels au meme champ, sur
+    # les sujets d'ENTRAINEMENT — donc sans appariement et sans qu'aucun sujet
+    # d'evaluation n'entre dans son estimation.
+    # Voir src/cfm/estimate_intensity_recalibration.py. Defaut 1.0 = sans effet.
+    if recalib_factor != 1.0:
+        pred_05mm = pred_05mm * recalib_factor
+
     vol_src_05mm = img_src.get_fdata(dtype=np.float32)
     mask = vol_src_05mm > 1e-6
     pred_05mm_masked = pred_05mm * mask
@@ -539,9 +553,9 @@ def infer_single(
         p_lo=p_lo, p_hi=p_hi, device=dev, use_amp=use_amp, amp_dtype=amp_dtype,
         norm_mode=norm_mode, center_crop_only=center_crop_only,
         fixed_lo=fixed_lo, fixed_hi=fixed_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
-                    compat_orientation=compat_orientation,
-                    compat_source_norm=compat_source_norm,
-                    upsample_order=upsample_order,
+        compat_orientation=compat_orientation,
+        compat_source_norm=compat_source_norm,
+        upsample_order=upsample_order,
         target_spacing=target_spacing,
         encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
     )
@@ -565,6 +579,8 @@ def infer_batch(
     split: str = "Training_prospective",
     modalities=None,
     pairs_filter=None,
+    max_subjects=None,
+    recalibration=None,
     env_path=None,
     n_steps: Optional[int] = None,
     norm_mode: Optional[str] = None,
@@ -652,6 +668,18 @@ def infer_batch(
             pair_out_dir = out_root / "task3" / mod / f"{src}_to_{tgt}"
             pair_out_dir.mkdir(parents=True, exist_ok=True)
 
+            # Facteur de recalage : la table par PAIRE est plus fine que celle
+            # par champ cible (0.3231 contre 0.3345 au leave-one-out du
+            # 2026-08-25), on la prefere quand elle existe.
+            recal = 1.0
+            if recalibration is not None:
+                pair_key = f"{src}_to_{tgt}"
+                recal = float(
+                    recalibration.get("by_pair", {}).get(mod, {}).get(pair_key)
+                    or recalibration.get("by_target_field", {}).get(mod, {}).get(tgt)
+                    or 1.0
+                )
+
             fixed_lo = fixed_hi = tgt_lo = tgt_hi = None
             if field_norm_stats is not None:
                 entry = field_norm_stats.get(mod, {}).get(src)
@@ -668,6 +696,11 @@ def infer_batch(
                 continue
 
             input_files = sorted(input_dir.glob("*.nii.gz"))
+            if max_subjects is not None:
+                # Sous-echantillonnage DETERMINISTE : le meme sous-ensemble a
+                # chaque appel, sinon deux estimations du recalage ne portent pas
+                # sur les memes sujets.
+                input_files = input_files[:max_subjects]
             print(f"\n[{mod}] {src} → {tgt} : {len(input_files)} sujets")
 
             for nii_path in input_files:
@@ -688,6 +721,7 @@ def infer_batch(
                     fixed_lo=fixed_lo, fixed_hi=fixed_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
                     compat_orientation=compat_orientation,
                     compat_source_norm=compat_source_norm,
+                    recalib_factor=recal,
                     upsample_order=upsample_order,
                     target_spacing=target_spacing,
                     encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
@@ -711,7 +745,16 @@ def parse_args():
     p.add_argument("--output", default=None)
     p.add_argument("--output_dir", default=None, help="Batch mode output root")
     p.add_argument("--split", default="Training_prospective",
-                   choices=["Training_prospective", "Validating_prospective", "Testing_prospective"])
+                   choices=["Training_prospective", "Validating_prospective",
+                            "Testing_prospective", "Training_retrospective"])
+    p.add_argument("--intensity_recalibration", default=None,
+                   help="JSON produit par estimate_intensity_recalibration.py — "
+                        "corrige la part systematique de l'erreur d'echelle "
+                        "d'intensite (80 %% de l'energie de l'erreur en T1W/T2FLAIR)")
+    p.add_argument("--max_subjects", type=int, default=None,
+                   help="limite le nombre de sujets SOURCE par paire. Sert a estimer "
+                        "le recalage d'intensite sur les sujets d'ENTRAINEMENT sans "
+                        "payer les 143 sujets par paire.")
     p.add_argument("--modalities", nargs="+", default=None)
     p.add_argument("--pairs", default=None, help="Subset of pairs, e.g. '0.1T_to_7T,1.5T_to_3T'")
     p.add_argument("--env", default="local")
@@ -810,6 +853,9 @@ def main():
         infer_batch(
             cfg_path=args.config, checkpoint=args.checkpoint, output_dir=args.output_dir,
             split=args.split, modalities=args.modalities, pairs_filter=pairs_filter,
+            max_subjects=args.max_subjects,
+            recalibration=(json.load(open(args.intensity_recalibration))
+                           if args.intensity_recalibration else None),
             env_path=args.env, n_steps=args.n_steps, norm_mode=args.norm_mode,
             center_crop_only=args.center_crop_only,
             use_ema=not args.no_ema, skip_existing=args.skip_existing, device=args.device,
