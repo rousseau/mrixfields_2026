@@ -85,6 +85,31 @@ METHODS: List[Tuple[str, Dict[str, Tuple[str, str]]]] = [
 # faisaient (EMA sans correction de biais, orientation LAS/RAS, normalisation).
 # `latent_dim = 129024` : ces predictions viennent bien du checkpoint de
 # production de l'epoque, pas du run z=4096 (verifie en recalculant, 0.6383).
+# Run du 2026-08-27 : time_scale 1000 + conditionnement FiLM + adjacent_only.
+# C'est le seul checkpoint dont la trajectoire se courbe reellement
+# (cos(v(0),v(1)) = -0.24 / 0.80 / 0.03 contre 1.000000 partout ailleurs ;
+# courbure 0.50 / 0.97 / 0.86 de celle exigee contre 0.006-0.05).
+S27 = RESULTS / "staircase_20260827"
+R_BEST = ("Vectorise R-best", {
+    m: ("outputs/mmfm/vec_rbest/predictions/task3", str(S27 / f"task3_vec_rbest_{m}.csv"))
+    for m in ("T1W", "T2W", "T2FLAIR")
+})
+
+# PLAFOND DE REPRESENTATION : la verite terrain passee dans l'encodeur/decodeur
+# de l'architecture, sans aucun transport (paires identite, dt = 0). C'est ce que
+# l'architecture rendrait avec un flow PARFAIT. Mesure du 2026-08-27 : MedVAE
+# 0.1048 de nRMSE moyen, INR 0.3395 -- et l'INR score 0.3749, donc 90.6 % de son
+# erreur est sa representation, pas son flow.
+CEIL = RESULTS / "ceiling_20260827"
+CEIL_VAE = ("Plafond MedVAE", {
+    m: ("outputs/mmfm/ceiling_vectorized/predictions/task3", str(CEIL / f"ceiling_vectorized_{m}.csv"))
+    for m in ("T1W", "T2W", "T2FLAIR")
+})
+CEIL_INR = ("Plafond INR", {
+    m: ("outputs/mmfm/ceiling_inr/predictions/task3", str(CEIL / f"ceiling_inr_{m}.csv"))
+    for m in ("T1W", "T2W", "T2FLAIR")
+})
+
 INR_AVANT = ("INR avant audit", {
     "T1W": (I_OLD, str(C07 / "task3_inr_129k_T1W.csv")),
     "T2W": (I_OLD, str(C14 / "task3_inr_T2W.csv")),
@@ -108,6 +133,12 @@ def gt_path(root: Path, mod: str, field: str, sid: str) -> Path:
 
 
 def pred_path(method_root: str, mod: str, pair: str, tgt: str, sid: str) -> Path:
+    # Les volumes de PLAFOND sont ranges par paire IDENTITE (`7T_to_7T`) : ils ne
+    # dependent que du champ cible, puisqu'aucun transport n'a lieu. On y renvoie
+    # donc la paire correspondante, quelle que soit la paire demandee — c'est ce
+    # qui permet de poser le plafond a cote d'une prediction sur la meme figure.
+    if "/ceiling_" in method_root:
+        pair = f"{tgt}_to_{tgt}"
     return Path(method_root) / mod / pair / f"P_{mod}_{tgt}_{sid}.nii.gz"
 
 
@@ -118,7 +149,16 @@ def load_metrics(csv_path: str) -> Dict[str, Tuple[float, float, float]]:
     out = {}
     with open(p) as f:
         for r in csv.DictReader(f):
-            out[r["pair"]] = (float(r["nrmse_mean"]), float(r["ssim_mean"]), float(r["lpips_mean"]))
+            # Deux schemas coexistent. Les CSV Task 3 sont indexes par PAIRE et
+            # portent LPIPS ; les CSV de plafond sont indexes par CHAMP cible
+            # (aucun transport n'a lieu) et n'ont pas LPIPS. On enregistre le
+            # plafond sous la cle `X_to_X` pour qu'il s'aligne sur pred_path.
+            lp = float(r["lpips_mean"]) if "lpips_mean" in r else float("nan")
+            vals = (float(r["nrmse_mean"]), float(r["ssim_mean"]), lp)
+            if "pair" in r:
+                out[r["pair"]] = vals
+            else:
+                out[f"{r['field']}_to_{r['field']}"] = vals
     return out
 
 
@@ -233,7 +273,7 @@ def make_panel(args, data_root: Path, out: Path) -> None:
     gt = load_vol(gt_path(data_root, mod, tgt_f, sid))
     src = load_vol(gt_path(data_root, mod, src_f, sid))
     preds = []
-    methods = METHODS + ([INR_AVANT] if args.with_before else [])
+    methods = _selected_methods(args)
     for label, per_mod in methods:
         if mod not in per_mod:
             raise SystemExit(f"{label} : modalite {mod} non declaree")
@@ -332,7 +372,7 @@ def make_calib_demo(args, data_root: Path, out: Path) -> None:
     ng = float(np.linalg.norm(g))
 
     rows = []
-    for label, per_mod in METHODS:
+    for label, per_mod in _selected_methods(args):
         if mod not in per_mod:
             continue
         p = pred_path(per_mod[mod][0], mod, args.pair, tgt_f, sid)
@@ -386,7 +426,7 @@ def make_spectrum(args, data_root: Path, out: Path) -> None:
                 ax.plot(centers, p_gt, color="k", lw=2.0, ls=style, label="verite terrain")
             else:
                 ax.plot(centers, p_gt, color="k", lw=2.0, ls=style)
-            for mi, (label, per_mod) in enumerate(METHODS):
+            for mi, (label, per_mod) in enumerate(_selected_methods(args)):
                 if mod not in per_mod:
                     continue
                 p = pred_path(per_mod[mod][0], mod, pair, tgt, args.subject)
@@ -433,9 +473,31 @@ def make_spectrum(args, data_root: Path, out: Path) -> None:
 
 # --------------------------------------------------------------------------- #
 
+def _selected_methods(args) -> List[Tuple[str, Dict[str, Tuple[str, str]]]]:
+    """Les trois architectures de production, plus les temoins demandes.
+
+    L'ordre place les plafonds en DERNIER : ils ne sont pas des methodes
+    concurrentes mais la borne que chaque architecture ne peut pas franchir.
+    """
+    m = list(METHODS)
+    if getattr(args, "with_rbest", False):
+        m.append(R_BEST)
+    if getattr(args, "with_before", False):
+        m.append(INR_AVANT)
+    if getattr(args, "with_ceiling", False):
+        m += [CEIL_VAE, CEIL_INR]
+    return m
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["panel", "spectrum", "calib"], default="panel")
+    ap.add_argument("--with-rbest", action="store_true",
+                    help="ajoute le run corrige du 2026-08-27 (time_scale + FiLM + adjacent_only)")
+    ap.add_argument("--with-ceiling", action="store_true",
+                    help="ajoute le PLAFOND de representation : la verite terrain passee dans "
+                         "l'encodeur/decodeur, sans transport. Montre ce que l'architecture "
+                         "rendrait avec un flow parfait.")
     ap.add_argument("--modality", default="T1W")
     ap.add_argument("--modalities", nargs="+", default=["T1W", "T2W", "T2FLAIR"])
     ap.add_argument("--pair", default="3T_to_7T")
