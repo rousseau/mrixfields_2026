@@ -854,8 +854,12 @@ def main():
             cfg_path=args.config, checkpoint=args.checkpoint, output_dir=args.output_dir,
             split=args.split, modalities=args.modalities, pairs_filter=pairs_filter,
             max_subjects=args.max_subjects,
-            recalibration=(json.load(open(args.intensity_recalibration))
-                           if args.intensity_recalibration else None),
+            # CLI prioritaire sur la config, config prioritaire sur « aucun ».
+            recalibration=(
+                json.load(open(args.intensity_recalibration))
+                if args.intensity_recalibration
+                else (json.load(open(cfg_infer["intensity_recalibration"]))
+                      if cfg_infer.get("intensity_recalibration") else None)),
             env_path=args.env, n_steps=args.n_steps, norm_mode=args.norm_mode,
             center_crop_only=args.center_crop_only,
             use_ema=not args.no_ema, skip_existing=args.skip_existing, device=args.device,

@@ -203,3 +203,14 @@ inference:
   n_steps: 20
   ode_solver: euler
   norm_mode: field_fixed
+  # RECALAGE D'INTENSITE (2026-08-29). La denormalisation ci-dessus multiplie par
+  # un `hi` FIXE par (modalite, champ cible), donc chaque sujet recoit l'echelle
+  # MOYENNE de sa classe. Cette table corrige la part SYSTEMATIQUE du biais qui
+  # en resulte. Estimee en appariant les DISTRIBUTIONS d'intensite des volumes
+  # predits et reels au meme champ, sur les seuls sujets d'ENTRAINEMENT : aucun
+  # appariement requis, aucun sujet d'evaluation dans l'estimation.
+  # Mesure sur les 60 paires : nRMSE 0.3737 -> 0.3525, 40/60 victoires,
+  # signes p = 0.0135, Wilcoxon p = 0.0225. SSIM et LPIPS inchanges — c'est bien
+  # un recalage d'intensite, pas un changement de structure.
+  # Voir results/mmfm/recalib_20260829/manifest.md.
+  intensity_recalibration: configs/mmfm/intensity_recalibration.json
