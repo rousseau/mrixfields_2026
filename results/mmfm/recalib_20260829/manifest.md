@@ -40,7 +40,7 @@ distributions **ne demande aucun appariement**.
 
 ## Résultat
 
-| métrique | R-best | recalé | écart | apparié (60 paires) |
+| métrique | R-best | recalibré | écart | apparié (60 paires) |
 |---|---|---|---|---|
 | **nRMSE** | 0.3737 | **0.3525** | **−0.0212** | **40/60, signes p = 0.0135, Wilcoxon p = 0.0225** |
 | SSIM | 0.9047 | 0.9056 | +0.0009 | 34/60, p = 0.37 |
@@ -48,13 +48,13 @@ distributions **ne demande aucun appariement**.
 
 Par contraste :
 
-| | R-best | recalé | écart | victoires |
+| | R-best | recalibré | écart | victoires |
 |---|---|---|---|---|
 | T1W | 0.4441 | 0.4531 | **+0.0091** | 11/20 |
 | T2W | 0.3181 | **0.2939** | −0.0242 | 14/20 |
 | T2FLAIR | 0.3589 | **0.3104** | −0.0485 | 15/20 |
 
-**SSIM et LPIPS ne bougent pas** : c'est la signature d'un recalage d'intensité
+**SSIM et LPIPS ne bougent pas** : c'est la signature d'une recalibration d'intensité
 pur, qui ne touche pas la structure. C'est le comportement attendu, et c'est
 aussi la limite — la correction ne rend pas les images meilleures, elle les
 remet au bon niveau.
@@ -70,11 +70,11 @@ constante de classe ne peut rien contre ça.
 |---|---|
 | production (vectorisé) | 0.3794 |
 | R-best (géométrie du flow corrigée) | 0.3737 |
-| **R-best + recalage** | **0.3525** |
+| **R-best + recalibration** | **0.3525** |
 | *leave-one-out du 2026-08-25 (circulaire, non livrable)* | *0.3231* |
 | *oracle par volume (borne inatteignable)* | *0.2191* |
 
-Le recalage récupère donc **environ 40 %** de ce que le protocole circulaire
+La recalibration récupère donc **environ 40 %** de ce que le protocole circulaire
 laissait espérer (0.3737 → 0.3525 contre 0.3737 → ~0.3231), et le fait sans
 toucher aux données d'évaluation.
 
@@ -112,10 +112,10 @@ toucher aux données d'évaluation.
 
 | chemin | contenu |
 |---|---|
-| `task3_rbest_recal_{T1W,T2W,T2FLAIR}.csv` | score après recalage |
+| `task3_rbest_recal_{T1W,T2W,T2FLAIR}.csv` | score après recalibration |
 | `../../../configs/mmfm/intensity_recalibration.json` | **la table livrée** (3 contrastes) |
 | `../../../configs/mmfm/intensity_recalibration_nopair.json` | table intermédiaire, 2 contrastes, échantillon plus mince |
-| `../staircase_20260827/task3_vec_rbest_*.csv` | référence avant recalage |
+| `../staircase_20260827/task3_vec_rbest_*.csv` | référence avant recalibration |
 
 ## Reproduction
 

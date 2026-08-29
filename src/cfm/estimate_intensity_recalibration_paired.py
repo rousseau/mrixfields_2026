@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
-"""Estime le recalage d'intensite par la formule ORACLE, sur un split APPARIE
-tenu a l'ecart de l'evaluation.
+"""Estime la recalibration d'intensite par la formule ORACLE, sur un split APPARIE.
+
+    ATTENTION — INUTILISABLE SUR CE JEU DE DONNEES EN L'ETAT.
+
+    Ce script attend un split ou le MEME sujet existe a plusieurs champs. Verifie
+    le 2026-08-29 : il n'en existe aucun en dehors des 3 sujets d'evaluation.
+    `Validating_prospective` en a l'apparence (3 fichiers par champ) mais PAS la
+    propriete : les sujets y sont 0001-0003 a 0.1T, 0004/0005/0008 a 1.5T,
+    0010-0012 a 3T, 0013-0015 a 5T, 0016-0018 a 7T -- chacun n'existe qu'a UN
+    champ, comme le jeu d'entrainement. J'ai lu « 3 fichiers par champ » comme
+    « les memes 3 sujets aux 5 champs » et paye 5.2 h de GPU pour le decouvrir.
+    Le script est conserve parce que la METHODE est la bonne le jour ou des
+    donnees appariees existeront ; utiliser
+    `estimate_intensity_recalibration.py` en attendant.
 
 Complement de `estimate_intensity_recalibration.py`, qui apparie des
 DISTRIBUTIONS (aucun appariement requis, mais estimateur approche). Ici on
@@ -11,14 +23,7 @@ exact qui minimise ||a*p - g||^2 :
 
 Le rapport de normes seul, faute du cosinus, ne capte qu'une partie du signal
 (correlation 0.441 mesuree le 2026-08-28) : c'est precisement ce terme que cette
-voie recupere.
-
-LE SPLIT COMPTE. `Validating_prospective` contient 3 sujets (0016/0017/0018)
-distincts des 3 sujets d'evaluation (0006/0007/0009), avec verite terrain aux 5
-champs et 3 contrastes, et n'avait jamais servi dans ce projet. Estimer dessus
-puis appliquer a l'evaluation est donc un protocole propre — contrairement au
-leave-one-subject-out du 2026-08-25, qui consommait les sujets d'evaluation
-eux-memes.
+voie recupererait.
 
 Le script REFUSE d'estimer sur le split d'evaluation.
 
@@ -60,7 +65,7 @@ def main() -> None:
 
     if a.split == FORBIDDEN:
         raise SystemExit(
-            f"--split {FORBIDDEN} est le split d'EVALUATION. Estimer le recalage "
+            f"--split {FORBIDDEN} est le split d'EVALUATION. Estimer la recalibration "
             f"dessus puis y mesurer le gain serait circulaire. Utiliser "
             f"Validating_prospective.")
 

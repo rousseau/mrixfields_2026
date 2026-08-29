@@ -319,7 +319,7 @@ def mode_calibration(args) -> None:
                     # p_sq / pg / g_sq permettent de recalculer le nRMSE pour
                     # N'IMPORTE QUEL facteur d'echelle a en forme fermee :
                     #   nRMSE(a)^2 = (a^2*p_sq - 2*a*pg + g_sq) / g_sq
-                    # Sans eux, tester une nouvelle regle de recalage exigerait
+                    # Sans eux, tester une nouvelle regle de recalibration exigerait
                     # de relire les 540 volumes de prediction.
                     rows.append({"modality": mod, "pair": pair, "target": tgt_f,
                                  "subject": sid, "method": label,
@@ -399,7 +399,7 @@ def mode_recalib(args) -> None:
     cible ? Si oui, il s'estime sur des donnees d'entrainement une fois pour
     toutes — c'est une constante de dénormalisation a corriger, pas un oracle.
 
-    On teste donc des regles de recalage estimees en LAISSANT LE SUJET DE COTE
+    On teste donc des regles de recalibration estimees en LAISSANT LE SUJET DE COTE
     (leave-one-subject-out) : le facteur applique au sujet s est la mediane des
     facteurs oracles des AUTRES sujets. Avec 3 sujets, cela veut dire 2 sujets
     par estimation : bruite, mais honnete — aucune information de la verite du
@@ -434,7 +434,7 @@ def mode_recalib(args) -> None:
         ("constante par paire", lambda r: loo(r, lambda x: x["pair"])),
     ]
     names = [m[0] for m in METHODS]
-    print("nRMSE moyen selon la regle de recalage — facteurs estimes SANS le sujet evalue\n")
+    print("nRMSE moyen selon la regle de recalibration — facteurs estimes SANS le sujet evalue\n")
     print(f"  {'regle':28s}" + "".join(f"{n:>34s}" for n in names))
     print(f"  {'':28s}" + "".join(f"{'T1W':>11s}{'T2W':>11s}{'T2FLAIR':>12s}" for _ in names))
     for label, rule in regles + [("oracle par volume (borne)", None)]:

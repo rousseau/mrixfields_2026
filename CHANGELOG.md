@@ -368,7 +368,7 @@ pas d'anatomie.** Détail : `results/mmfm/qualitative_20260824/manifest.md`.
 | mesure | résultat |
 |---|---|
 | Correction d'échelle oracle (un scalaire par volume) | supprime **82 %** (T1W) et **83 %** (T2FLAIR) de l'énergie de l'erreur ; 39 % en T2W ; 20–24 % pour l'INR |
-| Constante de recalage par paire, estimée sans oracle (leave-one-subject-out) | 0.3794 → **0.3231**, −15 %, **sans réentraîner** |
+| Constante de recalibration par paire, estimée sans oracle (leave-one-subject-out) | 0.3794 → **0.3231**, −15 %, **sans réentraîner** |
 | Témoin identité, gain paire-à-paire | +34.1 % T1W, **+5.6 % T2W, −1.2 % T2FLAIR** (battu sur 11 paires sur 20) |
 | Sujet 0009, T1W@7T | norme L2 de 325 contre 845 et 705 → **46 % du « mur du 7T » vient d'un seul volume** |
 | Indice de netteté (intérieur du cerveau) | vectorisé 0.36 / UNet 0.36 / INR 0.24, témoin 1.00 — **un tiers de la finesse réelle** |
@@ -553,7 +553,7 @@ une lacune que ce journal existe pour ne plus reproduire.
 | 1 | `test_inr_backbone_smoke.py` : seuil `nrmse_fg < 0.6` qui accepte le cassé, à 2 mm | 1 h |
 | 2 | Aucun test qui compare la loss finale à « prédire zéro » — trois lignes, aurait tout arrêté | 15 min |
 | 3 | Régénérer le cache INR sous le prétraitement corrigé | ~6 h GPU |
-| 4 | Constante de recalage d'intensité par paire (−15 % mesuré, sans réentraîner) : pas de données appariées pour l'ajuster hors des 3 sujets d'évaluation ; voie non testée = comparer les distributions d'intensité prédites et réelles, sans appariement | à instruire |
+| 4 | Constante de recalibration d'intensité par paire (−15 % mesuré, sans réentraîner) : pas de données appariées pour l'ajuster hors des 3 sujets d'évaluation ; voie non testée = comparer les distributions d'intensité prédites et réelles, sans appariement | à instruire |
 | 5 | Adoption du MedVAE perceptuel : régénérer les caches + réentraîner les deux flows | >1 jour |
 | 6 | Géométrie du latent INR (25 % de structure commune contre 91 %) : canoniser l'ajustement | ~6 h |
 | 7 | Loss L1 au lieu de L2 : écart à la dérivation du flow matching, effet mesuré nul sur les symptômes, à corriger par correction | 15 min + réentraînement |

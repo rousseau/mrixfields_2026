@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Estime le recalage d'intensite SANS appariement, sur les sujets d'entrainement.
+"""Estime la recalibration d'intensite SANS appariement, sur les sujets d'entrainement.
 
 LE PROBLEME (mesure le 2026-08-25, `results/mmfm/qualitative_20260824/manifest.md`
 section 4). L'inference denormalise par un `hi` FIXE par (modalite, champ cible),
@@ -135,7 +135,7 @@ def main() -> None:
         raise SystemExit(
             f"--split {a.split} : les volumes reels doivent venir des sujets "
             f"d'ENTRAINEMENT. Utiliser Training_retrospective, sans quoi le "
-            f"recalage est ajuste sur les donnees d'evaluation.")
+            f"la recalibration serait ajustee sur les donnees d'evaluation.")
 
     root = Path(load_env("local")["data_root"])
     print(f"Niveaux REELS ({a.split}, mediane sur <= {a.limit} sujets par classe)")
@@ -145,7 +145,7 @@ def main() -> None:
 
     fac_tgt: dict = {}
     fac_pair: dict = {}
-    print(f"\nFacteurs de recalage (statistique '{a.stat}') — reel / predit")
+    print(f"\nFacteurs de recalibration (statistique '{a.stat}') — reel / predit")
     for mod in a.modalities:
         if mod not in real or mod not in ptgt:
             continue

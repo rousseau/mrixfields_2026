@@ -668,7 +668,7 @@ def infer_batch(
             pair_out_dir = out_root / "task3" / mod / f"{src}_to_{tgt}"
             pair_out_dir.mkdir(parents=True, exist_ok=True)
 
-            # Facteur de recalage : la table par PAIRE est plus fine que celle
+            # Facteur de recalibration : la table par PAIRE est plus fine que celle
             # par champ cible (0.3231 contre 0.3345 au leave-one-out du
             # 2026-08-25), on la prefere quand elle existe.
             recal = 1.0
@@ -698,7 +698,7 @@ def infer_batch(
             input_files = sorted(input_dir.glob("*.nii.gz"))
             if max_subjects is not None:
                 # Sous-echantillonnage DETERMINISTE : le meme sous-ensemble a
-                # chaque appel, sinon deux estimations du recalage ne portent pas
+                # chaque appel, sinon deux estimations de la recalibration ne portent pas
                 # sur les memes sujets.
                 input_files = input_files[:max_subjects]
             print(f"\n[{mod}] {src} → {tgt} : {len(input_files)} sujets")
@@ -753,7 +753,7 @@ def parse_args():
                         "d'intensite (80 %% de l'energie de l'erreur en T1W/T2FLAIR)")
     p.add_argument("--max_subjects", type=int, default=None,
                    help="limite le nombre de sujets SOURCE par paire. Sert a estimer "
-                        "le recalage d'intensite sur les sujets d'ENTRAINEMENT sans "
+                        "la recalibration d'intensite sur les sujets d'ENTRAINEMENT sans "
                         "payer les 143 sujets par paire.")
     p.add_argument("--modalities", nargs="+", default=None)
     p.add_argument("--pairs", default=None, help="Subset of pairs, e.g. '0.1T_to_7T,1.5T_to_3T'")

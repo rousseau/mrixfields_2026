@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Applique un recalage d'intensite a un arbre de predictions DEJA ecrit.
+"""Applique une recalibration d'intensite a un arbre de predictions DEJA ecrit.
 
-Le recalage est une simple multiplication apres denormalisation : le refaire en
-relancant l'inference couterait ~3.5 h de GPU pour un resultat identique au bit
-pres. Ce script relit les volumes, multiplie, et reecrit dans un nouvel arbre —
+La recalibration est une simple multiplication apres denormalisation : la refaire
+en relancant l'inference couterait ~3.5 h de GPU pour un resultat identique au
+bit pres. Ce script relit les volumes, multiplie, et reecrit dans un nouvel arbre —
 quelques minutes, sans GPU.
 
 `src/cfm/infer_mmfm_unified.py --intensity_recalibration` reste le chemin de
-PRODUCTION (le recalage y est applique au moment de la prediction) ; celui-ci
+PRODUCTION (elle y est appliquee au moment de la prediction) ; celui-ci
 sert a evaluer une table de facteurs sur des predictions existantes.
 
 Usage :

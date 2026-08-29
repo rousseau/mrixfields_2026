@@ -211,6 +211,6 @@ inference:
   # appariement requis, aucun sujet d'evaluation dans l'estimation.
   # Mesure sur les 60 paires : nRMSE 0.3737 -> 0.3525, 40/60 victoires,
   # signes p = 0.0135, Wilcoxon p = 0.0225. SSIM et LPIPS inchanges — c'est bien
-  # un recalage d'intensite, pas un changement de structure.
+  # une recalibration d'intensite, pas un changement de structure.
   # Voir results/mmfm/recalib_20260829/manifest.md.
   intensity_recalibration: configs/mmfm/intensity_recalibration.json

@@ -241,7 +241,7 @@ l'architecture**. Aucune n'a de force propre sur les champs extrêmes.
 > - **80 % de l'énergie de l'erreur** en T1W et T2FLAIR disparaît avec un seul
 >   facteur d'échelle par volume : l'anatomie est juste, le niveau est faux.
 >   La part SYSTÉMATIQUE en est récupérable sans oracle : une constante de
->   recalage par paire (source→cible), estimée en laissant le sujet évalué de
+>   recalibration par paire (source→cible), estimée en laissant le sujet évalué de
 >   côté, ferait passer le vectorisé de **0.3794 à 0.3231 (−15 %) sans
 >   réentraînement**. C'est la piste à instruire avant tout travail
 >   supplémentaire sur l'architecture.

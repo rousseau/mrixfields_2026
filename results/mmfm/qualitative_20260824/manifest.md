@@ -35,7 +35,7 @@ Sa part systématique est récupérable sans réentraîner : **0.3794 → 0.3231
 **Les cinq résultats, dans l'ordre d'importance :**
 
 1. 80 % de l'énergie de l'erreur part avec UN scalaire par volume (§4) ; la part
-   systématique en est récupérable par une constante de recalage par paire,
+   systématique en est récupérable par une constante de recalibration par paire,
    estimée sans oracle : score moyen 0.3794 → **0.3231**, −15 %, sans
    réentraînement (§4bis).
 2. Face au témoin « ne rien faire », le gain paire-à-paire du vectorisé vaut
@@ -267,7 +267,7 @@ vérité n'entre dans son propre facteur. `--mode recalib`.
 
 nRMSE moyen, vectorisé :
 
-| règle de recalage | T1W | T2W | T2FLAIR | moyenne |
+| règle de recalibration | T1W | T2W | T2FLAIR | moyenne |
 |---|---|---|---|---|
 | brut (a = 1) — état actuel | 0.4353 | 0.3376 | 0.3654 | 0.3794 |
 | constante par contraste | 0.4456 | 0.3371 | 0.3684 | 0.3837 |
@@ -464,7 +464,7 @@ prédiction ne sait pas dégrader.
 | chemin | contenu |
 |---|---|
 | `identity_baseline_{T1W,T2W,T2FLAIR}.csv` | témoin « ne rien faire », formules officielles vérifiées bit-à-bit |
-| `calibration_intensite.csv` | par (contraste, paire, sujet, méthode) : nRMSE brut, après correction d'échelle réalisable, oracle d'échelle, oracle affine, et les sommes `p_sq`/`pg`/`g_sq` qui permettent de tester une autre règle de recalage sans relire les volumes |
+| `calibration_intensite.csv` | par (contraste, paire, sujet, méthode) : nRMSE brut, après correction d'échelle réalisable, oracle d'échelle, oracle affine, et les sommes `p_sq`/`pg`/`g_sq` qui permettent de tester une autre règle de recalibration sans relire les volumes |
 | `sharpness_index_cerveau_entier.csv` | indice de netteté relative, cerveau entier |
 | `sharpness_index_interieur_0.5.csv` | le même, restreint à l'intérieur du cerveau — c'est celui qui fait foi |
 | `spectres_radiaux.png` / `.csv` | puissance spectrale radiale, 3 contrastes x 2 paires |
