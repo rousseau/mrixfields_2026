@@ -207,18 +207,6 @@ def main() -> None:
             r, p = real[mod][tgt][a.stat], st[a.stat]
             fac_pair[mod][pair] = float(r / p) if p > 1e-12 else 1.0
 
-    out = {
-        "statistic": a.stat,
-        "estimated_from": {"split": a.split, "pred_root": str(a.pred_root),
-                           "limit": a.limit},
-        "note": ("Facteurs multiplicatifs appliques a la prediction APRES "
-                 "denormalisation. Estimes par appariement de DISTRIBUTIONS entre "
-                 "volumes predits et volumes reels au meme champ, sur les sujets "
-                 "d'entrainement uniquement — aucun sujet d'evaluation n'y entre."),
-        "by_target_field": fac_tgt,
-        "by_pair": fac_pair,
-        **out_extra,
-    }
     n_block = sum(len(v) for v in blocked.values())
     if n_block:
         print(f"\n  {n_block} champ(s) cible(s) BLOQUE(S) — facteur force a 1.000 :")
@@ -231,8 +219,19 @@ def main() -> None:
               "2026-08-30 : sans ce\n  garde-fou, nRMSE 0.3749 -> 0.4690 (19 victoires "
               "sur 60, p = 0.006).")
 
-    out_extra = {"blocked_target_fields": {k: v for k, v in blocked.items() if v},
-                 "min_contrast_ratio": a.min_contrast_ratio}
+    out = {
+        "statistic": a.stat,
+        "estimated_from": {"split": a.split, "pred_root": str(a.pred_root),
+                           "limit": a.limit},
+        "note": ("Facteurs multiplicatifs appliques a la prediction APRES "
+                 "denormalisation. Estimes par appariement de DISTRIBUTIONS entre "
+                 "volumes predits et volumes reels au meme champ, sur les sujets "
+                 "d'entrainement uniquement — aucun sujet d'evaluation n'y entre."),
+        "by_target_field": fac_tgt,
+        "by_pair": fac_pair,
+        "blocked_target_fields": {k: v for k, v in blocked.items() if v},
+        "min_contrast_ratio": a.min_contrast_ratio,
+    }
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     json.dump(out, open(a.out, "w"), indent=2)
     print(f"\necrit -> {a.out}")
