@@ -57,6 +57,58 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-08-30 — Recalibration d'intensité : PISTE FERMÉE, négative
+
+**Verdict : un succès sur trois architectures, deux explications réfutées, et une
+cause qui n'est pas réparable par un meilleur estimateur.** Détail :
+`results/mmfm/recalib_20260829/manifest.md` §8.
+
+| architecture | avant | après | écart | apparié (60 paires) |
+|---|---|---|---|---|
+| **vectorisé R-best** | 0.3737 | **0.3525** | −0.0212 | 40/60, p = 0.014 |
+| **UNet** | 0.4033 | 0.4688 | **+0.0654** | 28/60, p = 0.70 |
+| **INR** | 0.3749 | 0.4690 | **+0.0941** | 19/60, p = 0.006 |
+
+La clé `inference.intensity_recalibration` est **retirée** de la config de
+production. Le code et les tables restent en place pour trace. Garder un réglage
+qui marche sur 1 architecture sur 3 sans explication serait un réglage non
+justifié.
+
+**Deux hypothèses formulées, deux réfutées par la mesure.**
+
+1. *Le terme `cos(p,g)` manquant* — le facteur oracle vaut `(‖g‖/‖p‖)·cos(p,g)`
+   et l'estimateur n'en calcule que le rapport de normes. Vrai pour l'INR
+   (prédictions plates). **Faux pour l'UNet** : `cos` y vaut **0.935–0.993**, et
+   la corrélation à l'oracle n'est pourtant que de **0.344**.
+2. *La norme L2 conflate intensité et taille du cerveau* — **faux** :
+   CV(‖v‖) ≈ CV(moyenne cerveau) partout (0.213 contre 0.217 ; 0.140 contre
+   0.140), le nombre de voxels ne varie que de 8–10 %.
+
+**Cause retenue** : la **dispersion inter-sujets du niveau atteint 35 %**
+(T1W@7T) face à une correction qui est une **constante par classe**, estimée sur
+une population et appliquée à une autre. Problème de transfert de population, pas
+d'estimation. Le seul protocole qui fonctionnait (leave-one-out, 0.3794 → 0.3231)
+consomme les sujets d'évaluation et n'est pas déployable.
+
+**Garde-fou : utile, insuffisant.** Rapport de contraste relatif prédictions/réel,
+seuil 0.65. Sur l'INR il évite **+0.0891 des +0.0941** de dégât (52/60 paires
+strictement inchangées ; des 8 modifiées, 4 gagnent et 4 perdent, p = 1.00 ex
+æquo exclus). Sur R-best il ne bloque rien et le gain reste intact. **Sur l'UNet
+il ne bloque rien non plus — et le dégât passe.** Calibré sur deux architectures,
+il ne discrimine pas la troisième.
+
+**Ce qui reste vrai et déplace la suite** : l'erreur d'échelle EST 80 % de
+l'énergie de l'erreur, et un oracle par volume donnerait 0.2191 au lieu de
+0.3794. **La marche existe mais n'est pas franchissable avec 3 sujets appariés.**
+L'effort passe à la marche suivante, **0.2191 → 0.1048 : l'erreur STRUCTURELLE
+du flow.**
+
+**Piège de statistique, corrigé en cours de route** : j'avais annoncé « 4/60
+victoires, p = 0.0000 » pour l'INR gardé, en comptant **52 égalités exactes**
+(facteur 1.000) comme des défaites. Les ex æquo doivent être exclus d'un test des
+signes — le bon calcul est 4 contre 4 sur 8, p = 1.00. À vérifier
+systématiquement dès qu'une correction laisse des paires inchangées.
+
 ## 2026-08-27 (soir) — Le correctif de temps SEUL ne change rien : le mécanisme de conditionnement domine
 
 **Verdict : R1 (`time_scale: 1000` seul, 25 000 itérations, 2 h) est TOUJOURS
@@ -553,7 +605,7 @@ une lacune que ce journal existe pour ne plus reproduire.
 | 1 | `test_inr_backbone_smoke.py` : seuil `nrmse_fg < 0.6` qui accepte le cassé, à 2 mm | 1 h |
 | 2 | Aucun test qui compare la loss finale à « prédire zéro » — trois lignes, aurait tout arrêté | 15 min |
 | 3 | Régénérer le cache INR sous le prétraitement corrigé | ~6 h GPU |
-| 4 | Constante de recalibration d'intensité par paire (−15 % mesuré, sans réentraîner) : pas de données appariées pour l'ajuster hors des 3 sujets d'évaluation ; voie non testée = comparer les distributions d'intensité prédites et réelles, sans appariement | à instruire |
+| 4 | ~~Constante de recalibration d'intensité par paire~~ **FERMÉE, NÉGATIVE (2026-08-30)** — la voie sans appariement a été instruite : gagne sur 1 architecture sur 3, deux explications réfutées, cause = variance inter-sujets de 35 % contre une constante par classe. Non réparable par un meilleur estimateur | — |
 | 5 | Adoption du MedVAE perceptuel : régénérer les caches + réentraîner les deux flows | >1 jour |
 | 6 | Géométrie du latent INR (25 % de structure commune contre 91 %) : canoniser l'ajustement | ~6 h |
 | 7 | Loss L1 au lieu de L2 : écart à la dérivation du flow matching, effet mesuré nul sur les symptômes, à corriger par correction | 15 min + réentraînement |

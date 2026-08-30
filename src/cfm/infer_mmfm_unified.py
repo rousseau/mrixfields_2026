@@ -410,7 +410,7 @@ def process_volume_unified(
             )
         pred_05mm = denormalize_from_01(pred_05mm, tgt_lo, tgt_hi)
 
-    # RECALAGE D'INTENSITE. La denormalisation ci-dessus multiplie par un `hi`
+    # RECALIBRATION D'INTENSITE. La denormalisation ci-dessus multiplie par un `hi`
     # FIXE par (modalite, champ cible), calcule sur les 1939 volumes
     # d'entrainement : chaque sujet recoit l'echelle MOYENNE de sa classe. Le
     # facteur global qu'un oracle choisirait enleve alors 80 % de l'energie de
