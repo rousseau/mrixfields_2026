@@ -277,6 +277,23 @@ def subject_scale(src_vol: np.ndarray, hi_pop_src: float, pct: float = 99.5) -> 
     return float(np.percentile(src_vol, pct)) / max(hi_pop_src, 1e-12)
 
 
+def _methods_for(args):
+    """Les methodes a scorer : celles codees en dur, OU une racine arbitraire.
+
+    Sans cela, mesurer l'erreur STRUCTURELLE d'un nouveau run exigerait de
+    modifier `METHODS` a chaque fois. Or c'est desormais la mesure de travail :
+    en nRMSE brut, 80 % de ce qu'on mesure est l'erreur d'echelle d'intensite,
+    declaree inaccessible avec 3 sujets apparies (voir
+    results/mmfm/recalib_20260829/manifest.md §8) -- tout progres structurel y est
+    noye. C'est exactement ce qui est arrive a R-best : geometrie du flow reparee
+    d'un facteur 100, score inchange.
+    """
+    if getattr(args, "pred_root", None):
+        name = args.name or Path(args.pred_root).parts[-3]
+        return [(name, {m: (args.pred_root, "") for m in MODALITIES})]
+    return METHODS
+
+
 def mode_calibration(args) -> None:
     """Quelle part de l'erreur est une simple erreur d'ECHELLE D'INTENSITE ?
 
@@ -303,7 +320,7 @@ def mode_calibration(args) -> None:
                 g = cache(mod, tgt_f, sid).ravel().astype(np.float64)
                 ng = float(np.linalg.norm(g))
                 r_sub = subject_scale(cache(mod, src_f, sid), hi_pop[mod][src_f])
-                for label, per_mod in METHODS:
+                for label, per_mod in _methods_for(args):
                     if mod not in per_mod:
                         continue
                     pth = pred_path(per_mod[mod][0], mod, pair, tgt_f, sid)
@@ -341,7 +358,7 @@ def mode_calibration(args) -> None:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
     print(f"\n-> {out}")
 
-    names = [m[0] for m in METHODS]
+    names = [m[0] for m in _methods_for(args)]
     print("\nnRMSE brut -> correction REALISABLE (relative au sujet) -> ORACLE d'echelle\n")
     print(f"  {'contraste':10s} " + "".join(f"{n:>34s}" for n in names))
     for mod in args.modalities:
@@ -537,6 +554,11 @@ def main():
                          "(1.0 = cerveau entier ; 0.5 = interieur seul, sans les bords)")
     ap.add_argument("--check-pairs", nargs="+", default=["3T_to_7T", "0.1T_to_1.5T", "7T_to_0.1T"])
     ap.add_argument("--tol", type=float, default=5e-4)
+    ap.add_argument("--pred-root", default=None,
+                    help="racine de predictions a scorer (.../predictions/task3) au lieu "
+                         "des methodes codees en dur — pour mesurer l'erreur STRUCTURELLE "
+                         "d'un nouveau run")
+    ap.add_argument("--name", default=None, help="nom de la methode dans le CSV")
     ap.add_argument("--outdir", default=str(DEFAULT_OUTDIR),
                     help="repertoire de sortie ; en passer un NOUVEAU par campagne, "
                          "sous peine d'ecraser les CSV d'une campagne precedente")
