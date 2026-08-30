@@ -51,6 +51,24 @@ from common.config import load_env
 
 FIELDS = ["0.1T", "1.5T", "3T", "5T", "7T"]
 
+# GARDE-FOU — seuil sur le rapport de contraste (predit / reel).
+#
+# L'estimateur vaut ||g||/||p||, alors que le facteur oracle vaut
+# (||g||/||p||) * cos(p, g). L'approximation ne tient que si la prediction a
+# approximativement la bonne FORME. Quand elle est plate, cos est petit, le
+# rapport de normes explose, et multiplier par un facteur gonfle ne restaure
+# rien -- il amplifie une bouillie.
+#
+# Mesure du 2026-08-30, sur les deux cas connus :
+#   R-best (la recalibration GAGNE, nRMSE 0.3737 -> 0.3525) : rapport 0.701-1.282
+#   INR    (elle DEGRADE,           nRMSE 0.3749 -> 0.4690) : rapport 0.277-0.777
+# et les cellules T2W de l'INR, ou le degat etait le pire (+0.2357, 2 victoires
+# sur 20), sont a 0.277-0.593.
+#
+# 0.65 accepte les 15 cellules de R-best (minimum 0.701) et rejette 13 des 15
+# cellules de l'INR, dont TOUTES celles de T2W.
+MIN_CONTRAST_RATIO = 0.65
+
 
 def _load(p: Path) -> np.ndarray:
     return np.asarray(nib.load(str(p)).get_fdata(dtype=np.float32))
@@ -65,8 +83,13 @@ def _stats(v: np.ndarray) -> dict:
     mais aussi moins directement liee a la metrique.
     """
     m = v > np.percentile(v, 60)
+    mean = float(v[m].mean()) if m.any() else 0.0
     return {"l2": float(np.linalg.norm(v)),
-            "brain": float(v[m].mean()) if m.any() else 0.0}
+            "brain": mean,
+            # Contraste RELATIF, sans dimension : invariant a l'echelle, donc il
+            # mesure la FORME et non le niveau. C'est ce qui permet de detecter
+            # qu'un ecart n'est PAS une simple erreur d'echelle.
+            "contrast": (float(v[m].std()) / mean) if (m.any() and mean > 1e-9) else 0.0}
 
 
 def real_levels(root: Path, split: str, modalities: list[str], limit: int) -> dict:
@@ -81,7 +104,7 @@ def real_levels(root: Path, split: str, modalities: list[str], limit: int) -> di
             s = [_stats(_load(p)) for p in files]
             if not s:
                 continue
-            out[mod][f] = {k: float(np.median([x[k] for x in s])) for k in ("l2", "brain")}
+            out[mod][f] = {k: float(np.median([x[k] for x in s])) for k in ("l2", "brain", "contrast")}
             out[mod][f]["n"] = len(s)
             print(f"  reel  {mod:8s} {f:6s} n={len(s):3d}  "
                   f"l2={out[mod][f]['l2']:9.1f}  cerveau={out[mod][f]['brain']:.4f}")
@@ -111,7 +134,7 @@ def pred_levels(pred_root: Path, modalities: list[str]) -> tuple[dict, dict]:
             out[mod] = {}
             for k, lst in per.items():
                 out[mod][k] = {m: float(np.median([x[m] for x in lst]))
-                               for m in ("l2", "brain")}
+                               for m in ("l2", "brain", "contrast")}
                 out[mod][k]["n"] = len(lst)
         return out
 
@@ -128,6 +151,10 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=40,
                     help="volumes reels par classe pour la mediane")
     ap.add_argument("--stat", default="l2", choices=["l2", "brain"])
+    ap.add_argument("--min-contrast-ratio", type=float, default=MIN_CONTRAST_RATIO,
+                    help="en dessous, le facteur est force a 1.0 : la prediction est "
+                         "trop plate pour qu'un scalaire corrige quoi que ce soit "
+                         "(0 pour desactiver le garde-fou)")
     ap.add_argument("--out", default="configs/mmfm/intensity_recalibration.json")
     a = ap.parse_args()
 
@@ -145,6 +172,7 @@ def main() -> None:
 
     fac_tgt: dict = {}
     fac_pair: dict = {}
+    blocked: dict = defaultdict(list)
     print(f"\nFacteurs de recalibration (statistique '{a.stat}') — reel / predit")
     for mod in a.modalities:
         if mod not in real or mod not in ptgt:
@@ -155,13 +183,26 @@ def main() -> None:
             if f not in real[mod] or f not in ptgt[mod]:
                 continue
             r, p = real[mod][f][a.stat], ptgt[mod][f][a.stat]
-            fac_tgt[mod][f] = float(r / p) if p > 1e-12 else 1.0
-            print(f"    cible {f:6s} : {fac_tgt[mod][f]:6.3f}   "
-                  f"(n predit {ptgt[mod][f]['n']}, n reel {real[mod][f]['n']})")
+            fac = float(r / p) if p > 1e-12 else 1.0
+            cr = (ptgt[mod][f]["contrast"] / real[mod][f]["contrast"]
+                  if real[mod][f]["contrast"] > 1e-9 else 0.0)
+            if cr < a.min_contrast_ratio:
+                blocked[mod].append(f)
+                fac_tgt[mod][f] = 1.0
+                print(f"    cible {f:6s} : {fac:6.3f} -> 1.000  BLOQUE "
+                      f"(contraste {cr:.3f} < {a.min_contrast_ratio:.2f} : la prediction "
+                      f"est trop plate, l'ecart n'est pas une erreur d'echelle)")
+            else:
+                fac_tgt[mod][f] = fac
+                print(f"    cible {f:6s} : {fac:6.3f}   contraste {cr:.3f}   "
+                      f"(n predit {ptgt[mod][f]['n']}, n reel {real[mod][f]['n']})")
         fac_pair[mod] = {}
         for pair, st in sorted(ppair.get(mod, {}).items()):
             tgt = pair.split("_to_")[1]
             if tgt not in real[mod]:
+                continue
+            if tgt in blocked[mod]:
+                fac_pair[mod][pair] = 1.0   # le blocage du champ cible s'herite
                 continue
             r, p = real[mod][tgt][a.stat], st[a.stat]
             fac_pair[mod][pair] = float(r / p) if p > 1e-12 else 1.0
@@ -176,7 +217,22 @@ def main() -> None:
                  "d'entrainement uniquement — aucun sujet d'evaluation n'y entre."),
         "by_target_field": fac_tgt,
         "by_pair": fac_pair,
+        **out_extra,
     }
+    n_block = sum(len(v) for v in blocked.values())
+    if n_block:
+        print(f"\n  {n_block} champ(s) cible(s) BLOQUE(S) — facteur force a 1.000 :")
+        for mod, fs in blocked.items():
+            if fs:
+                print(f"    {mod} : {', '.join(fs)}")
+        print("  Motif : le contraste relatif des predictions y est trop faible ; "
+              "l'ecart\n  a la verite n'est pas une erreur d'echelle et un facteur "
+              "multiplicatif\n  amplifierait une image plate. Mesure sur l'INR le "
+              "2026-08-30 : sans ce\n  garde-fou, nRMSE 0.3749 -> 0.4690 (19 victoires "
+              "sur 60, p = 0.006).")
+
+    out_extra = {"blocked_target_fields": {k: v for k, v in blocked.items() if v},
+                 "min_contrast_ratio": a.min_contrast_ratio}
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     json.dump(out, open(a.out, "w"), indent=2)
     print(f"\necrit -> {a.out}")
