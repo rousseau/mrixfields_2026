@@ -57,6 +57,39 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-08-31 — Contraction des latents : hypothèse RÉFUTÉE (c'est l'inverse)
+
+**Verdict : les latents prédits sont PLUS dispersés que les réels, pas moins.**
+Détail : `results/mmfm/contraction_20260831/manifest.md`.
+
+| rapport prédit / réel | valeur |
+|---|---|
+| amplitude (écart-type par élément) | **1.166** |
+| dispersion inter-sujets | **1.152** |
+| **rang effectif (diversité)** | **0.862** |
+
+Contrôle de cohérence : sur un pas d'identité (`dt = 0`), écart relatif
+**exactement 0.00e+00** — la mesure est fiable.
+
+L'hypothèse testée : L1 estime la médiane conditionnelle, sur un couplage
+indépendant (l'OT étant vacuous à 129 024 dimensions), donc le flow devrait rendre
+une tendance centrale. **Faux.** C'est la **troisième** réfutation de la piste
+L1/tendance centrale — après ‖médiane‖/‖moyenne‖ = 0.98–1.01 et l'échec
+d'`adjacent_only`, tous deux le 2026-08-26.
+
+**La partie D du plan (loss L2 + standardisation, 4 h de GPU) n'est donc PAS
+lancée.** C'est précisément ce que le diagnostic devait décider, et il l'a fait en
+quelques minutes au lieu de deux réentraînements.
+
+**Observation neuve, sans correctif proposé.** Le rang effectif est la seule
+quantité déficitaire (T1W 15.2/19.3, T2W 17.4/20.8, T2FLAIR 18.6/19.6) : perte de
+**diversité à taille constante**, pas effondrement vers la moyenne. Et la
+dispersion prédite est **quasi identique quel que soit le champ cible** (T1W :
+2458, 2459, 2460, 2446 contre 2208, 2277, 2465, 2171 pour les vrais) — le flow
+déplace le centroïde avec `t` mais la forme du nuage ne dépend presque pas du
+champ visé. Consigné sans hypothèse : ce projet a assez payé celles formulées trop
+vite.
+
 ## 2026-08-30 — `batch_size: 8` (OT enfin actif) : NÉGATIF, et le harnais s'est trompé de 20 points
 
 **Verdict : activer le couplage OT ne change rien de mesurable.** Détail :
