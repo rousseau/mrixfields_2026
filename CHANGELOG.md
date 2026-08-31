@@ -57,6 +57,51 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-08-30 — `batch_size: 8` (OT enfin actif) : NÉGATIF, et le harnais s'est trompé de 20 points
+
+**Verdict : activer le couplage OT ne change rien de mesurable.** Détail :
+`results/mmfm/structural_20260830_batch8/`.
+
+**Le défaut de code était réel.** Toutes les configs de production sont à
+`batch_size: 1`. Le couplage OT permute les cibles *à l'intérieur d'un lot* :
+avec un seul échantillon de chaque côté il n'a rien à permuter. `ot_method:
+exact` n'a donc jamais rien fait — vérifié directement, `ot_sampler.sample_plan`
+ne réordonne rien à batch 1 et réordonne à batch 8. Le flow était entraîné en
+couplage **indépendant** depuis le début.
+
+**Le corriger ne rapporte rien.**
+
+| | R-best | batch8 | écart | apparié |
+|---|---|---|---|---|
+| nRMSE officiel | 0.3737 | 0.3713 | −0.0024 | 34/60, p = 0.37 |
+| **nRMSE structurel** (échelle oracle retirée) | **0.2143** | **0.2147** | **+0.0004** | **95/180, p = 0.50** |
+
+Sur la métrique de travail — celle construite exprès pour voir les progrès
+structurels — l'écart est de **+0.2 %**. Le harnais annonçait **−19 %**.
+
+**Pourquoi le harnais s'est trompé, et ce que ça coûte à sa crédibilité.** L'OT
+par mini-lot cherche des correspondances entre 8 points dans un espace à
+**129 024 dimensions** : à cette échelle, la structure de plus proche voisin est
+essentiellement aléatoire, et le « couplage » n'apporte aucune information. Le
+harnais tournait en dimension 4096 avec 64 points — plus dense, donc l'OT y avait
+un sens. **Ce n'est pas `batch_size: 1` qui rendait l'OT vacuous, c'est la
+dimension.** L'augmenter à 8 ne change pas ça.
+
+Le harnais a maintenant fait deux prédictions vérifiables sur données réelles :
+le *mécanisme* de R-best (juste) et le gain structurel du couplage OT (**faux de
+20 points**). **Il élimine ce qui ne peut pas marcher ; il ne prédit pas les
+amplitudes.** Toute décision fondée sur une amplitude annoncée par le harnais
+doit désormais être traitée comme une hypothèse, pas comme une estimation.
+
+**Coût quasi nul en temps** : 3.31 it/s à batch 8 contre 3.48 à batch 1, 11.6 GB.
+Le couplage OT était presque gratuit — il n'apporte simplement rien.
+
+**Conséquence sur la suite** : l'interpolant cubique du papier MMFM repose sur un
+**chaînage OT** des 5 marginales. Cette prémisse vient d'être invalidée à notre
+échelle. La partie *cubique* (cible lisse en `t`) reste testable indépendamment
+du couplage, mais l'ingrédient « trajectoire couplée » est à considérer comme
+inopérant ici.
+
 ## 2026-08-30 — Recalibration d'intensité : PISTE FERMÉE, négative
 
 **Verdict : un succès sur trois architectures, deux explications réfutées, et une
