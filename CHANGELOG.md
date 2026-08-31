@@ -135,6 +135,46 @@ Le couplage OT était presque gratuit — il n'apporte simplement rien.
 du couplage, mais l'ingrédient « trajectoire couplée » est à considérer comme
 inopérant ici.
 
+## 2026-08-31 — `batch_size: 8` (OT enfin actif) : NÉGATIF, et le harnais s'est trompé de 20 points
+
+**Découverte en amont** : toutes les configs de production étaient à
+`batch_size: 1`. Le couplage OT permute les cibles **à l'intérieur d'un lot** —
+avec un échantillon de chaque côté il n'a rien à permuter. **`ot_method: exact`
+n'a donc jamais rien fait** ; le flow était entraîné en couplage indépendant.
+Vérifié : `ot_sampler.sample_plan` ne réordonne rien à batch 1, réordonne à
+batch 8.
+
+**Résultat du correctif** (`configs/mmfm/vectorized_batch8.yaml`, 2.12 h, 3.31 it/s
+contre 3.48 — le couplage est quasi gratuit) :
+
+| | brut | structurel |
+|---|---|---|
+| production | 0.3794 | ~0.2191 |
+| R-best | 0.3737 | 0.2143 |
+| **batch8** | **0.3713** | **0.2147** |
+
+- brut, contre R-best : −0.0024, **34/60**, signes p = 0.37, Wilcoxon p = 0.53
+- structurel, contre R-best : **+0.0004**, **95/180**, p = 0.50
+
+**Rien, sur aucune des deux métriques.**
+
+**Le harnais synthétique annonçait −19 % d'erreur structurelle pour le couplage
+OT ; on mesure +0.2 %.** Sa seule prédiction quantitative est fausse de 20 points.
+Il reste utile pour **éliminer** un mécanisme (il avait correctement dit que
+batch 1 franchit quand même la porte) mais ses **amplitudes ne transfèrent pas**.
+À ne plus jamais citer comme promesse de gain.
+
+**Le motif à regarder en face : cinq correctifs de mécanisme, zéro gain de score.**
+Échelle du temps, conditionnement FiLM, `adjacent_only`, recalibration
+d'intensité, couplage OT. Trois étaient des défauts de code réels et mesurés — la
+géométrie du flow est passée de `cos(v(0),v(1)) = 1.000000` à −0.24/0.80/0.03,
+courbure ×100. Le seul progrès mesurable reste **local et structurel** : T2W
+0.2717 → 0.2598 avec R-best, six fois le plancher de bruit, invisible en brut.
+
+**Ce que cela impose** : arrêter d'enchaîner des réentraînements de 2 h sur la foi
+d'un raisonnement mécanistique, et commencer par un diagnostic qui décide si le
+levier existe. Plan révisé en conséquence, avec critère d'arrêt explicite.
+
 ## 2026-08-30 — Recalibration d'intensité : PISTE FERMÉE, négative
 
 **Verdict : un succès sur trois architectures, deux explications réfutées, et une
