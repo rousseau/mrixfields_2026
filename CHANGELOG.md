@@ -90,7 +90,7 @@ déplace le centroïde avec `t` mais la forme du nuage ne dépend presque pas du
 champ visé. Consigné sans hypothèse : ce projet a assez payé celles formulées trop
 vite.
 
-## 2026-08-30 — `batch_size: 8` (OT enfin actif) : NÉGATIF, et le harnais s'est trompé de 20 points
+## 2026-08-30/31 — `batch_size: 8` (OT enfin actif) : NÉGATIF, et le harnais s'est trompé de 20 points
 
 **Verdict : activer le couplage OT ne change rien de mesurable.** Détail :
 `results/mmfm/structural_20260830_batch8/`.
@@ -104,10 +104,12 @@ couplage **indépendant** depuis le début.
 
 **Le corriger ne rapporte rien.**
 
-| | R-best | batch8 | écart | apparié |
-|---|---|---|---|---|
-| nRMSE officiel | 0.3737 | 0.3713 | −0.0024 | 34/60, p = 0.37 |
-| **nRMSE structurel** (échelle oracle retirée) | **0.2143** | **0.2147** | **+0.0004** | **95/180, p = 0.50** |
+| | production | R-best | batch8 | écart / R-best | apparié |
+|---|---|---|---|---|---|
+| nRMSE officiel | 0.3794 | 0.3737 | 0.3713 | −0.0024 | 34/60, signes p = 0.37, Wilcoxon p = 0.53 |
+| **nRMSE structurel** (échelle oracle retirée) | 0.2191 | **0.2143** | **0.2147** | **+0.0004** | **95/180, p = 0.50** |
+
+Config : `configs/mmfm/vectorized_batch8.yaml`, 2.12 h d'entraînement. |
 
 Sur la métrique de travail — celle construite exprès pour voir les progrès
 structurels — l'écart est de **+0.2 %**. Le harnais annonçait **−19 %**.
@@ -135,35 +137,6 @@ Le couplage OT était presque gratuit — il n'apporte simplement rien.
 du couplage, mais l'ingrédient « trajectoire couplée » est à considérer comme
 inopérant ici.
 
-## 2026-08-31 — `batch_size: 8` (OT enfin actif) : NÉGATIF, et le harnais s'est trompé de 20 points
-
-**Découverte en amont** : toutes les configs de production étaient à
-`batch_size: 1`. Le couplage OT permute les cibles **à l'intérieur d'un lot** —
-avec un échantillon de chaque côté il n'a rien à permuter. **`ot_method: exact`
-n'a donc jamais rien fait** ; le flow était entraîné en couplage indépendant.
-Vérifié : `ot_sampler.sample_plan` ne réordonne rien à batch 1, réordonne à
-batch 8.
-
-**Résultat du correctif** (`configs/mmfm/vectorized_batch8.yaml`, 2.12 h, 3.31 it/s
-contre 3.48 — le couplage est quasi gratuit) :
-
-| | brut | structurel |
-|---|---|---|
-| production | 0.3794 | ~0.2191 |
-| R-best | 0.3737 | 0.2143 |
-| **batch8** | **0.3713** | **0.2147** |
-
-- brut, contre R-best : −0.0024, **34/60**, signes p = 0.37, Wilcoxon p = 0.53
-- structurel, contre R-best : **+0.0004**, **95/180**, p = 0.50
-
-**Rien, sur aucune des deux métriques.**
-
-**Le harnais synthétique annonçait −19 % d'erreur structurelle pour le couplage
-OT ; on mesure +0.2 %.** Sa seule prédiction quantitative est fausse de 20 points.
-Il reste utile pour **éliminer** un mécanisme (il avait correctement dit que
-batch 1 franchit quand même la porte) mais ses **amplitudes ne transfèrent pas**.
-À ne plus jamais citer comme promesse de gain.
-
 **Le motif à regarder en face : cinq correctifs de mécanisme, zéro gain de score.**
 Échelle du temps, conditionnement FiLM, `adjacent_only`, recalibration
 d'intensité, couplage OT. Trois étaient des défauts de code réels et mesurés — la
@@ -171,9 +144,13 @@ géométrie du flow est passée de `cos(v(0),v(1)) = 1.000000` à −0.24/0.80/0
 courbure ×100. Le seul progrès mesurable reste **local et structurel** : T2W
 0.2717 → 0.2598 avec R-best, six fois le plancher de bruit, invisible en brut.
 
-**Ce que cela impose** : arrêter d'enchaîner des réentraînements de 2 h sur la foi
+**Ce que cela impose** : ne plus enchaîner des réentraînements de 2 h sur la foi
 d'un raisonnement mécanistique, et commencer par un diagnostic qui décide si le
 levier existe. Plan révisé en conséquence, avec critère d'arrêt explicite.
+
+*(Cette entrée fusionne deux rédactions indépendantes de la MÊME expérience, qui
+coexistaient aux dates du 30 et du 31 — violation de la règle « une entrée par
+expérience » de ce fichier.)*
 
 ## 2026-08-30 — Recalibration d'intensité : PISTE FERMÉE, négative
 
