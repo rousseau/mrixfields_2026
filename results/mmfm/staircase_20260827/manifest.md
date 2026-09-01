@@ -92,7 +92,7 @@ de la vraie cible. La quantité mesurée n'est pas une borne : c'est la **qualit
 de l'ajustement INR à 20 pas** (`inner_steps_eval: 20`).
 
 Ce qu'elle établit tout de même, et c'est frappant : **l'ajustement INR ne retient
-que 20.6 % du contraste de la cible** (écart-type sur le cerveau, T2W@3T), contre
+que 55.1 % du contraste de la cible en moyenne** (écart-type sur le cerveau, T2W@3T), contre
 73.7 % pour sa propre prédiction et **87.3 % pour MedVAE**. Le handicap de l'INR
 est bien dans son chemin de représentation — mais `inner_steps_eval` est un
 levier non testé, et il faut le tester avant de conclure à une limite de capacité.

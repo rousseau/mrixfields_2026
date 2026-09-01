@@ -57,6 +57,82 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-09-01 — Pas d'intégration et budget d'ajustement INR : les deux NÉGATIFS. **Critère d'arrêt atteint.**
+
+### B — nombre de pas d'intégration : NÉGATIF
+
+4 paires de saut maximal × 3 sujets × 3 contrastes = 36 volumes par réglage, là
+où l'erreur de discrétisation doit être la plus forte.
+
+| `n_steps` | brut | **structurel** |
+|---|---|---|
+| 20 (production) | 0.4587 | **0.2788** |
+| 50 | 0.4583 | 0.2795 |
+| 100 | 0.4577 | 0.2795 |
+
+Contre 20 pas : **+0.0007**, **18/36**, signes p = 1.00, Wilcoxon p = 0.46 — pour
+50 comme pour 100. **Rien.** C'était pourtant le seul levier dont le mécanisme
+était *renforcé* par les résultats précédents (une droite s'intègre en un pas,
+une courbe non). La trajectoire est bel et bien courbée maintenant, et
+l'intégration à 20 pas la suit déjà assez bien.
+
+### C — budget d'ajustement de l'INR : gain réel mais marginal, la limite est STRUCTURELLE
+
+Auto-reconstruction T1W, `inner_steps_eval` ∈ {20, 60, 200} :
+
+| pas | nRMSE | SSIM | contraste restitué |
+|---|---|---|---|
+| 20 | 0.3582 | 0.8452 | 0.632 |
+| 60 | 0.3515 | 0.8500 | 0.680 |
+| 200 | 0.3471 | 0.8527 | 0.696 |
+| *MedVAE, pour comparaison* | *0.1048* | *0.9517* | *0.873* |
+
+Monotone et réel, mais **−3.1 % de nRMSE pour 10× le budget**, et **5T/7T ne
+bougent pas** (0.424 → 0.426 ; 0.555 → 0.547). La « limite de capacité » de l'INR
+n'est donc **pas** un budget d'optimisation : c'est structurel. Question ouverte
+depuis des mois, tranchée.
+
+### CORRECTION — le « 20.6 % de contraste restitué » était une généralisation abusive
+
+Ce chiffre, cité depuis le 2026-08-28 dans plusieurs manifestes et dans le plan,
+provenait d'**un seul volume** : T2W@3T, sujet 0006 — la pire cellule. Mesuré
+proprement sur les 3 contrastes × 5 champs × 3 sujets, l'ajustement INR à 20 pas
+restitue **0.551** du contraste en moyenne :
+
+| | 0.1T | 1.5T | 3T | 5T | 7T | moyenne |
+|---|---|---|---|---|---|---|
+| T1W | 0.650 | 0.489 | 0.592 | 0.714 | 0.714 | 0.632 |
+| T2W | 0.693 | 0.282 | **0.245** | 0.259 | 0.516 | 0.399 |
+| T2FLAIR | 0.887 | 0.631 | 0.437 | 0.540 | 0.618 | 0.623 |
+
+La mesure d'origine n'était pas fausse ; **son extrapolation l'était**. La
+conclusion qualitative tient (le handicap de l'INR est représentationnel : 0.551
+contre 0.873 pour MedVAE) mais sa sévérité était surestimée d'un facteur ~2.7.
+**Ne jamais généraliser une cellule à un tableau.**
+
+### CRITÈRE D'ARRÊT ATTEINT
+
+> **L'erreur structurelle de 0.2143 n'est pas réductible par les leviers de flow
+> disponibles.** Le plafond de représentation à 0.1048 reste hors d'atteinte, et
+> l'écart n'est ni un défaut de conditionnement, ni de couplage, ni de
+> discrétisation, ni de loss.
+
+Sept leviers, sept fois rien au-delà du plancher de bruit : échelle du temps,
+conditionnement FiLM, `adjacent_only`, recalibration d'intensité, couplage OT,
+pas d'intégration, budget d'ajustement INR. Trois étaient des **défauts de code
+réels** — la géométrie du flow est passée de `cos(v(0),v(1)) = 1.000000` à
+−0.24/0.80/0.03, courbure ×100. Le seul progrès mesurable reste **T2W structurel
+0.2717 → 0.2598**.
+
+**C'est un résultat, pas un échec.** Il ferme le côté flow. Ce qui reste ouvert :
+la représentation (MedVAE perceptuel, dette n°5 — la barre avait été franchie le
+2026-08-25 : SSIM 0.9727 contre 0.9152), ou l'acceptation du plateau.
+
+**Fait non expliqué, à ne pas perdre** : le rang effectif des latents prédits est
+la seule quantité déficitaire (0.862), et leur dispersion est quasi identique
+quel que soit le champ visé. Le flow déplace le centroïde avec `t` mais la forme
+du nuage ne dépend presque pas de la cible.
+
 ## 2026-08-31 — Contraction des latents : hypothèse RÉFUTÉE (c'est l'inverse)
 
 **Verdict : les latents prédits sont PLUS dispersés que les réels, pas moins.**
