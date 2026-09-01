@@ -57,6 +57,39 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-09-01 — Plafond du MedVAE perceptuel : porte franchie, mais de 6.9 % seulement
+
+**Verdict : le plafond passe de 0.1048 à 0.0976 de nRMSE, les 15 cellules
+s'améliorent sans exception.** Détail : `results/mmfm/ceiling_20260901/manifest.md`.
+
+| | pré-entraîné | **LPIPS** | écart |
+|---|---|---|---|
+| T1W | 0.1081 | 0.0999 | −0.0082 |
+| T2W | 0.1228 | 0.1157 | −0.0071 |
+| T2FLAIR | 0.0836 | 0.0772 | −0.0063 |
+| **moyenne** | **0.1048** | **0.0976** | **−0.0072** |
+| SSIM | 0.9518 | **0.9579** | +0.0061 |
+
+**Pourquoi il fallait mesurer avant d'adopter.** Les chiffres du 2026-08-25
+(SSIM 0.9727 contre 0.9152) donnaient un écart **quatre fois plus grand**. Ils
+proviennent d'une auto-reconstruction par **patches 64³** à 1 mm, sans le
+rééchantillonnage 1 mm → 0.5 mm ni les sujets d'évaluation. Adopter sur cette base
+aurait été payer une journée sur une comparaison de protocoles différents. La
+mesure sous notre protocole coûte 1.3 h — paires identité, `dt = 0`, donc le flow
+ne déplace rien et son entraînement sur les anciens latents est sans conséquence.
+
+**Ce que cela borne.** Le vectorisé est à **0.2143** structurel pour un plafond de
+0.1048 : l'écart de 0.1095 est celui que le critère d'arrêt vient de déclarer
+irréductible par les leviers de flow. Abaisser le plafond ne rapporte, au mieux et
+si les erreurs s'additionnent, que ces **0.0072** — 3.4 % du score structurel.
+Au-dessus du plancher de bruit, donc mesurable ; pas de quoi franchir un palier.
+
+**Adoption lancée** malgré cela, le gain étant réel et le levier étant le dernier
+ouvert : cache régénéré (`medvae_finetune_1989e9d1`, 10.0 s/volume × 1939 ≈ 5.4 h,
+554 Mo), puis entraînement (~2 h) et contrôle mécanistique. L'évaluation complète
+(~6 h) n'est **pas** enchaînée automatiquement : la porte mécanistique se lit
+d'abord.
+
 ## 2026-09-01 — Pas d'intégration et budget d'ajustement INR : les deux NÉGATIFS. **Critère d'arrêt atteint.**
 
 ### B — nombre de pas d'intégration : NÉGATIF
