@@ -57,6 +57,71 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-09-02 (soir) — **La piste du rang effectif aboutit : le flow translate, le vrai transport non.**
+
+**Verdict : le flow appris est une translation à 3.5 % près, alors que le vrai
+déplacement champ→champ est propre au sujet à 71.7 %. Un facteur 20.** Détail :
+`results/mmfm/translation_20260902/manifest.md`.
+
+### Les deux observations du 2026-08-31 se réduisent à UN fait
+
+Il manquait le témoin **source**. Le diagnostic comparait prédit contre
+réel-à-la-cible ; ajouté le nuage source :
+
+| | valeur |
+|---|---|
+| **part du déplacement propre au sujet** | **0.0348** |
+| dispersion prédite / **source** | **0.9972** |
+| rang effectif prédit / **source** | **1.0024** |
+
+Le nuage prédit **est** celui de la source, transporté en bloc. **Le « déficit de
+rang de 0.862 » n'existait pas** : le rang prédit égale celui de la source (15.2 /
+17.3 / 18.6) et le 0.862 le comparait à celui des **cibles** (19.3 / 20.8 / 19.6).
+
+### La mesure qui en fait un défaut
+
+Une translation n'est fautive que si le vrai transport en est un autre — et
+attention, Task 3 juge par SUJET, or une translation préserve exactement
+l'identité du sujet. Mesuré sur les **3 sujets appariés** (les seuls du jeu ;
+45 latents encodés pour l'occasion) :
+
+| | part propre au sujet |
+|---|---|
+| **vrai déplacement** | **0.7173** (min 0.286, max 1.528) |
+| **flow appris** | **0.0348** |
+
+`‖D̄‖` vaut 1500–3000, l'écart-type autour 1000–1800 : **la composante manquée est
+du même ordre que celle qui est captée.**
+
+### Pourquoi le flow ne PEUT pas l'apprendre
+
+Conséquence directe du non-appariement. Le modèle voit une source `z_i` au champ f
+et une cible `z_j'` au champ g appartenant à **un autre sujet** : la composante
+individuelle de `z_j' − z_i` est, de son point de vue, du bruit. L'espérance
+conditionnelle est le décalage **commun**. Le couplage OT existe pour réparer
+cela, et il est **vacuous à 129 024 dimensions** (mesuré le 2026-08-30 : +0.2 %).
+
+**0 sujet apparié sur 1056 → couplage indépendant → part individuelle
+inapprenable → le flow ne peut que translater.**
+
+### Ce que cela dit des HUIT résultats négatifs
+
+Tous réparaient la **machinerie** d'un flow qui apprenait structurellement la
+mauvaise chose, pour une raison d'**information** et non de mécanisme. Trois
+étaient de vrais défauts de code, et les corriger a réparé la géométrie
+(`cos(v(0),v(1))` de 1.000000 à −0.24/0.80/0.03, courbure ×100) **sans toucher à
+ce qui limite le score**. Le plateau cesse d'être un mystère.
+
+### La limite de ce qui est affirmé
+
+**Avec 3 sujets appariés on ne peut PAS trancher si ces 71.7 % sont prédictibles
+depuis la source.** Un ajustement linéaire sur 3 points dans 129 024 dimensions
+interpolerait trivialement. Deux lectures restent ouvertes : déplacement dépendant
+de l'anatomie (apprenable avec un couplage qui marcherait en haute dimension), ou
+variation d'acquisition de la cible non transportable — on sait déjà que les 35 %
+de variance inter-sujets du niveau d'intensité sont de cette seconde nature.
+**Ne pas conclure au-delà.**
+
 ## 2026-09-02 — MedVAE perceptuel adopté : NÉGATIF. Le gain de représentation ne se transmet pas.
 
 **Verdict : le plafond descend de 6.9 %, le score ne bouge pas d'un iota.**
