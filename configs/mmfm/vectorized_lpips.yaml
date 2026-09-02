@@ -135,6 +135,13 @@ data:
   num_workers: 4
   use_latent_cache: true
   latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  # CHEMIN EXPLICITE, et ce n'est pas du confort. Le cache_id est un hash de
+  # (checkpoint VAE, spacing, volume_size, percentiles, field_norm_stats_path),
+  # mais les DEUX points d'entree ne le calculent pas pareil : precompute_mmfm_latents
+  # recoit --field-norm-stats et obtient 1989e9d1, tandis que train_mmfm_unified,
+  # qui ne le recoit pas, cherche 4b1bb0a5 et echoue. Les configs de production
+  # masquaient ce defaut en fixant deja ce chemin.
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_1989e9d1/retro_train
   # Cache 1mm APLATI, converti depuis le cache UNet (mêmes latents,
   # simplement reshapés) via convert_unet_cache_to_flat.py — garantit
   # une comparaison strictement équitable entre les deux architectures.

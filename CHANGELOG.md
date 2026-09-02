@@ -57,6 +57,85 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-09-02 — MedVAE perceptuel adopté : NÉGATIF. Le gain de représentation ne se transmet pas.
+
+**Verdict : le plafond descend de 6.9 %, le score ne bouge pas d'un iota.**
+Détail : `results/mmfm/structural_20260902_lpips/`.
+
+| | brut | structurel |
+|---|---|---|
+| production | 0.3794 | 0.2191 |
+| **R-best** | 0.3737 | **0.2143** |
+| batch8 | 0.3713 | 0.2147 |
+| **LPIPS** | 0.3739 | **0.2147** |
+
+- brut contre R-best : **+0.0002**, 29/60, signes p = 0.90, Wilcoxon p = 0.92
+- **structurel contre R-best : +0.0004**, 97/180, signes p = 0.33, Wilcoxon p = 0.41
+
+**La porte annonçait −0.0072. On mesure +0.0004.**
+
+Contrôle mécanistique passé avant l'évaluation (5/5) : `cos(v(0),v(1))` =
+−0.235/0.461/0.276, courbure moyenne 0.850 contre 0.776 pour R-best. Ce n'est donc
+pas un entraînement raté — le modèle voit le temps et courbe sa trajectoire.
+
+### Ce que ce résultat apprend, et qui est NEUF
+
+C'est le premier cas où l'on a **à la fois** une amélioration de plafond mesurée
+et certaine — **−0.0072, les 15 cellules sans exception** — **et** un effet nul de
+bout en bout. Les sept nulls précédents portaient sur des mécanismes dont l'effet
+réel était inconnu ; celui-ci a un gain établi **qui ne se transmet pas**.
+
+L'attente avait été conditionnée explicitement : « au mieux et **si les erreurs
+s'additionnent** ». **Elles ne s'additionnent pas.** Le gain de représentation est
+intégralement absorbé par le flow, qui produit la même erreur totale dans un
+espace latent meilleur.
+
+**Conséquence sur un raisonnement tenu depuis le 2026-08-27** : la décomposition
+« 72 % de l'erreur est le flow, 28 % la représentation », déduite du plafond,
+**n'est actionnable dans aucun des deux sens**. Elle décrit une borne, pas un
+budget d'erreur qu'on pourrait réduire terme par terme. Sept leviers de flow n'ont
+rien donné ; améliorer la représentation ne donne rien non plus.
+
+### Défauts de mon propre protocole, rencontrés en chemin
+
+1. **Le `cache_id` n'est pas résolu pareil par les deux points d'entrée.** C'est un
+   hash de (checkpoint VAE, spacing, volume_size, percentiles,
+   `field_norm_stats_path`) ; `precompute_mmfm_latents.py` reçoit
+   `--field-norm-stats` et produit `1989e9d1`, `train_mmfm_unified.py` ne le reçoit
+   pas et cherche `4b1bb0a5`. Les configs de production **masquaient** ce défaut en
+   fixant `latent_cache_dir` explicitement. En le retirant pour laisser la
+   résolution automatique opérer, je l'ai exposé — et l'entraînement a échoué
+   immédiatement.
+2. **Mes chaînes n'arrêtaient pas sur échec.** `chain13` a enchaîné le contrôle
+   mécanistique sur un checkpoint inexistant au lieu de s'arrêter : **~14 h de GPU
+   inactif**. Les chaînes suivantes portent `set -e`.
+3. **La loss n'est pas comparable entre VAE.** Base « prédire zéro » 21.06 ici
+   contre 22.32 pour R-best : les latents perceptuels n'ont pas la même échelle.
+   Seul le ratio l'est (0.819 contre 0.829). Même piège que le régime
+   `adjacent_only` du 2026-08-26.
+
+### État : plateau, sur les deux côtés
+
+**Huit leviers, huit fois rien** au-delà du plancher de bruit de 0.002 : échelle du
+temps, conditionnement FiLM, `adjacent_only`, recalibration d'intensité, couplage
+OT, pas d'intégration, budget d'ajustement INR, MedVAE perceptuel. **Trois étaient
+des défauts de code réels** — la géométrie du flow est passée de
+`cos(v(0),v(1)) = 1.000000` à −0.24/0.80/0.03, courbure ×100.
+
+Le seul progrès mesurable de toute la série reste **T2W structurel 0.2717 → 0.2598**
+(R-best), six fois le plancher de bruit, invisible en nRMSE brut.
+
+**Le plateau à ~0.3737 brut / ~0.2143 structurel est robuste à tout ce qui a été
+essayé, des deux côtés de la chaîne.** Ce n'est pas un échec de mise en œuvre :
+c'est une propriété mesurée du problème avec ces données — 3 sujets appariés, et
+une variance inter-sujets de 35 % sur le niveau d'intensité.
+
+**Fait non expliqué, à ne pas perdre** : le rang effectif des latents prédits est
+la seule quantité déficitaire (0.862), et leur dispersion est **quasi identique
+quel que soit le champ visé** — le flow déplace le centroïde avec `t` mais la forme
+du nuage ne dépend presque pas de la cible. C'est la seule piste que la série n'a
+pas refermée, et elle reste sans hypothèse.
+
 ## 2026-09-01 — Plafond du MedVAE perceptuel : porte franchie, mais de 6.9 % seulement
 
 **Verdict : le plafond passe de 0.1048 à 0.0976 de nRMSE, les 15 cellules
