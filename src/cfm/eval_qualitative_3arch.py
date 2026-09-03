@@ -110,6 +110,19 @@ CEIL_INR = ("Plafond INR", {
     for m in ("T1W", "T2W", "T2FLAIR")
 })
 
+# Run du 2026-09-02 : R-best entraine sur les latents du MedVAE PERCEPTUEL
+# (fine-tuning LPIPS). Plafond de representation 0.0976 contre 0.1048, mais score
+# de bout en bout inchange -- le gain de representation est absorbe par le flow.
+LPIPS = ("Vectorise LPIPS", {
+    m: ("outputs/mmfm/vec_lpips/predictions/task3", str(S27 / f"task3_vec_lpips_{m}.csv"))
+    for m in ("T1W", "T2W", "T2FLAIR")
+})
+CEIL2 = RESULTS / "ceiling_20260901"
+CEIL_LPIPS = ("Plafond LPIPS", {
+    m: ("outputs/mmfm/ceiling_lpips/predictions/task3", str(CEIL2 / f"ceiling_lpips_{m}.csv"))
+    for m in ("T1W", "T2W", "T2FLAIR")
+})
+
 INR_AVANT = ("INR avant audit", {
     "T1W": (I_OLD, str(C07 / "task3_inr_129k_T1W.csv")),
     "T2W": (I_OLD, str(C14 / "task3_inr_T2W.csv")),
@@ -482,10 +495,24 @@ def _selected_methods(args) -> List[Tuple[str, Dict[str, Tuple[str, str]]]]:
     m = list(METHODS)
     if getattr(args, "with_rbest", False):
         m.append(R_BEST)
+    if getattr(args, "with_lpips", False):
+        m.append(LPIPS)
     if getattr(args, "with_before", False):
         m.append(INR_AVANT)
     if getattr(args, "with_ceiling", False):
         m += [CEIL_VAE, CEIL_INR]
+    if getattr(args, "with_ceiling_lpips", False):
+        m.append(CEIL_LPIPS)
+    only = getattr(args, "only", None)
+    if only:
+        # selection par nom, dans l'ordre demande : au-dela de 6 colonnes un
+        # panneau devient illisible, et toutes les comparaisons n'ont pas besoin
+        # des memes temoins.
+        by = {lbl: pair for lbl, pair in m}
+        missing = [o for o in only if o not in by]
+        if missing:
+            raise SystemExit(f"--only : inconnu(s) {missing} ; disponibles {sorted(by)}")
+        m = [(o, by[o]) for o in only]
     return m
 
 
@@ -494,6 +521,12 @@ def main():
     ap.add_argument("--mode", choices=["panel", "spectrum", "calib"], default="panel")
     ap.add_argument("--with-rbest", action="store_true",
                     help="ajoute le run corrige du 2026-08-27 (time_scale + FiLM + adjacent_only)")
+    ap.add_argument("--with-lpips", action="store_true",
+                    help="ajoute le run sur latents MedVAE perceptuel (2026-09-02)")
+    ap.add_argument("--with-ceiling-lpips", action="store_true",
+                    help="ajoute le plafond du MedVAE perceptuel")
+    ap.add_argument("--only", nargs="+", default=None,
+                    help="ne garder que ces methodes, dans cet ordre (par leur nom)")
     ap.add_argument("--with-ceiling", action="store_true",
                     help="ajoute le PLAFOND de representation : la verite terrain passee dans "
                          "l'encodeur/decodeur, sans transport. Montre ce que l'architecture "
