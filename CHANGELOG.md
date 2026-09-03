@@ -57,6 +57,57 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-09-03 (soir) — **La composante individuelle n'est pas prédictible depuis la source. La série est close.**
+
+**Verdict : NON, sous la seule forme testable avec 3 sujets appariés.** Détail :
+`results/mmfm/predictable_20260903/manifest.md`.
+
+| | moyenne | min | max |
+|---|---|---|---|
+| **R² dans l'échantillon (1 paramètre)** | **0.135** | 0.000 | 0.552 |
+| **LOO, erreur modèle / translation** | **0.990** | 0.808 | 1.272 |
+| α + 1 | 0.770 | 0.339 | 1.030 |
+
+33/60 cellules battent la translation hors échantillon — signes **p = 0.52**.
+
+**Forme testée, à UN paramètre.** Si la carte était affine en intensité,
+`D_i − D̄ = (a−1)(z_i − z̄)` et la composante individuelle serait entièrement
+prédictible par un scalaire. Un paramètre contre 3 × 129 024 dimensions de résidu.
+Ajuster plus riche aurait interpolé trivialement — trois points dans un tel espace
+sont toujours parfaitement explicables.
+
+**Le R² dans l'échantillon suffit à conclure** : 0.135 avec un paramètre est une
+*borne supérieure* sur ce qui généralise. **86.5 % de la composante individuelle
+est orthogonale à la déviation source** — c'est de l'information sur l'acquisition
+CIBLE, absente de la source, donc **irréductible** quelle que soit l'architecture.
+
+**Recoupement indépendant** : le 2026-08-25 avait établi que l'écart d'intensité
+d'un sujet à sa classe n'est pas transportable d'un champ à l'autre — « c'est une
+propriété de l'acquisition cible » — avec 35 % de variance inter-sujets. Deux
+chemins sans rapport, même conclusion.
+
+**Observation réelle** : les α sont **systématiquement négatifs** (α+1 = 0.770 en
+moyenne, toutes les cellules sous 1.03) — la déviation individuelle *rétrécit* en
+montant en champ. Cohérent, mais 13.5 % de la variance seulement.
+
+### La série est close, et la cause est nommée
+
+Huit leviers de mécanisme, puis le couplage (toutes dimensions, 2026-09-03), puis
+la prédictibilité depuis la source. Tout est mesuré, tout est négatif, et la cause
+n'est pas contournable avec ces données :
+
+> **0 sujet apparié sur 1056**, et une composante individuelle du transport qui
+> représente 71.7 % du déplacement et dont 86.5 % est absente du volume source.
+
+Le plateau à **0.3737** brut / **0.2143** structurel n'est pas un défaut de mise
+en œuvre : **c'est la borne de ce que l'information disponible permet.** Le
+plafond de représentation à 0.1048 suppose un flow parfait, ce que l'absence
+d'appariement rend inatteignable.
+
+**Limite assumée** : seule la forme affine/scalaire est testable ici. Une fonction
+plus riche de `z_src` pourrait en principe capter davantage, mais aucune n'est
+vérifiable avec 3 sujets appariés.
+
 ## 2026-09-03 — Couplage en dimension réduite : SANS OBJET, et mon explication du 30/08 était fausse
 
 **Verdict : l'OT en dimension pleine apparie parfaitement (180/180).** Il n'y a
