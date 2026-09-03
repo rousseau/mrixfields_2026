@@ -57,6 +57,64 @@ trois bugs pendant des mois. **Non corrigé à ce jour.**
 
 ---
 
+## 2026-09-03 — Couplage en dimension réduite : SANS OBJET, et mon explication du 30/08 était fausse
+
+**Verdict : l'OT en dimension pleine apparie parfaitement (180/180).** Il n'y a
+rien à restaurer. Détail : `results/mmfm/coupling_20260903/manifest.md`.
+
+### Le test direct, sur nos latents
+
+Les 3 sujets de `Training_prospective` sont les seuls à exister à plusieurs
+champs : on connaît donc l'appariement véritable. Hasard = 1/3 (espérance du
+nombre de points fixes d'une permutation de 3 éléments).
+
+| méthode | justes | taux |
+|---|---|---|
+| **OT plein** (129 024 dim) | **180/180** | **1.000** |
+| ACP 4 | 180/180 | 1.000 |
+| aléatoire 4 | 168/180 | 0.933 |
+| *hasard* | | *0.333* |
+
+### Ce que cela corrige
+
+**Mon explication du 2026-08-30 — « la concentration des distances rend la
+structure de plus proche voisin essentiellement aléatoire » — est FAUSSE.** L'OT
+apparie parfaitement dès que des correspondances existent.
+
+**La vraie raison de son inutilité** : il n'y a aucune correspondance à trouver.
+0 sujet sur 1056 n'existe à deux champs, donc l'OT ne peut coupler que le sujet A
+au champ f avec le sujet **B** au champ g — et `A@f → B@g` contient (anatomie de
+B − anatomie de A), qui n'appartient pas à la transformation de champ. **Aucune
+méthode de couplage, en aucune dimension, ne peut retrouver une correspondance
+absente des données.**
+
+Cela recadre le rôle de l'OT en flow matching non apparié : **réduction de
+variance** pour la carte *marginale*, pas récupération de correspondances
+individuelles. Task 3 demande la carte individuelle.
+
+### Le harnais, une fois de plus non représentatif
+
+Il ne reproduit pas l'effondrement (0.767 à dim 129 024, très loin du hasard),
+parce que **son facteur sujet est unidimensionnel** alors que l'anatomie réelle est
+de haute dimension. Deux enseignements réels tout de même : l'ACP-4 bat l'OT plein
+partout et l'écart croît avec la dimension (0.897 contre 0.767) ; la projection
+aléatoire détruit tout (−0.045), donc ce qui compte est la *direction* du signal.
+Troisième fois que le harnais s'avère non représentatif du régime réel.
+
+### Réserve
+
+Avec 3 sujets l'affectation est 3×3 et l'anatomie est bien plus distinctive que
+l'écart entre champs : l'OT y réussit trivialement. « L'OT apparie correctement »
+n'est établi que dans ce régime facile. **Le point logique n'en dépend pas** : il
+porte sur l'absence de correspondances, pas sur la capacité de l'OT.
+
+### État
+
+**Le couplage est clos, toutes dimensions.** Reste une seule question ouverte :
+la composante individuelle de 71.7 % est-elle **prédictible depuis le volume
+source** ? Si oui, un modèle pourrait l'apprendre sans couplage. **3 sujets
+appariés ne permettent pas de trancher.**
+
 ## 2026-09-02 (soir) — **La piste du rang effectif aboutit : le flow translate, le vrai transport non.**
 
 **Verdict : le flow appris est une translation à 3.5 % près, alors que le vrai
@@ -370,7 +428,15 @@ structurels — l'écart est de **+0.2 %**. Le harnais annonçait **−19 %**.
 **Pourquoi le harnais s'est trompé, et ce que ça coûte à sa crédibilité.** L'OT
 par mini-lot cherche des correspondances entre 8 points dans un espace à
 **129 024 dimensions** : à cette échelle, la structure de plus proche voisin est
-essentiellement aléatoire, et le « couplage » n'apporte aucune information. Le
+essentiellement aléatoire, et le « couplage » n'apporte aucune information.
+
+> **CORRECTION du 2026-09-03 — cette explication est FAUSSE.** Mesuré
+> directement : l'OT sur les latents pleins (129 024 dimensions) apparie le bon
+> sujet **180 fois sur 180** dès que des correspondances existent. La
+> concentration des distances ne l'empêche pas. La vraie raison est qu'il n'y a
+> **aucune correspondance à trouver** — 0 sujet sur 1056 n'existe à deux champs,
+> donc l'OT ne peut coupler que des sujets DIFFÉRENTS. Voir
+> `results/mmfm/coupling_20260903/manifest.md`. Le
 harnais tournait en dimension 4096 avec 64 points — plus dense, donc l'OT y avait
 un sens. **Ce n'est pas `batch_size: 1` qui rendait l'OT vacuous, c'est la
 dimension.** L'augmenter à 8 ne change pas ça.
