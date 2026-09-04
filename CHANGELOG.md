@@ -102,6 +102,28 @@ Ses 0.3175 tombent **entre** le sain de production (0.2430) et le cassé (0.4443
 budget de 2000 pas, calibré pour 40 volumes à 2 mm, est simplement insuffisant à 1 mm.
 Faible, pas défaillant — distinction que l'ancienne porte absolue ne permettait pas.
 
+### Confirmation de bout en bout, et une réserve sur `[5/5]`
+
+Premier passage complet `[1/5]`→`[5/5]` en une exécution (les portes n'avaient jusque-là
+été vues qu'en rejeu sur backbone rechargé) : **les cinq passent**, code de sortie 0.
+Log : `outputs/smoke_inr_1mm_20260904_full.log`.
+
+| | fit | LOO | z=0 | ratio `[5/5]` |
+|---|---|---|---|---|
+| smoke, backbone A | 0.3175 | 0.3533 | 0.3942 | 1.24 |
+| smoke, backbone B | 0.3185 | 0.3533 | **0.3517** | **1.10** |
+| production | 0.2430 | 0.3100 | 0.4443 | 1.83 |
+
+**Le contrôle négatif a peu de marge sur un backbone smoke : 1.10 contre un seuil de
+1.05.** Le fit est reproductible d'un entraînement à l'autre (0.3175/0.3185) et la
+baseline LOO est identique au chiffre près (0.3533, elle est déterministe) — c'est **z=0
+qui varie**, de 0.3942 à 0.3517 : le « cerveau moyen » produit sans information de volume
+dépend du tirage d'entraînement. **`[5/5]` peut donc échouer un jour sans que rien ne soit
+cassé** ; ce serait un faux positif sur le test, pas un verdict sur le backbone. Cause
+connue et déjà dite par `[3/5]` : 2000 pas ne suffisent pas à 1 mm. En production la marge
+est de 1.83, sans ambiguïté. À surveiller ; ne pas relever le seuil sans avoir d'abord
+augmenté le budget du smoke.
+
 ### Trois défauts trouvés dans le correctif lui-même
 
 1. **La baseline trichait** (découvert au premier lancement, entrée du 2026-09-03 nuit).
