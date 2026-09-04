@@ -16,14 +16,28 @@ docs/MMFM_INR_STATE_OF_THE_ART.md, Plan phase 1 / "porte 1"):
      voxels are flat background shared by every subject — see
      inr_backbone.py's _weighted_mse docstring for the fix). Without this
      check that collapse would silently pass Phase 1.
-  3. Fit-and-reconstruct (Algorithm 2) on a training volume: nRMSE/SSIM,
-     whole-volume AND foreground-masked (the latter is what actually
-     reflects anatomical fidelity, not background correctness) — sane
-     ballpark, not SOTA (this is a short smoke run on 40 volumes / a few
-     thousand steps, not a real training budget).
+  3. Fit-and-reconstruct (Algorithm 2) on a training volume, scored by
+     foreground-masked nRMSE (background correctness is free — after
+     center-crop/pad most voxels are flat background every subject shares).
+     The gate is RELATIVE: the fit must beat the best prediction that has no
+     access to z, i.e. the LEAVE-ONE-OUT mean of the other volumes. An
+     absolute threshold does not work here, and that is now measured rather
+     than argued: a deliberately broken backbone (z=0) scores 0.4443 on the
+     production model and 0.3942 here — both comfortably UNDER the old
+     `nrmse_fg < 0.6`, which therefore accepted the broken mechanism as
+     readily as the healthy one, for months.
   4. Resolution invariance: fit z independently from the SAME volume seen at
      two different grid resolutions, decode both on a shared reference grid,
      compare — the practical analogue of NOIR's epsilon-ReNO check.
+  5. Negative control: decode at z=0 (no per-volume information at all) and
+     require it to be markedly WORSE than the fit. This is the test OF test
+     3 — without it, nothing establishes that gate 3 can separate a healthy
+     mechanism from a collapsed one.
+
+Regime: production (1mm, 192x224x192, 8 volumes), matching configs/mmfm/
+inr.yaml — not the historical 2mm/96x112x96/40-volume regime. Point budgets
+are subsampled (1M points) because a dense decode at 1mm is 8.25M points; the
+mechanism is what is under test here, not production-grade fidelity.
 
 Usage:
     PYTHONPATH=src python src/cfm/test_inr_backbone_smoke.py
@@ -34,6 +48,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -44,19 +59,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from common.config import load_env
 from common.io import SPLIT_MAP, load_nifti_volume
-from common.metrics import compute_nrmse, compute_ssim
+from common.metrics import compute_nrmse
 from cfm.inr_backbone import (
     INRBackbone,
     INRBackboneConfig,
+    diff_inr_configs,
     ModulatedSIREN,
     fit_new_volume,
     make_coord_grid,
     meta_train_step,
 )
 
-VOLUME_SIZE = (96, 112, 96)
-TARGET_SPACING = (2.0, 2.0, 2.0)
-N_VOLUMES = 40
+# Régime de PRODUCTION (2026-09, Phase 0.2) : le smoke test tourne à 1 mm /
+# 192×224×192 comme configs/mmfm/inr.yaml, pas à 2 mm / 96×112×96 comme avant.
+# Le test est un test de MÉCANISME (z se différencie, la perte décroît, la
+# reconstruction est saine), pas une porte de qualité de production — le seuil
+# `test_reconstruction_quality` est volontairement large (ordre de grandeur).
+# N_VOLUMES=8 (pas 40) parce qu'un stack de 40 volumes 1 mm ≈ 1.3 GB et la pile
+# (ollama/desktop) consomme déjà ~44 GB sur ce poste ; 8 volumes suffisent à
+# discriminer un backbone saine d'un backbone cassé et tiennent en mémoire.
+VOLUME_SIZE = (192, 224, 192)
+TARGET_SPACING = (1.0, 1.0, 1.0)
+N_VOLUMES = 8
 N_META_STEPS = 2000
 BATCH_SIZE = 2
 POINTS_PER_STEP = 16384
@@ -102,11 +126,39 @@ def _make_cfg() -> INRBackboneConfig:
     return INRBackboneConfig(**kw)
 
 
+def _load_smoke_backbone(path: Path, device: torch.device) -> INRBackbone:
+    """Recharge un backbone smoke déjà entraîné : rejoue les portes [2/5]-[5/5]
+    sans repayer les ~18 min de méta-entraînement de [1/5].
+
+    Applique la leçon D0 (voir arch_inr.load_inr_backbone) à ce checkpoint-ci :
+    la config est comparée à celle du checkpoint quand il la porte, parce
+    qu'une divergence de PROCÉDURE (inner_steps, fg_weight...) ne changerait
+    aucune forme de poids et passerait donc load_state_dict en silence.
+    Checkpoint sans `cfg` (antérieur) → comparaison ignorée, comme pour D0.
+    """
+    state = torch.load(path, map_location=device, weights_only=False)
+    cfg = _make_cfg()
+    diffs = diff_inr_configs(cfg, state.get("cfg"))
+    if diffs:
+        lines = "\n".join(f"  {n} : demandé={cur!r}  vs  checkpoint={exp!r}"
+                          for n, cur, exp in diffs)
+        raise ValueError(
+            f"Le backbone de {path} n'a pas été entraîné avec cette config.\n"
+            f"{lines}\nRelancez sans --load-checkpoint, ou repassez les mêmes "
+            f"options CLI (--modulate-scale / --lora-rank / --direct / "
+            f"--inner-steps) qu'à la sauvegarde."
+        )
+    backbone = INRBackbone(cfg).to(device)
+    backbone.load_state_dict(state["model"])
+    print(f"\n[1/5] ⏭  Méta-entraînement sauté — backbone rechargé depuis {path}")
+    return backbone
+
+
 def test_meta_training_converges(
     volumes: torch.Tensor, device: torch.device, z_reg_weight: float = 0.0,
 ) -> INRBackbone:
     n_steps = _OPTS["steps"]
-    print(f"\n[1/4] Meta-entraînement ({n_steps} pas, batch={BATCH_SIZE}, "
+    print(f"\n[1/5] Meta-entraînement ({n_steps} pas, batch={BATCH_SIZE}, "
           f"{POINTS_PER_STEP} points/pas, sur {volumes.shape[0]} volumes, "
           f"z_reg_weight={z_reg_weight:.2e})...")
     cfg = _make_cfg()
@@ -145,16 +197,26 @@ def test_meta_training_converges(
 
 
 def test_z_discriminates_between_volumes(backbone: INRBackbone, volumes: torch.Tensor, device: torch.device) -> None:
-    print("\n[2/4] Discrimination de z (fit indépendant sur 2 volumes distincts)...")
+    print("\n[2/5] Discrimination de z (fit indépendant sur 2 volumes distincts)...")
     backbone.eval()
     for p in backbone.parameters():
         p.requires_grad_(False)
 
-    coords_full = make_coord_grid(VOLUME_SIZE, device=device)
-    z0 = fit_new_volume(backbone, volumes[0:1], coords_full, num_steps=50, lr=1e-2)
-    z1 = fit_new_volume(backbone, volumes[1:2], coords_full, num_steps=50, lr=1e-2)
+    # Sous-échantillonnage de supervision (1M points) : à 1 mm un fit
+    # dense = 8.25M points, la graph d'activation ne tient pas en VRAM
+    # sur ce poste (ollama/desktop consomme ~44 GB sur 128 GB). Le budget
+    # de points est déjà sous-échantillonné partout dans le projet
+    # (points_per_step=16384 dans train_inr_backbone.py, fit_points=1M
+    # dans configs/mmfm/inr.yaml) — le smoke-test n'a pas à faire dense
+    # pour vérifier le mécanisme.
+    coords_all = make_coord_grid(VOLUME_SIZE, device=device)
+    n_sub = min(1_000_000, coords_all.shape[0])
+    idx = torch.randperm(coords_all.shape[0], device=device)[:n_sub]
+    coords_sub = coords_all[idx]
+    z0 = fit_new_volume(backbone, volumes[0:1], coords_all, num_steps=50, lr=1e-2, num_points=n_sub)
+    z1 = fit_new_volume(backbone, volumes[1:2], coords_all, num_steps=50, lr=1e-2, num_points=n_sub)
     with torch.no_grad():
-        coords_b = coords_full.unsqueeze(0)
+        coords_b = coords_sub.unsqueeze(0)
         recon0 = backbone.decode(coords_b, z0)
         recon1 = backbone.decode(coords_b, z1)
 
@@ -176,61 +238,185 @@ def test_z_discriminates_between_volumes(backbone: INRBackbone, volumes: torch.T
         p.requires_grad_(True)
 
 
-def test_reconstruction_quality(backbone: INRBackbone, volumes: torch.Tensor, device: torch.device) -> None:
-    print("\n[3/4] Qualité de reconstruction (Algorithme 2, dense)...")
+def _fg_nrmse(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    """nRMSE sur le foreground (cerveau) : la mesure discriminante.
+
+    Après center_crop_or_pad + percentiles, ~90 % des voxels sont du fond
+    quasi-invariant ≈ -1, que TOUTE prédiction (moyenne incluse) atteint à
+    coup sûr — il faut donc exclure le fond pour séparer anatomie du reste.
+    """
+    pred_np = ((pred.clamp(-1, 1) + 1) / 2).cpu().numpy()
+    gt_np = ((gt.clamp(-1, 1) + 1) / 2).cpu().numpy()
+    m = gt_np > FG_MASK_THRESHOLD_01
+    return float(compute_nrmse(pred_np, gt_np, mask=m))
+
+
+def _resample_idx(coords_full: torch.Tensor, n: int, seed: int = 0) -> torch.Tensor:
+    """Sous-échantillon déterministe de n indices sur la grille pleine."""
+    gen = torch.Generator(coords_full.device)
+    gen.manual_seed(seed)
+    return torch.randperm(coords_full.shape[0], device=coords_full.device, generator=gen)[:n]
+
+
+def test_reconstruction_quality(backbone: INRBackbone, volumes: torch.Tensor, device: torch.device) -> float:
+    """[3/5] Le fit de z doit dominer l'« average brain blob » (moyenne LOO).
+
+    C'est le seuil DISCRIMINANT demandé par le CHANGELOG. L'ancien seuil
+    absolu (nrmse_fg < 0.6) laissait passer le cassé — mesuré le 2026-09-04 :
+    un backbone à z=0 vaut 0.4443 (production) et 0.3942 (smoke), donc SOUS
+    0.6, accepté. (L'ancienne justification invoquait le 0.6383 de la
+    production : c'est le nRMSE Task 3 du FLOW de bout en bout, pas le
+    nrmse_fg de reconstruction du BACKBONE, qui vaut 0.2430 — deux grandeurs
+    incommensurables.) Ici on compare le fit à la MEILLEURE prédiction « sans z »
+    (la moyenne des autres volumes, le régime exact du collapse que ce test a
+    été écrit pour attraper). La moyenne est LEAVE-ONE-OUT : voir le
+    commentaire ci-dessous, une baseline qui contient la cible inverse le
+    verdict. Retourne le nrmse_fg du fit (utilisé par [5/5]).
+    """
+    print("\n[3/5] Qualité de reconstruction (fit vs average brain blob)...")
+    backbone.eval()
+    for p in backbone.parameters():
+        p.requires_grad_(False)
+
+    # Sous-échantillon (1M points) : un decode DENSE à 1mm (8.25M points)
+    # ~33 GB d'activation ne tient pas sur ce poste (ollama/desktop ~44 GB).
+    # Le budget de points est déjà sous-échantillonné partout ailleurs
+    # (points_per_step=16384, fit_points=1M) — le test de mécanisme n'a pas
+    # à faire dense ; la qualité absolue de production est mesurée ailleurs.
+    coords_full = make_coord_grid(VOLUME_SIZE, device=device)
+    n = min(1_000_000, coords_full.shape[0])
+    idx = _resample_idx(coords_full, n)
+    coords_sub = coords_full[idx]
+
+    vol = volumes[0:1]
+    gt = vol.reshape(1, -1)[0, idx]  # voxels aux mêmes points query
+    z = fit_new_volume(backbone, vol, coords_full, num_steps=50, lr=1e-2, num_points=n)
+    with torch.no_grad():
+        pred_fit = backbone.decode(coords_sub.unsqueeze(0), z).reshape(-1)
+    nrmse_fit = _fg_nrmse(pred_fit, gt)
+
+    # La meilleure prédiction « sans z » : la moyenne des AUTRES volumes.
+    # LEAVE-ONE-OUT obligatoire. Une moyenne qui contient la cible n'est pas
+    # une prédiction, c'est un oracle partiel — et la fuite n'est pas
+    # cosmétique : mesurée le 2026-09-03 sur ce jeu, elle vaut +0.0388 de
+    # nRMSE_fg (0.2716 cible incluse contre 0.3104 sans, moyenné sur les 8
+    # volumes) et INVERSE le verdict de la porte (fit 0.3213 : échec contre
+    # 0.3091 avec la cible, succès contre 0.3541 sans). À N=40 (ancien régime
+    # 2mm) la cible pesait 1/40 de sa propre référence et la fuite passait
+    # inaperçue ; à N=8 (le stack 1mm ne tient pas en mémoire au-delà) elle
+    # pèse 1/8 et décide seule du résultat. Voir CHANGELOG.md, 2026-09-03 (nuit).
+    mean_vol = volumes[1:].mean(dim=0, keepdim=True)  # volumes[0:1] = la cible
+    mean_sub = mean_vol.reshape(1, -1)[0, idx]
+    nrmse_mean = _fg_nrmse(mean_sub, gt)
+
+    print(f"    nRMSE_fg avec z (fit)            : {nrmse_fit:.4f}")
+    print(f"    nRMSE_fg sans z (moy. LOO, n={volumes.shape[0] - 1}): {nrmse_mean:.4f}")
+    assert nrmse_fit < nrmse_mean, (
+        f"le fit de z ne bat PAS la moyenne leave-one-out des autres volumes "
+        f"(fit={nrmse_fit:.4f} >= moyenne={nrmse_mean:.4f}) — le mécanisme "
+        "de fitting est cassé (collapse sur l'average brain blob ; voir "
+        "module docstring et inr_backbone.py::_weighted_mse)."
+    )
+    print(f"✅ le fit de z domine l'average brain blob "
+          f"({nrmse_mean:.4f} → {nrmse_fit:.4f}).")
+
+    for p in backbone.parameters():
+        p.requires_grad_(True)
+    return nrmse_fit
+
+
+def test_negative_gate(backbone: INRBackbone, volumes: torch.Tensor, device: torch.device, nrmse_fit: float) -> None:
+    """[5/5] Contrôle négatif : PROUVE que [3/5] est discriminant.
+
+    Simule un backbone cassé (z=0, modulation nulle → « average brain blob »
+    sans aucune information par volume). Le nRMSE_fg à z=0 DOIT être nettement
+    PIRE que celui du fit sain fourni par [3/5]. Si les deux sont à peu près
+    égaux (ratio < 1.05), le test [3/5] ne peut PAS séparer un mécanisme sain
+    d'un mécanisme cassé — c'est exactement le défaut que le CHANGELOG cite
+    comme « non corrigé » (threshold qui laisse passer le cassé).
+    Ratio = nrmse_z0 / nrmse_fit > 1.05.
+    """
+    print("\n[5/5] Contrôle négatif : prouver que [3/5] est discriminant...")
     backbone.eval()
     for p in backbone.parameters():
         p.requires_grad_(False)
 
     coords_full = make_coord_grid(VOLUME_SIZE, device=device)
+    n = min(1_000_000, coords_full.shape[0])
+    idx = _resample_idx(coords_full, n)
+    coords_sub = coords_full[idx]
     vol = volumes[0:1]
-    z = fit_new_volume(backbone, vol, coords_full, num_steps=50, lr=1e-2)
+    gt = vol.reshape(1, -1)[0, idx]
+
+    # z=0 : modulation nulle → le réseau produit le même « cerveau moyen »
+    # quel que soit le volume (le régime exact du collapse).
+    z0 = torch.zeros(1, backbone.cfg.latent_dim, device=device, dtype=torch.float32)
     with torch.no_grad():
-        pred = backbone.decode(coords_full.unsqueeze(0), z).reshape(VOLUME_SIZE)
+        pred_z0 = backbone.decode(coords_sub.unsqueeze(0), z0).reshape(-1)
+    nrmse_z0 = _fg_nrmse(pred_z0, gt)
 
-    pred_np = ((pred.clamp(-1, 1) + 1) / 2).cpu().numpy()
-    gt_np = ((vol[0, 0].clamp(-1, 1) + 1) / 2).cpu().numpy()
-    nrmse = compute_nrmse(pred_np, gt_np)
-    ssim = compute_ssim(pred_np, gt_np)
-
-    fg_mask = gt_np > FG_MASK_THRESHOLD_01
-    nrmse_fg = compute_nrmse(pred_np, gt_np, mask=fg_mask)
-    print(f"    Volume entier : nRMSE={nrmse:.4f}  SSIM={ssim:.4f}")
-    print(f"    Foreground seul (masque > {FG_MASK_THRESHOLD_01}) : nRMSE={nrmse_fg:.4f}")
-    assert nrmse_fg < 0.6, (
-        f"nRMSE foreground trop élevé pour un fitting Algorithme 2 (mécanisme cassé ?): {nrmse_fg:.4f}"
+    ratio = nrmse_z0 / max(nrmse_fit, 1e-9)
+    print(f"    nRMSE_fg z=0 (cassé)  : {nrmse_z0:.4f}")
+    print(f"    nRMSE_fg fit (sain)  : {nrmse_fit:.4f}")
+    print(f"    ratio (z0/fit)       : {ratio:.2f}")
+    assert ratio >= 1.05, (
+        f"le test de reconstruction n'est PAS discriminant : le z=0 (cassé) "
+        f"donne nRMSE_fg={nrmse_z0:.4f}, pas nettement pire que le fit sain "
+        f"({nrmse_fit:.4f}) — le seuil laisse donc passer le cassé (défaut "
+        "noté dans CHANGELOG.md). Revoir le seuil pour forcer ratio > 1.05."
     )
-    print("✅ Reconstruction dans un ordre de grandeur sain (y compris hors fond).")
+    print("✅ contrôle négatif : un mécanisme cassé (z=0) EST bien détecté, "
+          f"le test est discriminant (ratio = {ratio:.2f}).")
 
     for p in backbone.parameters():
         p.requires_grad_(True)
 
 
 def test_resolution_invariance(backbone: INRBackbone, volumes: torch.Tensor, device: torch.device) -> None:
-    print("\n[4/4] Invariance à la résolution (fit indépendant à 2 résolutions)...")
+    print("\n[4/5] Invariance à la résolution (fit indépendant à 2 résolutions)...")
     backbone.eval()
     for p in backbone.parameters():
         p.requires_grad_(False)
 
-    vol_full = volumes[0:1]  # (1, 1, 96, 112, 96)
+    # Sous-échantillon (1M points) pour le fit ET le decode : à 1 mm un fit
+    # dense 8.25M × 50 pas ne tient pas en VRAM. Le point du test est la
+    # propriété epsilon-ReNO de NOIR (z fitté à 2 résolutions → reconstructions
+    # voisines), qui n'exige PAS un fit dense : un budget de points commun et
+    # déterministe préserve la comparaison full-vs-demi-résolution.
+    n = 1_000_000
+    vol_full = volumes[0:1]
     half_size = tuple(s // 2 for s in VOLUME_SIZE)
     vol_half = F.interpolate(vol_full, size=half_size, mode="trilinear", align_corners=True)
 
     coords_full = make_coord_grid(VOLUME_SIZE, device=device)
+    n_f = min(n, coords_full.shape[0])
+    idx_f = _resample_idx(coords_full, n_f)
+    coords_full_sub = coords_full[idx_f]      # points de comparaison (decode)
     coords_half = make_coord_grid(half_size, device=device)
+    n_h = min(n, coords_half.shape[0])
 
-    z_full = fit_new_volume(backbone, vol_full, coords_full, num_steps=50, lr=1e-2)
-    z_half = fit_new_volume(backbone, vol_half, coords_half, num_steps=50, lr=1e-2)
+    # Le sous-échantillonnage du FIT passe par `num_points`, pas par une grille
+    # déjà réduite : fit_new_volume doit échantillonner coordonnées ET valeurs
+    # ENSEMBLE (sample_points). Lui donner une grille de 1M points avec un
+    # volume de 8.25M voxels casse l'appariement — RuntimeError de forme dans
+    # _weighted_mse (rencontré le 2026-09-04). C'est aussi ce que fait [3/5].
+    z_full = fit_new_volume(backbone, vol_full, coords_full, num_steps=50, lr=1e-2, num_points=n_f)
+    z_half = fit_new_volume(backbone, vol_half, coords_half, num_steps=50, lr=1e-2, num_points=n_h)
 
+    # decode aux mêmes points query (la grille pleine 1mm, sous-échantillonnée)
     with torch.no_grad():
-        ref_coords = coords_full.unsqueeze(0)
+        ref_coords = coords_full_sub.unsqueeze(0)
         recon_from_full = backbone.decode(ref_coords, z_full)
         recon_from_half = backbone.decode(ref_coords, z_half)
+    gt_ref = vol_full.reshape(1, -1)[0, idx_f]
 
     rel_err = (
         (recon_from_full - recon_from_half).norm() / recon_from_full.norm().clamp_min(1e-8)
     ).item()
-    print(f"    Erreur relative L2 (reconstructions@96x112x96, fit@full vs fit@demi-résolution) : {rel_err:.4f}")
+    nrmse_full = _fg_nrmse(recon_from_full.reshape(-1), gt_ref)
+    nrmse_half = _fg_nrmse(recon_from_half.reshape(-1), gt_ref)
+    print(f"    Erreur relative L2 (fit@full vs fit@demi-résolution) : {rel_err:.4f}")
+    print(f"    nRMSE_fg recon@full={nrmse_full:.4f}  recon@half={nrmse_half:.4f}")
     assert rel_err < 0.5, f"Invariance à la résolution trop faible pour valider le principe : {rel_err:.4f}"
     print("✅ Les deux fits (résolutions différentes) convergent vers des reconstructions voisines.")
 
@@ -253,6 +439,9 @@ if __name__ == "__main__":
                           "plus il en faut a priori pour converger.")
     ap.add_argument("--z-reg-weight", type=float, default=0.0,
                      help="Poids de la pénalité de lissage sur z (Hutchinson VJP). 0.0 = désactivée.")
+    ap.add_argument("--load-checkpoint", default=None,
+                     help="Recharge un backbone smoke déjà entraîné et saute [1/5] : "
+                          "rejoue les portes sans repayer le méta-entraînement.")
     ap.add_argument("--save-checkpoint", default=None,
                      help="Chemin où sauver le backbone entraîné (format compatible load_inr_backbone), "
                           "pour re-vérifier avec diagnose_inr_latent_smoothness.py.")
@@ -269,16 +458,25 @@ if __name__ == "__main__":
         volumes = _load_smoke_volumes(device)
         print(f"Volumes chargés : {tuple(volumes.shape)}")
 
-        backbone = test_meta_training_converges(volumes, device, z_reg_weight=args.z_reg_weight)
-        test_z_discriminates_between_volumes(backbone, volumes, device)
-        test_reconstruction_quality(backbone, volumes, device)
-        test_resolution_invariance(backbone, volumes, device)
+        if args.load_checkpoint:
+            backbone = _load_smoke_backbone(Path(args.load_checkpoint), device)
+        else:
+            backbone = test_meta_training_converges(volumes, device, z_reg_weight=args.z_reg_weight)
 
-        if args.save_checkpoint:
+        # Sauvegarde AVANT les portes, pas après : le méta-entraînement coûte
+        # ~18 min à 1mm, et c'est justement quand une porte ÉCHOUE qu'on veut
+        # rejouer les portes sur le même backbone sans le repayer.
+        if args.save_checkpoint and not args.load_checkpoint:
             out = Path(args.save_checkpoint)
             out.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"model": backbone.state_dict()}, out)
+            torch.save({"model": backbone.state_dict(),
+                        "cfg": asdict(backbone.cfg)}, out)
             print(f"\n💾 Checkpoint smoke sauvé : {out}")
+
+        test_z_discriminates_between_volumes(backbone, volumes, device)
+        nrmse_fit = test_reconstruction_quality(backbone, volumes, device)
+        test_resolution_invariance(backbone, volumes, device)
+        test_negative_gate(backbone, volumes, device, nrmse_fit=nrmse_fit)
 
         print("\n" + "=" * 70)
         print("✅ TOUS LES SMOKE TESTS SONT PASSÉS")

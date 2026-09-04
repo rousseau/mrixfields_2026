@@ -18,6 +18,18 @@ mappé sur `[0,1]`), le contraste (T1W/T2W/T2FLAIR) est la classe
 conditionnante. Couplage OT-CFM réel entre marginales adjacentes
 (`torchcfm.ExactOptimalTransportConditionalFlowMatcher`).
 
+> **Ce qui fait « multi-marginal » — à ne pas taire.** C'est **l'axe temps** qui
+> porte la multi-marginalité : un *seul* champ de vitesses `v(z, z_src, t, y)`
+> paramètre les 5 marginales de champ le long d'un continu `t ∈ [0,1]`
+> (`mmfm_core.py:136-139`). Le couplage OT, lui, est un détail de couplage
+> intra-étape et est **vacuous à `batch_size = 1`** — avec un seul échantillon
+> source/cible par étape, `torchcfm` construit un plan de transport 1×1 (identité),
+> bit-à-bit équivalent à un CFM couplé indépendamment ; il n'a un effet que comme
+> *réduction de variance* de la carte marginale, pas comme récupération de
+> correspondances sujet à sujet (0 sujet apparié sur 1056 volumes d'entraînement —
+> voir `CHANGELOG.md` et `configs/mmfm/vectorized.yaml:116-135` pour la mesure et
+> le retour à `batch_size: 1`).
+
 ## Code : un seul point de variation légitime
 
 ```

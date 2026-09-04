@@ -32,7 +32,7 @@ from torch import Tensor, nn
 
 from cfm.arch_vector import build_vector_mmfm
 from cfm.inr_backbone import (
-    DEFAULT_FIT_CHUNK, INRBackbone, INRBackboneConfig, decode_volume, fit_new_volume, make_coord_grid,
+    DEFAULT_FIT_CHUNK, INRBackbone, INRBackboneConfig, decode_volume, diff_inr_configs, fit_new_volume, make_coord_grid,
 )
 from common.dataset import FlatLatentCacheDataset
 
@@ -73,6 +73,44 @@ def load_inr_backbone(cfg: dict, device: torch.device) -> INRBackbone:
         )
     backbone = INRBackbone(_backbone_config_from_cfg(cfg)).to(device)
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
+    # D0 — garde-fou de cohérence. Le backbone (train_inr_backbone.py) embarque
+    # la config RESOLUE au moment de l'entraînement. Comparer la config courante
+    # (ici : le bloc `inr_backbone:` de la config de FLOW — source unique de
+    # vérité au chargement) contre le checkpoint est un test de cohérence :
+    #   - divergence d'architecture (hidden_dim, latent_dim, hyper_hidden_dim,
+    #     omega_*, num_hidden_layers) → ferait sinon échouer load_state_dict
+    #     avec un message obscur plutôt que le diagnostic précis ci-dessous ;
+    #   - divergence de PROCÉDURE (inner_lr, inner_steps_*, fg_weight,
+    #     bg_threshold) → échapperait totalement à load_state_dict (mêmes
+    #     formes de poids) et produirait un `z` source hors distribution
+    #     silencieusement — c'est le scénario le plus dangereux et le plus
+    #     fréquent à corriger (voir la section « Défauts de mon propre
+    #     protocole » dans CHANGELOG.md).
+    #
+    # `embedded is None` = checkpoint antérieur à ce garde-fou → on se tait et
+    # on se fie à load_state_dict (comportement historique inchangé).
+    embedded = state.get("backbone_cfg", None)
+    if embedded is not None:
+        diffs = diff_inr_configs(backbone.cfg, embedded)
+        if diffs:
+            lines = "\n".join(
+                f"  {n} : config courante (inr.yaml.inr_backbone)={cur!r}   vs   "
+                f"backbone (inr_backbone.yaml.model)={exp!r}"
+                for n, cur, exp in diffs
+            )
+            raise ValueError(
+                f"Config INR incohérente avec le backbone de {ckpt_path}.\n"
+                f"Champs en désaccord :\n{lines}\n"
+                f"Alignez configs/mmfm/inr.yaml (bloc inr_backbone:) et "
+                f"configs/mmfm/inr_backbone.yaml (bloc model:) SUR LA MÊME "
+                f"configuration, puis si vous avez modifié la config du "
+                f"backbone : ré-entraînez-le (train_inr_backbone.py) avant de "
+                f"le consommer. Si seul inr.yaml a changé de valeur par "
+                f"erreur : réalignez-le sur inr_backbone.yaml."
+            )
+        else:
+            print(f"  ✅ cohérence INR : la config du checkpoint ({ckpt_path}) "
+                  f"est identique à celle utilisée ({len(embedded)} champs).")
     if state.get("ema"):
         backbone.load_state_dict(state["ema"])
     else:

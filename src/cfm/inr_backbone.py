@@ -26,7 +26,7 @@ gradient is needed and keeping the graph would only waste memory.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -295,6 +295,37 @@ class INRBackboneConfig:
     #                    pas (mesuré, cf. comparison_20260807_1mm/manifest.md).
     modulate_scale: bool = False
     lora_rank: int = 0
+
+
+def diff_inr_configs(current: "INRBackboneConfig", expected: Optional[dict]) -> list:
+    """Fichier de cohérence INR — D0.
+
+    Retourne la liste des champs de `current` qui diffèrent de `expected`
+    (dict plat des champs de la config du backbone tel qu'entré, sérialisé avec
+    `asdict(INRBackboneConfig(...))`). `expected` à `None` = comparaison pas
+    demandée → retourne toujours [].
+
+    Ce gardien couvre ce qu'un `load_state_dict` ne peut PAS détecter : les
+    champs de la PROCÉDURE de fitting qui déterminent le `z` (inner_lr,
+    inner_steps_*, fg_weight, bg_threshold) — une divergence est silencieuse
+    (mêmes formes de poids) mais le flow reçoit alors un z source hors
+    distribution. Elle couvre aussi les champs d'ARCHITECTURE (hidden_dim,
+    num_hidden_layers, latent_dim, hyper_hidden_dim, omega_*, …) dont une
+    divergence ferait autrement échouer `load_state_dict` avec un message
+    obscur plutôt que le diagnostic précis de ce diff.
+
+    `None` dans `expected` = champ absent (ancien checkpoint) → ignoré.
+    """
+    if expected is None:
+        return []
+    diffs = []
+    for name, cur_val in asdict(current).items():
+        exp_val = expected.get(name, None)
+        if exp_val is None:
+            continue
+        if cur_val != exp_val:
+            diffs.append((name, cur_val, exp_val))
+    return diffs
 
 
 class INRBackbone(nn.Module):

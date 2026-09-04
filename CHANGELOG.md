@@ -51,9 +51,173 @@ par 3.3 et passée sous le seuil du prédicteur constant, **score T1W dégradé*
 0.3376). Toujours décomposer : par sujet, par paire, et contre un témoin trivial.
 
 **Un test dont le seuil accepte le cassé ne teste rien.**
-`test_inr_backbone_smoke.py:200` assère `nrmse_fg < 0.6` quand la production
-valait 0.6383, à 2 mm alors que la production est à 1 mm. Il a laissé passer
-trois bugs pendant des mois. **Non corrigé à ce jour.**
+`test_inr_backbone_smoke.py` assérait `nrmse_fg < 0.6` à 2 mm alors que la
+production est à 1 mm. Il a laissé passer trois bugs pendant des mois.
+**CORRIGÉ et MESURÉ le 2026-09-04** : le seuil est désormais relatif (battre la
+moyenne leave-one-out) et un contrôle négatif prouve qu'il discrimine. Et la
+preuve que l'ancien seuil acceptait le cassé est maintenant chiffrée, pas
+supposée : un backbone à z=0 vaut 0.4443 (production) et 0.3942 (smoke), tous
+deux **sous** 0.6, donc tous deux acceptés par l'ancienne porte. *(L'ancienne
+justification comparait 0.6 au 0.6383 de Task 3 — deux grandeurs
+incommensurables, voir l'entrée du 2026-09-04.)*
+
+---
+
+## 2026-09-04 — **Le backbone INR de production est sain, et on peut enfin le prouver**
+
+**Verdict : les cinq portes passent, et le contrôle négatif établit pour la première
+fois qu'elles savent séparer un mécanisme sain d'un cassé.** Logs :
+`outputs/gate_inr_production_20260904.log`, `outputs/smoke_inr_1mm_20260904_gates.log`,
+`outputs/smoke_inr_1mm_20260904_loo.log`. Table :
+`results/mmfm/gate_inr_production_20260904/gate_production_20steps.csv`.
+
+### Le backbone de PRODUCTION, mesuré pour la première fois
+
+`outputs/mmfm/inr_backbone/weights/model_final.pth` (129024-d, 2026-08-11), réglage de
+fitting de production (`inner_steps_eval=20`, `lr=0.01`, 1 048 576 points), 8 volumes
+T1W/3T `retro_train`, nRMSE **foreground** :
+
+| | moy. | min | max |
+|---|---|---|---|
+| **fit de z** | **0.2430** | 0.2301 | 0.2585 |
+| moyenne leave-one-out (« sans z ») | 0.3100 | 0.2881 | 0.3533 |
+| **z = 0** (cassé simulé) | 0.4443 | 0.4048 | 0.4870 |
+
+**8/8 volumes gagnés**, sans exception, 22 % de marge. Ratio z0/fit **1.83** contre un
+seuil à 1.05. Le mécanisme de fitting de production ne s'effondre pas sur le cerveau
+moyen — affirmation jamais vérifiée jusqu'ici.
+
+### Le smoke backbone : faible, pas cassé
+
+4096-d, 2000 pas, 8 volumes, 1 mm (loss 0.06441 → 0.00021 en 1191 s sur GB10) :
+
+| porte | chiffre | verdict |
+|---|---|---|
+| `[2/5]` discrimination de z | diff relative des recons **0.2103** (vérité terrain 0.2588), ‖z0−z1‖ = 0.0975 | ✅ |
+| `[3/5]` fit vs moyenne LOO | **0.3175** contre **0.3533** | ✅ |
+| `[4/5]` invariance à la résolution | erreur relative L2 **0.0056** ; recon@full 0.3175, recon@demi 0.3178 | ✅ |
+| `[5/5]` contrôle négatif z=0 | **0.3942** contre 0.3175 → ratio **1.24** (seuil 1.05) | ✅ |
+
+Ses 0.3175 tombent **entre** le sain de production (0.2430) et le cassé (0.4443) : le
+budget de 2000 pas, calibré pour 40 volumes à 2 mm, est simplement insuffisant à 1 mm.
+Faible, pas défaillant — distinction que l'ancienne porte absolue ne permettait pas.
+
+### Trois défauts trouvés dans le correctif lui-même
+
+1. **La baseline trichait** (découvert au premier lancement, entrée du 2026-09-03 nuit).
+   La moyenne « sans z » incluait le volume à reconstruire. Fuite mesurée : **+0.0388**
+   de nRMSE_fg (0.2716 cible incluse contre 0.3104 en leave-one-out, moyenné sur les 8).
+   Verdict inversé : le même fit à 0.3213 échouait contre 0.3091 et passait contre 0.3541.
+   **Cause : `N_VOLUMES` 40 → 8**, imposé par la mémoire à 1 mm, qui fait passer le poids
+   de la cible dans sa propre référence de 1/40 à 1/8. Le changement de régime a converti
+   un biais inoffensif en biais décisif, dans la modification même qui créait la baseline.
+2. **`[4/5]` plantait** : `RuntimeError: The size of tensor a (1000000) must match the size
+   of tensor b (8257536)`. Le test sous-échantillonnait les coordonnées (1M) mais passait
+   le volume entier (8.25M voxels) à `fit_new_volume` — coordonnées et valeurs
+   désappariées. `[3/5]` y échappait en passant la grille pleine + `num_points`, ce qui
+   laisse `sample_points` échantillonner les deux **ensemble**. Corrigé de la même façon.
+3. **La justification écrite était fausse.** Le commentaire « l'ancien seuil `nrmse_fg <
+   0.6` laissait passer le cassé, la production 1 mm est à 0.6383 » compare le nRMSE
+   **Task 3 du flow de bout en bout** au nRMSE_fg de **reconstruction du backbone**, qui
+   vaut 0.2430. Deux grandeurs incommensurables. La conclusion tient, mais la vraie
+   démonstration est celle d'aujourd'hui : **z=0 vaut 0.4443, donc l'ancien seuil de 0.6
+   l'acceptait**.
+
+### Garde-fou D0 : d'abord muet, puis armé par rétro-remplissage
+
+Au premier chargement le garde-fou n'imprimait rien : `backbone_cfg` était absent du
+checkpoint de production (clés réelles
+`['iter','model','ema','optimizer','scheduler','cfg_path']`), donc `diff_inr_configs`
+renvoyait `[]` — muet exactement là où il compte.
+
+**Rétro-rempli le 2026-09-04**, avec la règle de n'inscrire que ce qui est sourcé :
+
+| | champs | statut |
+|---|---|---|
+| **Prouvés par les poids** | `latent_dim` 129024, `hyper_hidden_dim` 512, `hidden_dim` 256, `num_hidden_layers` 6, `modulate_scale` False, `lora_rank` 0 | lus dans les formes des 18 tenseurs, puis `load_state_dict(strict=True)` accepté |
+| **Non récupérables d'un checkpoint** | `omega_0`/`omega_hidden` 30.0, `inner_lr` 0.01, `inner_steps_train` 10, `inner_steps_eval` 20, `fg_weight` 5.0, `bg_threshold` −0.9 | repris du `cfg_path` enregistré (`configs/mmfm/inr_backbone.yaml`, inchangé depuis son unique commit 223e5f4) |
+
+**Ce n'est pas une mesure et le checkpoint le dit** : une clé
+`backbone_cfg_provenance` y consigne la date, la source, la liste de ce qui est vérifié,
+la liste de ce qui ne l'est pas, et le chemin de la sauvegarde. Corroboration pour les
+champs non vérifiables : le run a duré 48 287 s pour 50 000 itérations, soit 0.97 s/iter
+contre les 0.98 s/iter annoncés par la config pour `latent_dim=129024`, et tous les
+commentaires datés de ce fichier (≤ 2026-08-10) précèdent l'entraînement
+(2026-08-10 16:29 → 2026-08-11 05:54).
+
+**Intégrité vérifiée** : les 36 tenseurs (`model` + `ema`) sont identiques au bit près à
+la sauvegarde `model_final.pth.bak_20260904` (md5 `e68c642b8454b2175b33c8d62a0b99af`),
+`iter=49999` et `cfg_path` préservés, écriture atomique via `os.replace`.
+
+**Le garde-fou est maintenant prouvé dans les deux sens** — ce qui n'avait jamais été
+fait : cas nominal, il imprime « cohérence INR : 13 champs » ; cas de divergence de
+PROCÉDURE (`inner_lr` 0.01 → 0.05, `inner_steps_eval` 20 → 10, deux changements qui ne
+touchent aucune forme de poids et passeraient `load_state_dict` en silence), il lève une
+`ValueError` nommant les deux champs et leurs deux valeurs.
+
+### Parité de calcul
+
+`src/cfm/gate_inr_production.py` **importe** `_fg_nrmse`, `_resample_idx` et
+`_load_smoke_volumes` de `test_inr_backbone_smoke` au lieu de les réimplémenter : les deux
+backbones sont jugés par le même code, aux mêmes points query, sur les mêmes volumes. Seul
+le backbone change. Contrôle croisé : la baseline LOO calculée par ce script (0.3100)
+retrouve celle mesurée séparément avant correction (0.3104).
+
+### Outillage
+
+`--load-checkpoint` rejoue les portes `[2/5]`–`[5/5]` sur un backbone déjà entraîné
+(~4 min) au lieu de repayer les ~20 min de méta-entraînement ; la sauvegarde a été
+déplacée **avant** les portes, puisque c'est précisément quand une porte échoue qu'on veut
+rejouer sans réentraîner. Le checkpoint smoke embarque désormais sa config, et le
+rechargement applique la même vérification que D0.
+
+---
+
+## 2026-09-03 (nuit) — **Le nouveau garde-fou du smoke test échoue, mais sa baseline triche**
+
+**Verdict : la porte `[3/5]` est INVALIDE en l'état — sa référence « sans z » inclut le
+volume qu'elle sert à reconstruire.** Log : `outputs/smoke_inr_1mm_20260903.log`.
+
+Premier lancement du smoke test INR remis au régime de production (1 mm, 192x224x192,
+8 volumes) avec sa nouvelle porte relative « le fit de z doit battre la moyenne du
+dataset ». Méta-entraînement sain (loss 0.06677 -> 0.00034 en 2000 pas, 18 min sur GB10),
+`[2/4]` discrimination de z passée (diff relative des reconstructions 0.2063 contre
+0.2588 pour la vérité terrain). Puis :
+
+| | nRMSE_fg |
+|---|---|
+| fit de z (backbone smoke, 2000 pas) | 0.3213 |
+| moyenne du dataset, **cible incluse** (baseline du test) | 0.3091 |
+| moyenne du dataset, **leave-one-out** (baseline honnête) | 0.3541 |
+
+**Le verdict s'inverse selon la baseline** : échec contre la moyenne qui a vu la cible,
+succès de 9.4 % contre la moyenne leave-one-out. Mesuré sur les 8 volumes, la fuite vaut
+**+0.0388 de nRMSE_fg** (0.2716 avec la cible contre 0.3104 sans).
+
+**La cause est dans le même changement.** `N_VOLUMES` est passé de 40 à 8 (le stack 1 mm
+ne tient pas en mémoire autrement). À 40 volumes la cible pesait 1/40 de sa propre
+référence — négligeable. À 8 volumes elle en pèse 1/8, et domine la décision. Le passage
+au régime de production a converti un biais inoffensif en biais décisif, dans la
+modification même qui introduisait la baseline.
+
+**Ce qui reste non mesuré** : l'assertion arrête la série avant `[4/5]` (invariance à la
+résolution) et surtout avant `[5/5]`, le contrôle négatif à z=0 — c'est-à-dire avant la
+porte qui devait *prouver* que `[3/5]` sait séparer un mécanisme sain d'un cassé. La
+raison d'être de la Phase 0.2 reste donc à établir.
+
+**Réserve, à ne pas confondre** : ce backbone est celui du smoke test (4096-d, 2000 pas,
+8 volumes), **pas** le backbone de production (`outputs/mmfm/inr_backbone/weights/
+model_final.pth`, 129024-d, 2026-08-11). Rien ici ne dit quoi que ce soit sur l'INR de
+production — cette mesure-là n'a pas encore été faite.
+
+**Défauts annexes constatés au passage** : le test `[2/4]` n'a pas été renuméroté `[2/5]` ;
+le docstring du module annonce toujours « 4 tests / 40 volumes / nRMSE et SSIM » alors que
+`compute_ssim` n'est plus importé ; le garde-fou D0 (`backbone_cfg` dans le checkpoint)
+est muet sur le backbone de production, dont les clés sont
+`['iter','model','ema','optimizer','scheduler','cfg_path']` — vérifié.
+
+**→ Résolu le 2026-09-04 (entrée ci-dessus).** Baseline corrigée en leave-one-out,
+porte repassée, et le backbone de PRODUCTION mesuré pour la première fois.
 
 ---
 

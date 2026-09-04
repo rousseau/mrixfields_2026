@@ -242,12 +242,23 @@ PYTHONPATH=src python src/cfm/train_mmfm_unified.py --method mmfm3d_vectorized \
 sbatch src/slurm/cfm_3d_jeanzay.slurm mmfm T1W configs/mmfm/vectorized.yaml
 ```
 
-**État** : ✅ Les trois variantes sont codées, entraînées et évaluées à code partagé identique (voir
-`results/mmfm/comparison_20260801_final/manifest.md`) : vectorisé nRMSE **0.4288** (meilleur global),
-UNet 0.4741, INR 0.4566 (entre les deux, mais meilleur sur les cibles 5T/7T — voir le manifest pour le
-détail). Le backbone INR est actuellement en cours d'entraînement prolongé (représentation encore
-sous-convergée par rapport à MedVAE, voir `results/mmfm/comparison_20260801_final/
-inr_reconstruction_capacity.csv`) avant de reprendre l'entraînement du flow.
+**État** : ✅ Les trois variantes sont codées, entraînées et évaluées à code strictement identique
+(voir `results/mmfm/comparison_20260807_1mm/` et `results/mmfm/comparison_20260814_all_contrasts/`).
+État de référence courant (Task 3, 20 paires × 3 sujets, évaluateur officiel, 1 mm, prédictions
+écrites à 0.5 mm natif) :
+
+| Architecture | nRMSE ↓ | SSIM ↑ | LPIPS ↓ |
+|---|---|---|---|
+| **INR** (`outputs/mmfm/inr_std`) | **0.3749** | 0.8631 | 0.1557 |
+| **Vectorisé** (`outputs/mmfm/vectorized`) | 0.3794 | **0.8975** | **0.0941** |
+| **UNet** (`outputs/mmfm/unet`) | 0.4033 | 0.8949 | 0.0953 |
+
+L'INR est **première en nRMSE** (0.3749) mais **derrière en SSIM et LPIPS** ; les deux scores de
+nRMSE sont **statistiquement indiscernables** (29 victoires/60, test des signes p = 0.65, Wilcoxon
+p = 0.38 — ne pas écrire « la meilleure » sans la métrique). Le meilleur connu en **géométrie de
+flow** est R-best (`configs/mmfm/vectorized_rbest.yaml`, nRMSE **0.3737**), non basé en canonique
+parce que son gain est sous la résolution statistique (n = 3). L'historique complet, les planchers
+connus et les délibérations sont dans **`CHANGELOG.md`** (source de vérité).
 ---
 
 ### Évaluation unifiée
@@ -283,13 +294,17 @@ Les figures sont sauvegardées dans `results/{stargan,cfm,mmfm}/visuals/<methode
 
 Un tableau de métriques est maintenu dans `results/evaluation_table.csv` et **enrichi progressivement** au fil des expériences. Ce fichier est versionné dans git.
 
-| Méthode | Modalité | nRMSE ↓ | SSIM ↑ | LPIPS ↓ | Dice ↑ | Notes |
-|---------|----------|---------|--------|---------|--------|-------|
-| StarGAN 2D (baseline) | T1W | — | — | — | — | checkpoint 150k |
-| AEKL + OT-CFM 3D | T1W | — | — | — | — | à compléter |
-| VQ-VAE + OT-CFM 3D | T1W | — | — | — | — | à lancer |
-| MedVAE (frozen) + CFM | T1W | — | — | — | — | à lancer |
-| MedVAE (fine-tuné) + CFM | T1W | — | — | — | — | à lancer |
+| Méthode | nRMSE ↓ (moy.) | SSIM ↑ | LPIPS ↓ | Résultat |
+|---------|---------|--------|---------|-------|
+| **INR** (Task 3, 3 contrastes, 1 mm) | **0.3749** | 0.8631 | 0.1557 | ✅ référence |
+| **Vectorisé** (Task 3, 3 contrastes, 1 mm) | 0.3794 | **0.8975** | **0.0941** | ✅ référence |
+| **UNet** (Task 3, 3 contrastes, 1 mm) | 0.4033 | 0.8949 | 0.0953 | ✅ référence |
+| *R-best (géométrie de flow, vectorisé)* | *0.3737* | — | — | non canonique (gain < bruit) |
+
+> **Note** : les métriques Dice/Volume (Task 1/2) et les variantes « star-gan/aek-l/vqvae »
+> sont hors périmètre de l'état de référence courant — voir `CHANGELOG.md` et
+> `results/mmfm/comparison_20260814_all_contrasts/` pour l'historique complet des 11 entrées de
+> ce tableau (lequel est la source de vérité).
 
 **Métriques** (identiques à celles du challenge) :
 - `nRMSE` — normalized Root Mean Square Error
@@ -468,21 +483,23 @@ mrixfields_2026/
 
 ## État d'avancement
 
+> Les numéros d'étape historisent l'ordre de développement. L'état de référence **courant** est
+> celui de l'Étape 4 (MMFM vectorisé / UNet / INR), à code strictement identique — voir le tableau
+> précédent et `CHANGELOG.md`. Les étapes 3 (OT-CFM 3D) et 4 (MMFM v1) sont des jalons dépassés.
+
 | Étape | Méthode | État | Checkpoint |
 |-----|---------|------|------------|
 | 1 | StarGAN 2D (T1W) | ✅ Terminé | `task3_any_to_any_T1W/` |
-| 2 | AEKL 3D (T1W) | ✅ Terminé | `vae3d_T1W/weights/model_best.pth` |
-| 2 | VQ-VAE NeuroQuant (T1W) | ✅ Smoke tests | `vqvae3d/runs/smoke_*` |
-| 2 | MedVAE frozen | ⏳ À évaluer | poids HuggingFace |
-| 2 | MedVAE fine-tuné | ✅ Terminé | `outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth` |
-| 2 | Benchmark VAE | ✅ Partiel | `results/benchmark_vae/metrics/` |
-| 3 | OT-CFM 3D + MedVAE (T1W) | ⏳ À lancer | `cfm3d_T1W_medvae/weights/` |
-| 3 | OT-CFM 3D + AEKL (T1W) | ⏳ Comparatif | `cfm3d_T1W_aekl/weights/` |
-| 3 | OT-CFM 3D + VQ-VAE (T1W) | ⏳ Comparatif | `cfm3d_T1W_vqvae/weights/` |
-| 4 | MedVAE vectorisé + MMFM | ✅ Baseline v1 | `cfm3d/runs/mmfm3d_medvae_multimodal_vectorized_v1/weights/` |
-| 4 | **MedVAE + MMFM-UNet multi-marginal** | ⏳ En cours (Run 1) | `cfm3d/runs/mmfm3d_multimarginal_medvae_run1/weights/` |
+| 2 | MedVAE (pré-entraîné, frozen) | ✅ en usage | poids HuggingFace `medvae_4_1_3d` |
+| 2 | MedVAE fine-tuné | ✅ (abandonné, voir `vectorized.yaml:34`) | `outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth` |
+| 2 | AEKL / VQ-VAE / RHVAE / Pythae | ✅ Smoke/legacy | voir `results/benchmark_vae/` |
+| 3 | OT-CFM 3D + VAE | ⚫ jalons historiques | `cfm3d_T1W_*/weights/` |
+| 4 | **MMFM vectorisé (MedVAE gelé)** | ✅ **référence 0.3794 nRMSE** | `outputs/mmfm/vectorized/weights/model_final.pth` |
+| 4 | **MMFM UNet (MedVAE gelé)** | ✅ **référence 0.4033 nRMSE** | `outputs/mmfm/unet/weights/model_final.pth` |
+| 4 | **MMFM INR (backbone SIREN)** | ✅ **référence 0.3749 nRMSE** | `outputs/mmfm/inr_std/weights/model_final.pth` |
+| 4 | R-best (vectorisé, temps/FiLM corrigés) | ✅ meilleur géométrie 0.3737 | `outputs/mmfm/vec_rbest/weights/model_final.pth` |
 | — | Script évaluation unifié | ✅ Terminé | `src/evaluation/evaluate.py` (5 méthodes) |
-| — | Tableau métriques | ⏳ À initialiser | `results/evaluation_table.csv` |
+| — | Journal des expériences (source de vérité) | ✅ À MAINTENIR | `CHANGELOG.md` |
 | — | Paper | ⬜ Vide | `paper/` |
 
 ---

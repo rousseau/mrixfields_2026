@@ -47,6 +47,8 @@ from common.config import load_yaml_with_include, load_env, resolve_paths
 from common.dataset import MultiModalNIfTILatentDataset
 from common.distributed import EMAModel
 from common.io import DOMAINS, MODALITIES
+from dataclasses import asdict
+
 from cfm.inr_backbone import INRBackbone, INRBackboneConfig, make_coord_grid, meta_train_step
 
 
@@ -82,6 +84,13 @@ def _save_checkpoint(path: Path, step: int, backbone, ema: EMAModel, optimizer, 
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "cfg_path": str(cfg_path),
+        # D0 : config RESOLUE du backbone au moment de l'entraînement — source
+        # de vérité lue par load_inr_backbone (arch_inr.py) pour détecter une
+        # divergence config/consommation qui serait invisible à load_state_dict
+        # (inner_lr, inner_steps_*, fg_weight, bg_threshold — mêmes formes de
+        # poids, mais un z source hors distribution). Absent des checkpoints
+        # antérieurs → le garde-fou se tait sur ceux-ci (diff_inr_configs).
+        "backbone_cfg": asdict(backbone.cfg),
     }, path)
 
 
