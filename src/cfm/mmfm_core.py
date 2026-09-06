@@ -302,6 +302,187 @@ def _compute_flow(
     return t_global, z_t, ut_global
 
 
+# ===========================================================================
+# Flow multi-marginal RÉEL — couplage OT chaîné + spline à travers les marginales
+#
+# Ce bloc remplace `_compute_flow` (droites indépendantes entre 2 marginales,
+# recousues dans un temps global) par l'algorithme de la référence que ce projet
+# prétend implémenter, Genentech/MMFM :
+#
+#   1. external/MMFM/src/mmfm/data.py:123 `couple_samples_no_int` — couplages OT
+#      CHAÎNÉS entre marginales consécutives (`ot.da.EMDTransport`), calculés sur
+#      TOUT le jeu de données, puis composés (`apply_couplings_no_int`) pour
+#      transformer des marginales non appariées en TUPLES COUPLÉS à travers tous
+#      les temps. C'est exactement notre situation : 0 sujet apparié dans
+#      `retro_train`, des ensembles de sujets différents par champ.
+#   2. external/MMFM/src/mmfm/multi_marginal_fm.py:334 — une SPLINE CUBIQUE à
+#      travers les K marginales du tuple, dont la dérivée `P(t, 1)` est la cible
+#      de vitesse. Une seule courbe lisse, pas des segments contradictoires.
+#
+# Pourquoi c'était fatal. Avec deux DataLoader indépendants (l'ancien chemin),
+# z_tgt est indépendant de z_src, donc E[z_tgt | z_src] = E[z_tgt] : la vitesse
+# optimale de Bayes ne dépend PAS du sujet, et le réseau converge vers une
+# constante. Mesuré sur le checkpoint de production le 2026-09-04 :
+# cos(v(t=0), v(t=1)) = 1.00000000, cos(v(sujet A), v(sujet B)) = 0.99997336,
+# les 4 déplacements cibles colinéaires à 1.000000 avec des normes en rapport
+# exact 1:2:3:4. Le modèle n'était pas cassé : il avait convergé vers l'optimum
+# d'un objectif qui n'avait qu'une constante à offrir.
+# ===========================================================================
+
+
+_SPLINE_CACHE: Dict[Tuple[Tuple[float, ...], str], Any] = {}
+
+
+def _spline_weights(
+    t_anchor: Tuple[float, ...],
+    t_query: np.ndarray,
+    derivative: int,
+) -> np.ndarray:
+    """Poids (T, K) tels que `P(t) = W @ Z` et `P'(t) = W' @ Z`.
+
+    Les temps d'ancrage sont FIXES (t_k = k/(K-1), les 5 champs), donc la spline
+    cubique de scipy est un opérateur LINÉAIRE fixe sur les K valeurs d'ancrage.
+    On l'obtient exactement en ajustant `interpolate.CubicSpline` sur la base
+    canonique une fois pour toutes, ce qui évite de faire un aller-retour
+    CPU/numpy sur un latent de 129 024 dimensions à chaque pas — tout en gardant
+    la sémantique de scipy au bit près (mêmes conditions de bord « not-a-knot »
+    que la référence, qui appelle `CubicSpline` directement).
+
+    Vérifié : `W @ Z` égale `CubicSpline(t_anchor, Z)(t)` à 6e-16 près pour
+    nu=0 et 7e-15 pour nu=1 ; les poids somment à 1 (nu=0) et 0 (nu=1) ; et
+    `P(t_k) = z_k` exactement.
+    """
+    from scipy import interpolate  # local: scipy n'est pas requis à l'inférence
+
+    key = (t_anchor, f"nu{derivative}")
+    spline = _SPLINE_CACHE.get(key)
+    if spline is None:
+        spline = interpolate.CubicSpline(
+            np.asarray(t_anchor, dtype=np.float64),
+            np.eye(len(t_anchor), dtype=np.float64),
+            axis=0,
+        )
+        _SPLINE_CACHE[key] = spline
+    return np.asarray(spline(np.asarray(t_query, dtype=np.float64), nu=derivative))
+
+
+def build_chained_ot_trajectories(
+    ds,
+    contrast_fields: Dict[int, List[int]],
+    usable_contrasts: List[int],
+    n_fields: int,
+    verbose: bool = True,
+) -> Dict[int, np.ndarray]:
+    """Couplages OT chaînés : construit des TRAJECTOIRES à partir de marginales
+    non appariées.
+
+    Pour chaque contraste, on résout un transport optimal entre les latents du
+    champ k et ceux du champ k+1, puis on chaîne les affectations. Le résultat
+    est un tableau `(n_traj, K)` d'INDICES dans `ds` : la ligne n donne, pour
+    chaque champ, le sujet que l'OT a apparié au sujet n du premier champ.
+
+    Différence assumée avec la référence : `couple_samples_no_int` lève
+    `NotImplementedError` sur une matrice de couplage non carrée. Nos classes
+    sont très déséquilibrées (43 à 235 volumes selon la cellule), donc on
+    généralise en prenant, pour chaque source, l'argmax de sa ligne du plan de
+    transport — l'affectation barycentrique dégénérée, qui coïncide avec la
+    permutation de la référence dans le cas carré.
+
+    Coût : la matrice de coût est n_src x n_tgt en dimension D. Pour la plus
+    grosse cellule (235 x 235 en 129 024 dimensions) c'est ~7 GFLOP, quelques
+    secondes, une seule fois avant l'entraînement.
+    """
+    import ot as pot  # local: seule cette fonction en dépend
+
+    by_class: Dict[int, List[int]] = {}
+    for i in range(len(ds.samples)):
+        by_class.setdefault(_sample_class(ds, i), []).append(i)
+
+    def _latents(indices: List[int]) -> np.ndarray:
+        rows = [np.asarray(ds[i][0], dtype=np.float64).reshape(-1) for i in indices]
+        return np.stack(rows, axis=0)
+
+    trajectories: Dict[int, np.ndarray] = {}
+    for contrast in usable_contrasts:
+        fields = contrast_fields[contrast]
+        idx_per_field = [by_class[_flat_class(contrast, f, n_fields)] for f in fields]
+        # La trajectoire est indexée par les sujets du PREMIER champ disponible.
+        traj = np.zeros((len(idx_per_field[0]), len(fields)), dtype=np.int64)
+        traj[:, 0] = np.asarray(idx_per_field[0], dtype=np.int64)
+        cur = _latents(idx_per_field[0])
+        for k in range(len(fields) - 1):
+            nxt_idx = idx_per_field[k + 1]
+            nxt = _latents(nxt_idx)
+            cost = pot.dist(cur, nxt)  # coût quadratique, comme pot.da.EMDTransport
+            a = np.full(cost.shape[0], 1.0 / cost.shape[0])
+            b = np.full(cost.shape[1], 1.0 / cost.shape[1])
+            plan = pot.emd(a, b, cost, numItermax=1_000_000)
+            assign = plan.argmax(axis=1)
+            traj[:, k + 1] = np.asarray(nxt_idx, dtype=np.int64)[assign]
+            # On avance en gardant l'ALIGNEMENT : la ligne n représente toujours
+            # la même trajectoire, ce que fait `apply_couplings_no_int` en
+            # composant les couplages.
+            cur = nxt[assign]
+        trajectories[contrast] = traj
+        if verbose and is_main_process():
+            uniq = [len(np.unique(traj[:, k])) for k in range(traj.shape[1])]
+            print(
+                f"  couplage OT chaîné, contraste {contrast} : {traj.shape[0]} trajectoires "
+                f"sur champs {fields} | sujets distincts par champ = {uniq}"
+            )
+    return trajectories
+
+
+def _compute_flow_trajectory(
+    Z: Tensor,
+    t_anchor: Tuple[float, ...],
+    anchor_pos: int,
+    sigma: float,
+    device: torch.device,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Construit (t, z_t, u_t, z_anchor) le long de la spline multi-marginale.
+
+    Args:
+        Z: (B, K, *rest) — les K marginales couplées de chaque trajectoire.
+            `rest` est quelconque : plat (D,) pour le cache vectorisé/INR,
+            spatial (C, H, W, D) pour le cache UNet. La spline est un opérateur
+            linéaire appliqué le long de l'axe K, donc élément par élément sur
+            `rest` — aucune hypothèse de forme.
+        t_anchor: temps des K marginales (fixes).
+        anchor_pos: index de la marginale servant d'ancre de conditionnement.
+            À l'inférence, `euler_integrate` conditionne sur le volume SOURCE
+            pendant toute la trajectoire ; l'entraînement doit donc voir la même
+            convention, avec une ancre tirée uniformément parmi les K champs
+            pour couvrir toutes les inférences possibles (montantes et
+            descendantes).
+        sigma: écart-type du chemin conditionnel. 0 = chemin déterministe ; la
+            référence n'ajoute alors aucun terme de dérivée
+            (`compute_conditional_flow`, cas `isinstance(self.sigma, float)`).
+
+    Returns:
+        (t, z_t, u_t, z_anchor) — t de forme (B,), les autres (B, *rest).
+    """
+    B, K = Z.shape[0], Z.shape[1]
+    if K != len(t_anchor):
+        raise RuntimeError(
+            f"Z porte {K} marginales mais t_anchor en déclare {len(t_anchor)}."
+        )
+    t = torch.rand(B, device=device)
+    tq = t.detach().cpu().numpy()
+    w0 = torch.as_tensor(_spline_weights(t_anchor, tq, 0), dtype=Z.dtype, device=device)
+    w1 = torch.as_tensor(_spline_weights(t_anchor, tq, 1), dtype=Z.dtype, device=device)
+    # Contraction le long de l'axe des marginales, quelle que soit la forme de
+    # queue : (B, K) x (B, K, *rest) -> (B, *rest).
+    flat = Z.reshape(B, K, -1)
+    z_t = torch.bmm(w0.unsqueeze(1), flat).reshape(B, *Z.shape[2:])
+    u_t = torch.bmm(w1.unsqueeze(1), flat).reshape(B, *Z.shape[2:])
+    if sigma > 0.0:
+        # Variance constante : sa dérivée est nulle, donc u_t est inchangé — même
+        # traitement que la référence.
+        z_t = z_t + sigma * torch.randn_like(z_t)
+    return t, z_t, u_t, Z[:, anchor_pos]
+
+
 @torch.no_grad()
 def euler_integrate(
     model_fn: Callable[[Tensor, Tensor, Tensor, Tensor], Tensor],
@@ -475,6 +656,7 @@ def train(
     max_per_class = data_cfg.get("max_volumes_per_class", None)
     random_crop_prob = float(data_cfg.get("random_crop_prob", 0.0))
     flip_lr_prob = float(data_cfg.get("flip_lr_prob", 0.0))
+    flip_axis = int(data_cfg.get("flip_axis", 0))
 
     raw_vs = data_cfg.get("volume_size", None)
     if raw_vs is None:
@@ -510,6 +692,45 @@ def train(
     adjacent_only = bool(train_cfg.get("adjacent_only", False))
     identity_prob = float(train_cfg.get("identity_prob", 0.1))
 
+    # ── PERTE. Le théorème du flow matching identifie le champ de vitesse
+    # marginal à l'ESPÉRANCE conditionnelle E[u_t | x_t] : c'est une régression
+    # quadratique qui la retrouve, une régression L1 retrouve la MÉDIANE
+    # conditionnelle. Les trois références utilisent une erreur quadratique
+    # (torchcfm, external/MMFM/src/mmfm/multi_marginal_fm.py,
+    # facebookresearch/flow_matching). Ce pipeline utilisait `l1` depuis
+    # l'origine. Le défaut est désormais `mse` : changer la perte n'affecte
+    # AUCUN checkpoint existant (elle n'intervient qu'à l'entraînement), donc
+    # aucun chiffre publié ne devient irreproductible — seul un
+    # ré-entraînement diffère, ce qui est l'intention.
+    loss_kind = str(train_cfg.get("loss", "mse")).lower()
+    if loss_kind not in ("mse", "l1"):
+        raise ValueError(f"train.loss doit valoir 'mse' ou 'l1', pas {loss_kind!r}")
+    loss_fn = F.mse_loss if loss_kind == "mse" else F.l1_loss
+
+    # ── MODE MARGINAL.
+    #   "trajectory" (défaut) : couplage OT chaîné hors boucle + spline cubique à
+    #     travers les K marginales — l'algorithme de Genentech/MMFM (voir
+    #     build_chained_ot_trajectories / _compute_flow_trajectory).
+    #   "pairwise" : l'ancien chemin, deux DataLoader indépendants et des droites
+    #     entre 2 marginales recousues dans le temps global. Conservé pour
+    #     rejouer un run historique, jamais pour en produire un nouveau : dans ce
+    #     régime la vitesse optimale ne dépend pas du sujet (mesuré le
+    #     2026-09-04 : cos(v(sujet A), v(sujet B)) = 0.99997336 sur le
+    #     checkpoint de production).
+    marginal_mode = str(train_cfg.get("marginal_mode", "trajectory")).lower()
+    if marginal_mode not in ("trajectory", "pairwise"):
+        raise ValueError(
+            f"train.marginal_mode doit valoir 'trajectory' ou 'pairwise', pas {marginal_mode!r}"
+        )
+
+    # ── FLIP. `FlatLatentCacheDataset.__getitem__` tire son propre flip, et le
+    # loop appelait le dataset DEUX fois par pas (source puis cible) : avec
+    # flip_lr_prob=0.5, une transition sur deux demandait au flow de transformer
+    # un cerveau EN SON IMAGE MIROIR. `flip_per_step` retire le tirage au
+    # dataset et l'applique une seule fois par pas, à toutes les marginales de
+    # la trajectoire.
+    flip_per_step = bool(train_cfg.get("flip_per_step", True))
+
     # Self-supervised anatomy-preservation regularizers (cycle/edge). Disabled
     # by default (lambda=0.0). See cycle_rollout_vector / edge_loss_3d.py.
     lambda_cycle = float(train_cfg.get("lambda_cycle", 0.0))
@@ -525,6 +746,20 @@ def train(
     lambda_cycle_active = lambda_cycle > 0.0 or lambda_cycle_final > 0.0
     lambda_edge_active = lambda_edge > 0.0 or lambda_edge_final > 0.0
     lambda_edge_fwd_active = lambda_edge_fwd > 0.0 or lambda_edge_fwd_final > 0.0
+
+    if marginal_mode == "trajectory" and (
+        lambda_cycle_active or lambda_edge_active or lambda_edge_fwd_active
+    ):
+        # Les régularisateurs cycle/edge sont écrits autour d'un aller-retour
+        # entre DEUX marginales (t_i -> t_j -> t_i). En mode trajectoire il n'y a
+        # plus de couple (t_i, t_j) : il faudrait redéfinir ce qu'ils
+        # régularisent. Refuser explicitement plutôt que de leur donner
+        # silencieusement des bornes qui ne veulent rien dire.
+        raise ValueError(
+            "lambda_cycle / lambda_edge / lambda_edge_fwd ne sont pas définis en "
+            "marginal_mode='trajectory' (ils supposent un aller-retour entre deux "
+            "marginales). Les mettre à 0.0, ou repasser en marginal_mode='pairwise'."
+        )
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -571,7 +806,12 @@ def train(
                 field_norm_stats_path=field_norm_stats_path,
             )
             cache_dir = cache_root / cache_id / split
-        ds = adapter.build_cache_dataset(cache_dir, cache_root, data_cfg)
+        ds_cfg = dict(data_cfg)
+        if flip_per_step and flip_lr_prob > 0.0:
+            # Le flip est retiré au dataset et appliqué une seule fois par pas
+            # dans la boucle, à toutes les marginales à la fois.
+            ds_cfg["flip_lr_prob"] = 0.0
+        ds = adapter.build_cache_dataset(cache_dir, cache_root, ds_cfg)
         adapter.validate_cache_shape(ds, latent_shape)
         if is_main_process():
             print(f"  Cache latents : {cache_dir}")
@@ -604,6 +844,58 @@ def train(
               f"{ {m: contrast_fields[m] for m in usable_contrasts} }")
         print(f"  identity_prob={identity_prob} | adjacent_only={adjacent_only} | "
               f"num_targets_per_step={num_targets_per_step}")
+        print(f"  marginal_mode={marginal_mode} | loss={loss_kind} | "
+              f"flip_per_step={flip_per_step} (flip_lr_prob={flip_lr_prob})")
+
+    # ── Couplage OT chaîné : une seule fois, avant la boucle.
+    trajectories: Optional[Dict[int, np.ndarray]] = None
+    traj_t_anchor: Dict[int, Tuple[float, ...]] = {}
+    if marginal_mode == "trajectory":
+        if is_main_process():
+            print("  Construction des trajectoires par couplage OT chaîné "
+                  "(Genentech/MMFM, data.py:123) …", flush=True)
+        t0_couple = time.time()
+        trajectories = build_chained_ot_trajectories(
+            ds, contrast_fields, usable_contrasts, n_fields,
+        )
+        for c in usable_contrasts:
+            traj_t_anchor[c] = tuple(
+                _field_to_time(f, n_fields) for f in contrast_fields[c]
+            )
+        if is_main_process():
+            print(f"  Couplage terminé en {time.time() - t0_couple:.1f}s | "
+                  f"temps d'ancrage par contraste = {traj_t_anchor}", flush=True)
+            for c in usable_contrasts:
+                if len(contrast_fields[c]) < 3:
+                    print(f"  ATTENTION contraste {c} : seulement "
+                          f"{len(contrast_fields[c])} marginales — la spline cubique "
+                          "dégénère vers une interpolation de bas degré.")
+
+    flat_latent_numel = int(np.prod(latent_shape))
+
+    def _flip_batch(z: Tensor) -> Tensor:
+        """Miroir gauche-droite, appliqué à TOUTES les marginales d'un même pas.
+
+        Accepte indifféremment un latent déjà spatial (dims de queue égales à
+        `latent_shape`, cache UNet) ou aplati (…, prod(latent_shape), cache
+        vectorisé) : les dimensions de tête, quel que soit leur nombre (lot,
+        marginales), sont préservées. `flip_axis` est un axe IMAGE, d'où le +1
+        qui saute la dimension de canaux — même convention que
+        `FlatLatentCacheDataset` / `LatentCacheDataset`.
+        """
+        k = len(latent_shape)
+        if z.shape[-k:] == tuple(latent_shape):
+            return torch.flip(z, dims=[z.ndim - k + 1 + flip_axis])
+        if z.shape[-1] != flat_latent_numel:
+            raise RuntimeError(
+                f"Forme de latent inattendue pour le flip : {tuple(z.shape)}, "
+                f"attendu des dims de queue {tuple(latent_shape)} ou "
+                f"(..., {flat_latent_numel})."
+            )
+        lead = z.shape[:-1]
+        v = z.reshape(*lead, *latent_shape)
+        v = torch.flip(v, dims=[len(lead) + 1 + flip_axis])
+        return v.reshape(*lead, -1)
 
     sobel3d = Sobel3D().to(device) if (lambda_edge_active or lambda_edge_fwd_active) else None
 
@@ -686,7 +978,17 @@ def train(
     msg_len = 1 + 2 * num_targets_per_step
 
     for step in range(start_iter, total_iters):
-        if is_distributed:
+        # RNG de pas, déterministe et DISTINCT par rang : en mode trajectoire il
+        # remplace le broadcast (chaque rang tire son propre lot, DDP moyenne les
+        # gradients), tout en restant reproductible à partir de `step`.
+        step_rng = np.random.default_rng(step * max(world_size, 1) + local_rank)
+
+        if marginal_mode == "trajectory":
+            # La trajectoire traverse tous les champs disponibles du contraste :
+            # il n'y a qu'un « plan » à tirer, le contraste.
+            contrast = int(step_rng.choice(usable_contrasts))
+            transitions = [(0, 0)]
+        elif is_distributed:
             if dist.get_rank() == 0:
                 contrast, transitions = _sample_step_plan(
                     contrast_fields, usable_contrasts,
@@ -721,34 +1023,73 @@ def train(
         cur_lambda_edge_fwd = _lerp_lambda(lambda_edge_fwd, lambda_edge_fwd_final, step, total_iters)
 
         for (fi, fj) in transitions:
-            same = (fi == fj)
-            src_flat = _flat_class(contrast, fi, n_fields)
-            tgt_flat = _flat_class(contrast, fj, n_fields)
+            if marginal_mode == "trajectory":
+                # ── Chemin multi-marginal RÉEL : une trajectoire couplée par OT,
+                # une spline cubique à travers ses K marginales, sa dérivée pour
+                # cible. Ni `transitions`, ni `identity_prob`, ni `adjacent_only`
+                # n'ont de sens ici : la trajectoire traverse TOUS les champs.
+                traj = trajectories[contrast]
+                rows = step_rng.integers(0, traj.shape[0], size=batch_size)
+                idx = traj[rows]  # (B, K)
+                Z = torch.stack([
+                    torch.stack([ds[int(j)][0] for j in row]) for row in idx
+                ]).to(device).float()  # (B, K, *rest)
 
-            src_item = next(class_loaders[src_flat])[0].to(device)
-            tgt_item = src_item if same else next(class_loaders[tgt_flat])[0].to(device)
+                if flip_per_step and flip_lr_prob > 0.0 and random.random() < flip_lr_prob:
+                    # UN SEUL tirage, appliqué aux K marginales : les
+                    # correspondances de la trajectoire restent cohérentes.
+                    Z = _flip_batch(Z)
 
-            if use_latent_cache and adapter.cache_prebakes_prep:
-                z_src, meta = src_item.float(), None
-                z_tgt = z_src if same else tgt_item.float()
+                meta = None
+                if not (use_latent_cache and adapter.cache_prebakes_prep):
+                    b, kk = Z.shape[0], Z.shape[1]
+                    prepped, meta = adapter.prep_latent(vae, Z.reshape(b * kk, *Z.shape[2:]))
+                    Z = prepped.reshape(b, kk, *prepped.shape[1:])
+
+                t_anchor = traj_t_anchor[contrast]
+                anchor_pos = int(step_rng.integers(0, len(t_anchor)))
+                t_global, z_t, ut_global, z_src = _compute_flow_trajectory(
+                    Z, t_anchor, anchor_pos, sigma, device,
+                )
+                same = False
+                t_i, t_j = t_anchor[anchor_pos], t_anchor[anchor_pos]
             else:
-                if use_latent_cache:
-                    z_src_enc = src_item.float()
-                    z_tgt_enc = z_src_enc if same else tgt_item.float()
-                else:
-                    with torch.no_grad(), torch.amp.autocast(
-                        "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
-                    ):
-                        z_src_enc = _encode_like_cache(
-                            vae, src_item, encode_tile, encode_tile_margin, use_amp, amp_dtype)
-                        z_tgt_enc = z_src_enc if same else _encode_like_cache(
-                            vae, tgt_item, encode_tile, encode_tile_margin, use_amp, amp_dtype)
-                z_src, meta = adapter.prep_latent(vae, z_src_enc)
-                z_tgt = z_src if same else adapter.prep_latent(vae, z_tgt_enc)[0]
+                same = (fi == fj)
+                src_flat = _flat_class(contrast, fi, n_fields)
+                tgt_flat = _flat_class(contrast, fj, n_fields)
 
-            t_i = _field_to_time(fi, n_fields)
-            t_j = _field_to_time(fj, n_fields)
-            t_global, z_t, ut_global = _compute_flow(FM, z_src, z_tgt, t_i, t_j, same, device)
+                src_item = next(class_loaders[src_flat])[0].to(device)
+                tgt_item = src_item if same else next(class_loaders[tgt_flat])[0].to(device)
+
+                if flip_per_step and flip_lr_prob > 0.0 and random.random() < flip_lr_prob:
+                    # Le MÊME tirage pour la source et la cible. Deux tirages
+                    # indépendants (l'ancien comportement, hérité de deux appels
+                    # séparés à `__getitem__`) demandaient au flow, une fois sur
+                    # deux, de transformer un cerveau en son image miroir.
+                    src_item = _flip_batch(src_item)
+                    tgt_item = src_item if same else _flip_batch(tgt_item)
+
+                if use_latent_cache and adapter.cache_prebakes_prep:
+                    z_src, meta = src_item.float(), None
+                    z_tgt = z_src if same else tgt_item.float()
+                else:
+                    if use_latent_cache:
+                        z_src_enc = src_item.float()
+                        z_tgt_enc = z_src_enc if same else tgt_item.float()
+                    else:
+                        with torch.no_grad(), torch.amp.autocast(
+                            "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+                        ):
+                            z_src_enc = _encode_like_cache(
+                                vae, src_item, encode_tile, encode_tile_margin, use_amp, amp_dtype)
+                            z_tgt_enc = z_src_enc if same else _encode_like_cache(
+                                vae, tgt_item, encode_tile, encode_tile_margin, use_amp, amp_dtype)
+                    z_src, meta = adapter.prep_latent(vae, z_src_enc)
+                    z_tgt = z_src if same else adapter.prep_latent(vae, z_tgt_enc)[0]
+
+                t_i = _field_to_time(fi, n_fields)
+                t_j = _field_to_time(fj, n_fields)
+                t_global, z_t, ut_global = _compute_flow(FM, z_src, z_tgt, t_i, t_j, same, device)
 
             y_tgt = torch.full((z_src.shape[0],), contrast, dtype=torch.long, device=device)
             t_vec = t_global.float()
@@ -757,7 +1098,7 @@ def train(
                 "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
             ):
                 v_t = model_fn(z_t, z_src, t_vec, y_tgt)
-                loss = F.l1_loss(v_t, ut_global) / float(k)
+                loss = loss_fn(v_t, ut_global) / float(k)
 
             z_src_roundtrip = None
             z_tgt_hat = None

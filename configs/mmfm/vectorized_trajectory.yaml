@@ -1,0 +1,169 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM vectorisé — CORRECTIFS DE L'AUDIT DU 2026-09-04 (points 3 et 4 du plan).
+#
+# Copie de configs/mmfm/vectorized.yaml. Six clés changent, toutes dans `train:`
+# et `model:`. Le bloc `data:` est IDENTIQUE (même cache, même résolution, même
+# split) pour que l'écart avec le run de production ne puisse venir que des
+# correctifs.
+#
+# CE QUE MESURAIT LE CHECKPOINT DE PRODUCTION (outputs/mmfm/vectorized), sondé
+# le 2026-09-04 sur ses poids EMA et de vrais latents du cache c4d1e200 :
+#   cos(v(t=0), v(t=1))               = 1.00000000   (aveugle au temps)
+#   cos(v(sujet A), v(sujet B))       = 0.99997336   (aveugle au sujet)
+#   colinéarité des 4 déplacements    = 1.000000     (une seule direction)
+#   normes des déplacements           = 1.91 / 3.82 / 5.74 / 7.65 %  (rapport 1:2:3:4)
+# Autrement dit `z -> z + Dt*c` pour UN vecteur constant : un degré de liberté
+# pour les 20 cellules de la Task 3. Toutes les ablations d'architecture menées
+# entre juillet et septembre faisaient donc varier l'architecture autour d'une
+# fonction constante.
+#
+# LES QUATRE CAUSES, ET LEUR CORRECTIF ICI
+#
+#  1. AUCUN COUPLAGE (train.marginal_mode). z_src et z_tgt étaient tirés de deux
+#     DataLoader indépendants, donc de sujets différents ; à batch_size=1 l'OT
+#     exact est dégénéré. Si z_tgt est indépendant de z_src, E[z_tgt|z_src] =
+#     E[z_tgt] et la vitesse optimale de Bayes n'a QU'UNE CONSTANTE à offrir. Le
+#     modèle avait convergé vers l'optimum d'un objectif vide.
+#     -> marginal_mode: trajectory — couplage OT chaîné calculé une fois hors
+#        boucle sur tout le cache, comme external/MMFM/src/mmfm/data.py:123.
+#
+#  2. PAS DE MULTI-MARGINAL (même clé). `_compute_flow` recousait des droites à
+#     deux marginales dans un temps global, ce qui impose des contraintes
+#     contradictoires au même champ de vitesse (défaut relevé le 2026-08-26 et
+#     contourné par adjacent_only, jamais corrigé).
+#     -> la cible de vitesse est la dérivée d'une SPLINE CUBIQUE traversant les
+#        5 marginales couplées, comme multi_marginal_fm.py:334.
+#
+#  3. PERTE L1 (train.loss). Le théorème du flow matching identifie le champ de
+#     vitesse à l'ESPÉRANCE conditionnelle : c'est une régression quadratique qui
+#     la retrouve, la L1 retrouve la médiane. Les trois références (torchcfm,
+#     Genentech/MMFM, facebookresearch/flow_matching) utilisent un coût
+#     quadratique.  -> loss: mse
+#
+#  4. FLIP MIROIR DÉSYNCHRONISÉ (train.flip_per_step). Le flip était tiré dans
+#     __getitem__, appelé deux fois par pas : une transition sur deux demandait
+#     au flow de transformer un cerveau EN SON IMAGE MIROIR.
+#     -> flip_per_step: true — un seul tirage par pas, appliqué aux 5 marginales.
+#
+# ET LE CONDITIONNEMENT (point 4 du plan), jamais combiné jusqu'ici :
+#   time_scale: 1000 + time_cond: film rendent le TEMPS visible (mesuré sur
+#   vec_rbest : cos(v(0),v(1)) passe de 1.000000 à -0.09) ; latent_mean/scale
+#   rendent le SUJET visible. La matrice des 16 configs antérieures montre
+#   qu'AUCUNE ne posait les deux à la fois : vectorized_rbest.yaml a le temps
+#   mais laisse latent_scale: 1.0 (et reste aveugle au sujet, cos = 0.99994) ;
+#   vectorized_r2_std.yaml a une échelle de latent mais reste en `concat`.
+#
+# PRÉREQUIS : le cache doit tenir en RAM (latent_preload_ram: true) — le
+# couplage OT lit tous les latents d'un contraste à la fois. Coût mesuré du
+# couplage : quelques secondes par contraste, une seule fois avant la boucle.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_vectorized_trajectory
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint:
+  latent_channels: 1
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  # TEMPS. `sinusoidal_time_embedding` a max_period=10000 : elle attend des
+  # INDICES de pas dans [0, 1000), pas un temps dans [0,1]. Sans ce facteur,
+  # l'embedding s'effondre en une rampe scalaire (rang effectif 1.22 sur 4 aux
+  # 5 temps de champ). Les deux références font ce produit.
+  time_scale: 1000.0
+  # MÉCANISME de conditionnement. En `concat`, 384 canaux de conditionnement
+  # affrontent 2 x 129024 canaux de latent à travers un seul Linear : 0.026 % de
+  # la variance d'entrée. En `film`, le conditionnement module (scale, shift)
+  # l'état normalisé de CHAQUE bloc résiduel — sa force ne dépend plus de la
+  # dimension du latent. C'est le mécanisme des deux références.
+  time_cond: film
+  # STANDARDISATION DE L'ENTRÉE. Mesuré sur 240 volumes du cache de production
+  # (medvae_finetune_c4d1e200) : moyenne 19.913378, écart-type 18.125440. Les
+  # LayerNorm du réseau sont toutes APRÈS `input_proj`, donc aucune ne rattrape
+  # le décalage : elles normalisent la SOMME déjà projetée. Laisser (0.0, 1.0)
+  # présente au réseau une entrée dont la composante continue vaut 1.1 fois sa
+  # propre variation.
+  # NOTE : `vectorized_r2_std.yaml` avait trouvé 18.0788 pour l'échelle, mais
+  # laissait latent_mean à 0.0 — la moitié du correctif seulement.
+  latent_mean: 19.913378
+  latent_scale: 18.125440
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: retro_train
+  output_subdir: mmfm/vectorized_trajectory
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_c4d1e200/retro_train
+  # OBLIGATOIRE ici : le couplage OT chaîné lit tous les latents d'un contraste.
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  # ── Les quatre correctifs de l'objectif (point 3 du plan d'audit) ──
+  marginal_mode: trajectory
+  loss: mse
+  flip_per_step: true
+  # ──────────────────────────────────────────────────────────────────
+  # batch_size reste à 1 : en mode trajectoire il ne sert plus à rendre l'OT
+  # non dégénéré (le couplage est calculé hors boucle sur tout le cache, pas sur
+  # le lot), seulement à moyenner le gradient. L'augmenter est possible et sans
+  # risque algorithmique, contrairement au régime `pairwise`.
+  batch_size: 1
+  total_iters: 25000
+  # SANS OBJET en mode trajectoire : la trajectoire traverse tous les champs à
+  # chaque pas, il n'y a plus de transition à tirer. Conservés pour que la
+  # config reste lisible en `pairwise`.
+  num_targets_per_step: 1
+  adjacent_only: false
+  identity_prob: 0.1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  accumulation_steps: 1
+  save_every: 2500
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed
