@@ -1,0 +1,13 @@
+region,run,modality,nrmse_mean,ssim_mean,n,missing
+slab_z150_180,trajectory (4 correctifs),T1W,0.433181,0.812993,60,0
+slab_z150_180,trajectory (4 correctifs),T2W,0.295919,0.800056,60,0
+slab_z150_180,trajectory (4 correctifs),T2FLAIR,0.335729,0.816482,60,0
+slab_z150_180,production (meme recette),T1W,0.403381,0.840974,60,0
+slab_z150_180,production (meme recette),T2W,0.321525,0.840661,60,0
+slab_z150_180,production (meme recette),T2FLAIR,0.349288,0.832093,60,0
+full_volume,trajectory (4 correctifs),T1W,0.457773,0.884577,60,0
+full_volume,trajectory (4 correctifs),T2W,0.304337,0.864884,60,0
+full_volume,trajectory (4 correctifs),T2FLAIR,0.362685,0.883160,60,0
+full_volume,production (meme recette),T1W,0.435288,0.899690,60,0
+full_volume,production (meme recette),T2W,0.337624,0.897996,60,0
+full_volume,production (meme recette),T2FLAIR,0.365416,0.894862,60,0

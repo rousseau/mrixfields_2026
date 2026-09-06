@@ -1,0 +1,94 @@
+{
+  "split": "retro_train",
+  "percentile_lower": null,
+  "percentile_upper": null,
+  "target_spacing": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "_comment": "Normalisation IDENTITE. Les donnees du challenge sont DEJA dans [0,1] (min=0.0, max=1.0 sur chaque volume) et le README officiel dit \u00ab no intensity rescaling is applied during training or evaluation \u00bb. Poser lo=0, hi=1 fait de normalize_volume_fixed() exactement x*2-1, et de denormalize_from_01() exactement l'identite : la chaine devient inversible au bit pres, sans ecretage, et surtout le NIVEAU ABSOLU de la source atteint le reseau. C'est le defaut 04 de l'audit du 2026-09-04 : la normalisation par percentiles divisait chaque volume par son propre p99.5 (facteur 1.6 a 3.4 selon le champ), puis field_fixed reinjectait une constante de POPULATION par champ \u2014 la sortie etait donc quantifiee sur 15 valeurs d'echelle. Le temoin srclevel (un scalaire par volume, choisi depuis le niveau observe dans la source) vaut 0.2561 contre 0.3485 pour le meilleur modele : c'est la marge que cette reconstruction vise.",
+  "stats": {
+    "T1W": {
+      "0.1T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "1.5T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "3T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "5T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "7T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      }
+    },
+    "T2W": {
+      "0.1T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "1.5T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "3T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "5T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "7T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      }
+    },
+    "T2FLAIR": {
+      "0.1T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "1.5T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "3T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "5T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      },
+      "7T": {
+        "lo": 0.0,
+        "hi": 1.0,
+        "n": null
+      }
+    }
+  }
+}

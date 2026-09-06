@@ -63,6 +63,314 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-06 (soir) — **Cache SANS normalisation : NÉGATIF. Le niveau atteint le réseau, mais MedVAE perd sa dynamique.**
+
+**Verdict : le défaut 04 est réel, et sa correction naïve est pire que le mal.**
+Config : `configs/mmfm/vectorized_identity.yaml`, cache `medvae_finetune_ff550d64`
+(1939 volumes ré-encodés, 5 h 30). CSV : `results/mmfm/compare_20260906/`.
+
+Recette d'inférence partagée, tranche notée, 180 volumes chacun :
+
+| run | T1W | T2W | T2FLAIR | nRMSE | SSIM |
+|---|---|---|---|---|---|
+| **identity (sans normalisation)** | **0.5278** | 0.3166 | 0.4297 | **0.4247** | 0.8176 |
+| l1 + 4 correctifs | 0.4249 | 0.3018 | 0.3189 | **0.3485** | 0.8220 |
+| mse + 4 correctifs | 0.4332 | 0.2959 | 0.3357 | 0.3549 | 0.8099 |
+| production | 0.4034 | 0.3215 | 0.3493 | 0.3581 | 0.8379 |
+| *témoin srclevel* | *0.2901* | *0.2612* | *0.2171* | ***0.2561*** | — |
+
+**+0.076 de nRMSE, la pire des quatre variantes.** T1W s'effondre (0.4249 →
+0.5278). Le correctif visait 0.3485 → 0.2561 ; il fait l'inverse.
+
+### La cause, mesurée
+
+Poser `lo=0, hi=1` rend bien la chaîne exactement inversible (aller-retour à
+1.5e-8, contre un plancher de 0.0549 en `field_fixed` pour un prédicteur
+PARFAIT) et fait bien arriver le niveau absolu au réseau. Mais le signal
+n'occupe alors plus qu'une fraction de la dynamique :
+
+| | écart-type du foreground | p99.5 après normalisation |
+|---|---|---|
+| T1W@7T, identité | **0.226** | **−0.20** |
+| T1W@7T, field_fixed | **0.615** | +1.00 (par construction) |
+| T1W@0.1T, identité | 0.384 | +0.64 |
+
+99.5 % des voxels de T1W@7T vivent sous −0.20, dans le bas de [−1,1]. MedVAE est
+entraîné sur des entrées qui remplissent leur plage : il reconstruit mal ce
+régime. Et la correspondance est nette — **T1W@7T est le cas le plus comprimé
+(std 0.226) et T1W le contraste le plus dégradé**. Les statistiques du latent le
+confirment : `latent_scale` passe de 18.125 à **13.551** (−25 %), le latent est
+lui aussi moins varié.
+
+### Ce que ça apprend
+
+Deux objectifs entrent en conflit sous un unique couple (lo, hi) : **préserver le
+niveau relatif entre volumes** exige un diviseur COMMUN, **remplir la dynamique
+du VAE** exige un diviseur proche du maximum de CHAQUE volume. `(0, 1)` satisfait
+le premier et sacrifie le second ; les percentiles par volume faisaient
+l'inverse ; `field_fixed` est un compromis par classe.
+
+**Piste non testée qui résout le conflit** : un diviseur global UNIQUE, identique
+pour tous les volumes et tous les champs, calé sur le p99.5 de POPULATION
+(~0.5 au lieu de 1.0). Il préserve exactement les écarts de niveau entre volumes
+(un seul diviseur) tout en doublant l'occupation de la dynamique. Une ligne dans
+`field_norm_stats_identity.json`.
+
+**Réserve honnête** : rien ne garantit que le flow saurait exploiter le niveau
+même correctement présenté. Ce run montre que la présentation naïve casse le
+VAE ; il ne montre pas que la présentation corrigée marcherait.
+
+---
+
+## 2026-09-06 — **`l1` contre `mse`, variable unique : la perte théoriquement fausse gagne sur les DEUX métriques.**
+
+**Verdict : l'attribution est confirmée, et elle va plus loin que prévu.** CSV :
+`outputs/mmfm/compare_20260905/`. Config : `configs/mmfm/vectorized_trajectory_l1.yaml`
+(diff avec la version mse : `loss`, `task_name`, `output_subdir` — rien d'autre).
+
+Recette d'inférence partagée, 180 volumes chacun, tranche notée :
+
+| run | T1W | T2W | T2FLAIR | nRMSE | SSIM |
+|---|---|---|---|---|---|
+| **l1 + 4 correctifs** | 0.4249 | 0.3018 | 0.3189 | **0.3485** | **0.8220** |
+| mse + 4 correctifs | 0.4332 | 0.2959 | 0.3357 | 0.3549 | 0.8099 |
+| production (l1, sans correctifs) | 0.4034 | 0.3215 | 0.3493 | 0.3581 | 0.8379 |
+| *témoin srclevel* | *0.2901* | *0.2612* | *0.2171* | ***0.2561*** | — |
+
+**Attribution (l1 − mse, seule la perte diffère) : nRMSE −0.0064, SSIM +0.0121.**
+`l1` gagne sur les DEUX métriques. L'hypothèse « mse coûte du SSIM » est
+vérifiée (43 % de l'écart récupéré), mais l'effet ne s'y limite pas : la perte
+quadratique dégrade aussi le nRMSE.
+
+**Le mécanisme est réparé dans les deux runs**, donc l'écart est bien imputable à
+la perte : `l1` donne cos(v0,v1)=0.035, sujet 7.34 %, colinéarité 0.26/0.69/0.83 ;
+`mse` donne −0.592, 8.25 %, 0.32/0.74/0.74 ; production 1.000000, 0.765 %, 1.000000.
+
+**Ce que ça dit du théorème.** Le flow matching identifie le champ de vitesse
+marginal à une ESPÉRANCE conditionnelle — le coût quadratique est le bon
+estimateur de cet objet-là. Mais on n'évalue pas le champ de vitesse : on évalue
+le POINT D'ARRIVÉE après intégration. Sur des cibles au bruit lourd (couplage OT
+synthétique entre sujets non appariés), l'estimateur robuste transporte mieux.
+Le correctif « théoriquement correct » était empiriquement le mauvais.
+
+**Netteté (`hf_ratio`, médiane, 36 cellules) — l'attribution est fermée par la
+grandeur qu'elle concerne** : production **0.2754**, l1 **0.2640**, mse
+**0.2436**. L'ordre des SSIM suit exactement l'ordre des netteté : `mse` est
+8.4 % plus flou que `l1`, et c'est ce flou que le SSIM sanctionne.
+Deux observations qui dépassent la question posée : les trois variantes ne
+restituent que **~25 %** du rapport HF/BF de la vérité (plancher commun, très
+au-dessus des écarts entre elles) ; et les 4 correctifs DÉGRADENT la netteté par
+rapport à la production (0.264 / 0.244 contre 0.275) — la spline moyenne sur
+cinq marginales là où les droites par paires n'en moyennaient que deux.
+
+**Meilleure configuration à ce jour : 0.3485** contre 0.3581 pour la production,
+soit −0.0095 (2.7 % relatif, au-dessus du plancher de bruit de 0.002). Premier
+gain réel de la série — mais le SSIM reste sous la production (−0.0160), et le
+témoin `srclevel` garde **27 %** d'avance.
+
+---
+
+## 2026-09-05 — **Les quatre correctifs : mécanisme RÉPARÉ, score NÉGATIF.**
+
+**Verdict : le mécanisme du flow n'est pas le levier.** Les trois dégénérescences
+sont levées et vérifiées, et le score ne suit pas. CSV :
+`outputs/mmfm/compare_20260905/compare_shared_recipe.csv`. Config :
+`configs/mmfm/vectorized_trajectory.yaml`. 25 000 itérations, 2 h 07, 3.49 it/s.
+
+### Le score, à recette d'inférence STRICTEMENT partagée
+
+Les deux jeux de 180 volumes ont été produits par le même chemin et les mêmes
+drapeaux (`--center_crop_only`, mêmes `field_norm_stats`), chaque modèle étant
+construit avec sa propre config puisque c'est requis pour le charger.
+
+| tranche [150,180) | T1W | T2W | T2FLAIR | nRMSE | SSIM |
+|---|---|---|---|---|---|
+| trajectory (4 correctifs) | 0.4332 | 0.2959 | 0.3357 | **0.3549** | **0.8098** |
+| production (même recette) | 0.4034 | 0.3215 | 0.3493 | **0.3581** | **0.8379** |
+| écart | +0.030 | −0.026 | −0.014 | **−0.0031** | **−0.0281** |
+| *témoin srclevel* | | | | *0.2561* | — |
+
+**Gain de 0.0031 en nRMSE — sous le plancher de bruit de run (0.002) — payé par
+0.0281 de SSIM, neuf fois plus grand.** T2W et T2FLAIR progressent, T1W recule
+nettement. Et le modèle reste **28 % derrière un scalaire par volume**.
+
+**La recette d'inférence ne comptait pas** : production à recette partagée
+= 0.3581 contre 0.3584 pour les fichiers stockés, soit **0.0003**. La réserve
+posée la veille (2.7e-2 d'écart en espace prédiction, contre un plancher bf16 de
+7.6e-4) était justifiée dans son principe et négligeable dans son effet.
+
+### Le mécanisme, lui, est bien réparé
+
+Sondes sur les poids EMA, latents réels du cache c4d1e200 :
+
+| sonde | production | trajectory |
+|---|---|---|
+| `cos(v(t=0), v(t=1))` | 1.00000000 | **−0.592** (137 % de variation) |
+| variation de v entre deux sujets | 0.765 % | **8.247 %** |
+| colinéarité des 4 déplacements | 1.000000 | **0.32 / 0.74 / 0.74** |
+| normes des déplacements | 1.91/3.82/5.74/7.65 (rampe 1:2:3:4) | 17.1/14.2/15.6/18.2 |
+
+**Piège de lecture, à noter** : la sensibilité au sujet fait 5.26 % (2500 pas) →
+1.010 % (5000) → 1.397 % (7500) → **8.247 % (25000)**. J'ai conclu à un plateau
+sur les trois premiers points et annoncé que la composante individuelle ne
+serait pas au rendez-vous. **C'était un creux, pas un plateau.** Trois points
+dans un transitoire ne font pas une tendance — même erreur que « une moyenne ne
+dit pas ce qu'on croit », dans sa version temporelle.
+
+### Hypothèse d'attribution, NON testée
+
+**La perte MSE explique probablement la chute de SSIM.** Le 2026-08-26 avait
+mesuré que la médiane conserve 106-144 % des hautes fréquences par rapport à la
+moyenne. Passer de `l1` à `mse` remplace un estimateur de médiane par un
+estimateur de moyenne : théoriquement correct pour le flow matching, plus flou en
+pratique. La L1 était un mauvais estimateur qui rendait service au SSIM.
+Confondu avec les trois autres changements — se teste en relançant `loss: l1`,
+tout le reste inchangé.
+
+### Ce que ça établit
+
+Deuxième occurrence du même schéma après le MedVAE perceptuel (2026-09-02) :
+**une propriété interne mesurablement améliorée ne se transmet pas à la
+métrique.** Le compteur passe à 2. Le levier restant est celui que le témoin
+désigne depuis le début — l'échelle d'intensité câblée à une constante par
+classe (défaut 04 de l'audit), que le flow ne touche pas quel que soit son degré
+de correction.
+
+---
+
+## 2026-09-04 (soir) — **Audit de code : la métrique était la mauvaise, et le flow calculait une constante. Quatre correctifs posés.**
+
+**Verdict : la clôture de série du 2026-09-03 est renversée. Le plateau n'était
+pas la borne de l'information disponible.** Rapport complet :
+https://claude.ai/code/artifact/cacb9435-8746-42b6-bb6f-139c25657b5a
+CSV : `results/mmfm/region_20260904/`.
+
+Harnais validé d'abord : il retrouve le témoin identité (0.9273 / 0.3859 /
+0.5574) et le vectorisé (0.3795 / SSIM 0.8975) **à la quatrième décimale**, et la
+conformité des formules à l'évaluateur officiel est exacte (écart 2.2e-16).
+
+### 1. La métrique locale n'était pas celle du classement
+
+`Submission/build_submission/README.md:114` : « Both pred and seg are sliced
+along axial **[150, 180)** … the GT is fixed at [150, 180), so other ranges will
+fail evaluation. » Le classement note un pavé **(364, 436, 30)**.
+`build_task3_submission.py` appliquait déjà ce clip — l'arbre de soumission était
+juste — mais **aucun script d'évaluation ne le faisait**, et le mot n'apparaît
+nulle part dans ce journal. Tout ce qui précède est mesuré sur 364 coupes, une
+région 12x plus grande (78.8 % de fond contre 54.8 %).
+
+**État de référence recalculé, mêmes fichiers, mêmes formules :**
+
+| | T1W | T2W | T2FLAIR | moy. nRMSE | moy. SSIM |
+|---|---|---|---|---|---|
+| Vectorisé — volume entier | 0.4354 | 0.3376 | 0.3654 | 0.3795 | 0.8975 |
+| **Vectorisé — tranche notée** | 0.4043 | 0.3215 | 0.3493 | **0.3584** | **0.8377** |
+| **UNet — tranche notée** | 0.4217 | 0.3271 | 0.3646 | **0.3711** | 0.8360 |
+| **INR — tranche notée** | 0.3708 | 0.3555 | 0.3175 | **0.3479** | 0.7835 |
+
+L'écart vaut 0.021 en nRMSE et **0.059 en SSIM** — dix fois la taille des effets
+arbitrés depuis un mois (AdaGN 0.0006, flip 0.0001, ordre 3 0.0031). **Le
+classement des trois architectures ne s'inverse PAS** (prédiction que j'avais
+posée comme possible : elle est fausse, et l'ordre non total INR/vectorisé est
+préservé — INR première en nRMSE, nettement dernière en SSIM).
+
+### 2. Le flow de production EST une constante — mesuré, pas déduit
+
+Poids EMA de `outputs/mmfm/vectorized/weights/model_final.pth`, latents réels du
+cache c4d1e200 :
+
+| sonde | valeur |
+|---|---|
+| `cos(v(t=0), v(t=1))` | **1.00000000** (‖v‖ 841.3135 → 841.3134) |
+| `cos(v(sujet A), v(sujet B))` | **0.99997336** (latents distants de 34 %) |
+| variation de v quand z_t → z_cible | **1.37 %** |
+| déplacements vers 1.5/3/5/7T | 1.91 / 3.82 / 5.74 / 7.65 % — rapport **1:2:3:4** |
+| colinéarité des 4 déplacements | **1.000000** |
+
+C'est `z ↦ z + Δt·c` pour un unique vecteur constant : **un degré de liberté**
+pour les 20 cellules. Et il est sous-dimensionné : `cos(c, E[z_7T]−E[z_0.1T])`
+= 0.74, ‖c‖ = 37 % du déplacement inter-classes, si bien que
+‖pred − E[z_7T]‖ = 41.8 % contre ‖z_src − E[z_7T]‖ = 44.2 % — **le modèle
+parcourt 5 % du chemin**. Les huit leviers négatifs étaient des ablations
+d'architecture autour d'une fonction constante.
+
+**Trois dégénérescences distinctes, jamais combinées.** Vectorisé : aveugle au
+temps ET au sujet. INR (`latent_scale: 2.16e-4`) : voit le sujet (cos A/B 0.917),
+pas le temps (0.99999881). R-best (`time_scale: 1000` + `film`) : voit le temps
+(cos(v0,v1) = −0.09), pas le sujet (0.99993843, `latent_scale: 1.0` sur un latent
+d'écart-type 18.1). Aucune des 16 configs ne pose les deux à la fois.
+
+### 3. La cause, chiffrée
+
+`mmfm_core.py:728-729` tirait z_src et z_tgt de **deux DataLoader indépendants**,
+et à `batch_size: 1` l'OT exact est dégénéré : aucun couplage. **R² de la
+prédiction du latent cible depuis le latent source, T1W 0.1T→7T, prédicteur
+affine à un paramètre :**
+
+| régime | R² au-delà d'une constante |
+|---|---|
+| pairwise (production) | **+0.0005** |
+| trajectoire (OT chaîné) | **+0.0335** |
+
+**+0.0005 : il n'y avait rien à apprendre.** Le meilleur prédicteur était
+E[z_cible], une constante — exactement ce que le modèle a appris. Ce n'était pas
+un défaut d'optimisation, c'était l'optimum d'un objectif vide.
+
+### 4. Le témoin qui manquait — et il bat les trois architectures
+
+Sur la tranche notée, 180 cellules :
+
+| témoin | nRMSE | déployable ? |
+|---|---|---|
+| recopier la source | 0.5996 | — |
+| source × scalaire, LOO sur les 2 autres sujets | **0.3179** | oui |
+| **source × scalaire, depuis le NIVEAU OBSERVÉ dans la source** | **0.2561** | oui |
+| source × scalaire oracle | 0.1740 | non (borne) |
+| meilleure architecture (INR) | 0.3479 | — |
+
+`corr(niveau du foreground de la source, gain oracle) = −0.76 / −0.70 / −0.88`.
+Le gain requis **est lisible dans la source**, et `normalize_volume` le divise
+avant que le réseau ne le voie. « La composante individuelle n'est pas
+prédictible depuis la source » (R² = 0.135, 2026-09-03) avait été testé dans
+l'espace normalisé, d'où l'information avait déjà été retirée.
+
+**Réserve, n = 3.** Le LOO nu est très bruité : le sujet 0009 a un 7T environ
+deux fois plus sombre que les autres (gains `7T_to_*` = [2.19, 2.66, **5.31**]),
+et le LOO lui attribue 2.43. Sur T1W il vaut 0.4088, soit à égalité avec le
+vectorisé (0.4043) et derrière l'INR (0.3708) — **la moyenne de 0.3179 est portée
+par T2W et T2FLAIR**. C'est `srclevel`, qui lit le niveau de la source, qui gagne
+partout (T1W 0.2901). Ces témoins sont des BORNES, pas des méthodes.
+
+### Correctifs posés (code)
+
+| # | correctif | fichier |
+|---|---|---|
+| 1 | `Z_CLIP_RANGE = (150, 180)` + `apply_z_clip`, `--region {slab,full}` (défaut `slab`), région écrite dans chaque CSV | `common/io.py`, `eval_quantitative_3arch.py`, `evaluation/evaluate.py` |
+| 2 | `--mode scaled_identity` : témoins LOO / srclevel / oracle | `eval_quantitative_3arch.py` |
+| 3a | `train.loss` — défaut **`mse`** (le FM exige une espérance, la L1 donne la médiane) | `mmfm_core.py` |
+| 3b | `train.flip_per_step` — **un seul tirage par pas** au lieu d'un par appel à `__getitem__` : une transition sur deux demandait un cerveau miroir | `mmfm_core.py`, testé sur les 4 formes de latent |
+| 3c | `build_chained_ot_trajectories` — couplage OT chaîné hors boucle (`data.py:123`) | `mmfm_core.py` |
+| 3d | `_compute_flow_trajectory` — spline cubique à travers les K marginales (`multi_marginal_fm.py:334`) | `mmfm_core.py` |
+| 4 | `configs/mmfm/vectorized_trajectory.yaml` — les 4 correctifs + `time_scale: 1000` + `time_cond: film` + `latent_mean: 19.913378` / `latent_scale: 18.125440` (mesurés sur 240 volumes du cache) | config |
+
+La spline est implémentée comme un opérateur linéaire fixe sur les 5 ancres
+(temps de champ fixes), obtenu en ajustant `scipy.CubicSpline` sur la base
+canonique : sémantique scipy identique à la référence, vérifiée à **6e-16**
+(nu=0) et **7e-15** (nu=1), sans aller-retour CPU par pas.
+
+**Smoke de bout en bout** : couplage des 3 contrastes en **2.4 s**
+(100/100/99 trajectoires ; sujets distincts par champ [100,100,100,43,81] pour
+T2W, l'OT réutilise les 43 volumes de 5T — cas rectangulaire assumé), puis
+entraînement à 3.8 it/s, 11.6 GB, gradients ~150. Le chemin `pairwise` reste
+fonctionnel (non-régression vérifiée).
+
+**Non fait, et il faut le dire** : aucun ré-entraînement complet. Les correctifs
+sont posés et vérifiés MÉCANIQUEMENT (le couplage produit du signal apprenable,
+la spline est exacte, le flip est cohérent, les deux chemins tournent) ; leur
+effet sur le score reste à mesurer par un run de 25 000 itérations.
+
+---
+
 ## 2026-09-04 — **Le backbone INR de production est sain, et on peut enfin le prouver**
 
 **Verdict : les cinq portes passent, et le contrôle négatif établit pour la première

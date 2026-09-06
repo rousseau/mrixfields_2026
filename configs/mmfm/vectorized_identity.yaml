@@ -1,0 +1,140 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DÉFAUT 04 CORRIGÉ — cache SANS normalisation par percentiles.
+#
+# Copie de vectorized_trajectory_l1.yaml (4 correctifs + perte l1, la meilleure
+# configuration mesurée à ce jour : nRMSE 0.3485 sur la tranche notée). Ce qui
+# change : le cache de latents, et donc les statistiques de standardisation.
+#
+# CE QUI EST CORRIGÉ. Les données du challenge sont DÉJÀ dans [0,1] et le README
+# officiel dit « no intensity rescaling is applied ». Le pipeline renormalisait
+# quand même : chaque volume divisé par son propre p99.5 à l'encodage, puis une
+# constante de POPULATION par (modalité, champ) réinjectée en sortie. Le niveau
+# d'intensité de la sortie était donc quantifié sur 15 valeurs possibles, et la
+# déviation propre au sujet (35 % de dispersion, mesure du 2026-08-30)
+# structurellement inexprimable.
+#
+# Avec lo=0 / hi=1 (configs/mmfm/field_norm_stats_identity.json),
+# normalize_volume_fixed devient exactement x*2-1 et denormalize_from_01
+# l'identité : aller-retour vérifié exact à 1.5e-8, contre un plancher de 0.0549
+# en field_fixed pour un prédicteur PARFAIT. Et surtout le NIVEAU ABSOLU de la
+# source atteint enfin le réseau.
+#
+# LA MARGE VISÉE. Le témoin `srclevel` — UN scalaire par volume, choisi depuis le
+# niveau de gris observé dans la source — vaut 0.2561 contre 0.3485 pour le
+# meilleur modèle. corr(niveau de la source, gain requis) = -0.76/-0.70/-0.88 :
+# l'information est dans la source, et c'est la normalisation qui la retirait.
+#
+# INFÉRENCE : doit impérativement utiliser --field_norm_stats
+# configs/mmfm/field_norm_stats_identity.json, sinon la sortie serait
+# dénormalisée avec les constantes de population et le correctif serait annulé.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_vectorized_identity
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint:
+  latent_channels: 1
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  # TEMPS. `sinusoidal_time_embedding` a max_period=10000 : elle attend des
+  # INDICES de pas dans [0, 1000), pas un temps dans [0,1]. Sans ce facteur,
+  # l'embedding s'effondre en une rampe scalaire (rang effectif 1.22 sur 4 aux
+  # 5 temps de champ). Les deux références font ce produit.
+  time_scale: 1000.0
+  # MÉCANISME de conditionnement. En `concat`, 384 canaux de conditionnement
+  # affrontent 2 x 129024 canaux de latent à travers un seul Linear : 0.026 % de
+  # la variance d'entrée. En `film`, le conditionnement module (scale, shift)
+  # l'état normalisé de CHAQUE bloc résiduel — sa force ne dépend plus de la
+  # dimension du latent. C'est le mécanisme des deux références.
+  time_cond: film
+  # STANDARDISATION DE L'ENTRÉE. Mesuré sur 240 volumes du cache de production
+  # (medvae_finetune_c4d1e200) : moyenne 19.913378, écart-type 18.125440. Les
+  # LayerNorm du réseau sont toutes APRÈS `input_proj`, donc aucune ne rattrape
+  # le décalage : elles normalisent la SOMME déjà projetée. Laisser (0.0, 1.0)
+  # présente au réseau une entrée dont la composante continue vaut 1.1 fois sa
+  # propre variation.
+  # NOTE : `vectorized_r2_std.yaml` avait trouvé 18.0788 pour l'échelle, mais
+  # laissait latent_mean à 0.0 — la moitié du correctif seulement.
+  latent_mean: 26.651935
+  latent_scale: 13.550569
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: retro_train
+  output_subdir: mmfm/vectorized_identity
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_ff550d64/retro_train
+  # OBLIGATOIRE ici : le couplage OT chaîné lit tous les latents d'un contraste.
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  # ── Les quatre correctifs de l'objectif (point 3 du plan d'audit) ──
+  marginal_mode: trajectory
+  loss: l1
+  flip_per_step: true
+  # ──────────────────────────────────────────────────────────────────
+  # batch_size reste à 1 : en mode trajectoire il ne sert plus à rendre l'OT
+  # non dégénéré (le couplage est calculé hors boucle sur tout le cache, pas sur
+  # le lot), seulement à moyenner le gradient. L'augmenter est possible et sans
+  # risque algorithmique, contrairement au régime `pairwise`.
+  batch_size: 1
+  total_iters: 25000
+  # SANS OBJET en mode trajectoire : la trajectoire traverse tous les champs à
+  # chaque pas, il n'y a plus de transition à tirer. Conservés pour que la
+  # config reste lisible en `pairwise`.
+  num_targets_per_step: 1
+  adjacent_only: false
+  identity_prob: 0.1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  accumulation_steps: 1
+  save_every: 2500
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed
