@@ -13,8 +13,24 @@ des chiffres :
                     Met un nombre sur le flou, que nRMSE et SSIM recompensent
                     au lieu de le penaliser (un predicteur qui rend la moyenne
                     conditionnelle minimise l'erreur quadratique).
+  --mode scaled_identity
+                    Temoin « recopier la source, rééchelonnee par UN scalaire »,
+                    estime en leave-one-out sur les autres sujets apparies (donc
+                    deployable). C'est LE temoin a battre : 80 % de l'energie de
+                    l'erreur de ce pipeline est une erreur d'echelle, et un seul
+                    nombre par paire vaut 0.2274 sur le volume entier contre
+                    0.3795 pour le modele de production. L'identite brute (0.6235)
+                    place la barre trop bas et credite au modele un gain qu'un
+                    scalaire obtient sans apprentissage.
   --mode table      Tableau final : 3 architectures x 3 contrastes, gain sur le
                     temoin, taux de victoire paire a paire.
+
+RÉGION ÉVALUÉE (--region, defaut `slab`). Le classement ne note PAS le volume
+entier : il note la tranche axiale [150, 180), forme (364, 436, 30) — voir
+common/io.py::Z_CLIP_RANGE. Tous les chiffres du CHANGELOG anterieurs au
+2026-09-04 ont ete mesures sur les 364 coupes et ne sont donc pas comparables au
+classement (ecart mesure sur le vectorise : 0.021 en nRMSE, 0.059 en SSIM). La
+region est ecrite dans chaque CSV produit.
 
 Les metriques du temoin sont recalculees ici avec les formules EXACTES de
 l'evaluateur officiel (Evaluation/evaluate.py : nRMSE = ||p-g||/||g|| sur le
@@ -46,6 +62,7 @@ from skimage.metrics import structural_similarity
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from common.config import load_env
+from common.io import Z_CLIP_RANGE, apply_z_clip
 from cfm.eval_qualitative_3arch import (
     METHODS, brain_bbox, gt_path, hf_ratio, load_metrics, load_vol, pred_path,
     spectrum_of_volume,
@@ -70,14 +87,28 @@ REF_IDENTITY_T1W = Path("results/mmfm/comparison_20260813_unet_adagn/task3_ident
 #  Formules officielles, reimplementees
 # --------------------------------------------------------------------------- #
 
+# RÉGION NOTÉE. « slab » = la tranche axiale [150, 180) que le classement note
+# réellement (voir common/io.py::Z_CLIP_RANGE) ; « full » = le volume entier, ce
+# que TOUS les chiffres du CHANGELOG antérieurs au 2026-09-04 mesuraient. Le
+# défaut est `slab` : c'est la seule région comparable au classement. `full`
+# reste accessible pour rejouer un chiffre historique, jamais pour en publier
+# un nouveau. Positionné par --region dans main().
+REGION = "slab"
+
+
+def _region(vol: np.ndarray) -> np.ndarray:
+    """Restreint un volume à la région évaluée (voir REGION)."""
+    return vol if REGION == "full" else apply_z_clip(vol)
+
+
 def official_nrmse(pred: np.ndarray, target: np.ndarray) -> float:
-    p, t = pred.astype(np.float64), target.astype(np.float64)
+    p, t = _region(pred).astype(np.float64), _region(target).astype(np.float64)
     n = np.linalg.norm(t)
     return float(np.linalg.norm(p - t) / n) if n > 1e-10 else 0.0
 
 
 def official_ssim(pred: np.ndarray, target: np.ndarray, slice_axis: int = 2) -> float:
-    p, t = pred.astype(np.float64), target.astype(np.float64)
+    p, t = _region(pred).astype(np.float64), _region(target).astype(np.float64)
     dr = t.max() - t.min()
     if dr < 1e-10:
         return 1.0
@@ -113,46 +144,75 @@ class VolumeCache:
 #  Mode identity
 # --------------------------------------------------------------------------- #
 
-def _aggregate(per_pair: Dict[str, List[Tuple[float, float]]]) -> List[dict]:
+def _aggregate(per_pair: Dict[str, List[Tuple[float, float]]],
+               method: str = "identity") -> List[dict]:
     rows = []
     for pair in PAIRS:
         vals = per_pair.get(pair, [])
         if not vals:
             continue
         n = np.array([v[0] for v in vals]); s = np.array([v[1] for v in vals])
-        rows.append({"method": "identity", "task": "task3", "pair": pair,
+        rows.append({"method": method, "task": "task3", "pair": pair,
+                     # La RÉGION entre dans le CSV : deux campagnes mesurées sur
+                     # des régions différentes ne sont pas comparables, et rien
+                     # dans un CSV ne le signalait jusqu'ici.
+                     "region": _region_label(),
                      "n_subjects": len(vals),
                      "nrmse_mean": float(n.mean()), "ssim_mean": float(s.mean()),
                      "nrmse_std": float(n.std()), "ssim_std": float(s.std())})
     return rows
 
 
+def _region_label() -> str:
+    if REGION == "full":
+        return "full_volume"
+    z0, z1 = Z_CLIP_RANGE
+    return f"slab_z{z0}_{z1}"
+
+
+def _check_against_official(cache, check_pairs, tol: float) -> None:
+    """Garde-fou : nos formules doivent retrouver le témoin produit par
+    l'évaluateur officiel.
+
+    Le CSV de référence (`REF_IDENTITY_T1W`) a été produit sur le VOLUME ENTIER.
+    La conformité des formules se vérifie donc en `full`, quelle que soit la
+    région sur laquelle on publie ensuite : ce test valide l'implémentation des
+    métriques, pas le choix de la région.
+    """
+    global REGION
+    ref = load_metrics(str(REF_IDENTITY_T1W))
+    if not ref:
+        raise SystemExit(f"temoin officiel de reference introuvable : {REF_IDENTITY_T1W}")
+    saved, REGION = REGION, "full"
+    try:
+        print(f"verification des formules contre l'evaluateur officiel "
+              f"({REF_IDENTITY_T1W.name}, volume entier) :")
+        worst = 0.0
+        for pair in check_pairs:
+            src_f, tgt_f = pair.split("_to_")
+            ns, ss = [], []
+            for sid in SUBJECTS:
+                g = cache("T1W", tgt_f, sid); s_ = cache("T1W", src_f, sid)
+                ns.append(official_nrmse(s_, g)); ss.append(official_ssim(s_, g))
+            dn = abs(float(np.mean(ns)) - ref[pair][0])
+            ds = abs(float(np.mean(ss)) - ref[pair][1])
+            worst = max(worst, dn, ds)
+            print(f"  {pair:14s} nRMSE {np.mean(ns):.5f} vs {ref[pair][0]:.5f} (d={dn:.2e})   "
+                  f"SSIM {np.mean(ss):.5f} vs {ref[pair][1]:.5f} (d={ds:.2e})")
+        if worst > tol:
+            raise SystemExit(f"ECART {worst:.2e} > tolerance {tol:.0e} — reimplementation "
+                             "non conforme a l'evaluateur officiel, on n'ecrit rien.")
+        print(f"conforme (ecart max {worst:.2e} <= {tol:.0e})")
+    finally:
+        REGION = saved
+    print(f"region publiee : {_region_label()}\n")
+
+
 def mode_identity(args) -> None:
     root = Path(load_env("local")["data_root"])
     cache = VolumeCache(root)
 
-    # --- garde-fou : notre reimplementation doit retrouver le temoin officiel
-    ref = load_metrics(str(REF_IDENTITY_T1W))
-    if not ref:
-        raise SystemExit(f"temoin officiel de reference introuvable : {REF_IDENTITY_T1W}")
-    check_pairs = args.check_pairs
-    print(f"verification contre l'evaluateur officiel ({REF_IDENTITY_T1W.name}) :")
-    worst = 0.0
-    for pair in check_pairs:
-        src_f, tgt_f = pair.split("_to_")
-        ns, ss = [], []
-        for sid in SUBJECTS:
-            g = cache("T1W", tgt_f, sid); s_ = cache("T1W", src_f, sid)
-            ns.append(official_nrmse(s_, g)); ss.append(official_ssim(s_, g))
-        dn = abs(float(np.mean(ns)) - ref[pair][0])
-        ds = abs(float(np.mean(ss)) - ref[pair][1])
-        worst = max(worst, dn, ds)
-        print(f"  {pair:14s} nRMSE {np.mean(ns):.5f} vs {ref[pair][0]:.5f} (d={dn:.2e})   "
-              f"SSIM {np.mean(ss):.5f} vs {ref[pair][1]:.5f} (d={ds:.2e})")
-    if worst > args.tol:
-        raise SystemExit(f"ECART {worst:.2e} > tolerance {args.tol:.0e} — reimplementation "
-                         "non conforme a l'evaluateur officiel, on n'ecrit rien.")
-    print(f"conforme (ecart max {worst:.2e} <= {args.tol:.0e})\n")
+    _check_against_official(cache, args.check_pairs, args.tol)
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
     for mod in args.modalities:
@@ -171,6 +231,151 @@ def mode_identity(args) -> None:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
         print(f"  -> {out}   moyenne nRMSE={np.mean([r['nrmse_mean'] for r in rows]):.4f} "
               f"SSIM={np.mean([r['ssim_mean'] for r in rows]):.4f}\n", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+#  Mode scaled_identity — le temoin qui manquait
+# --------------------------------------------------------------------------- #
+
+
+FG_THRESHOLD = 0.02  # seuil de foreground sur les donnees natives, deja dans [0, 1]
+
+
+def _global_gain(src: np.ndarray, tgt: np.ndarray) -> float:
+    """Facteur multiplicatif global au sens des moindres carres : le `a` qui
+    minimise ||a*src - tgt||. Un SEUL nombre par volume."""
+    s = _region(src).astype(np.float64)
+    t = _region(tgt).astype(np.float64)
+    den = float((s * s).sum())
+    return float((s * t).sum() / den) if den > 1e-12 else 1.0
+
+
+def _fg_level(vol: np.ndarray) -> float:
+    """Niveau d'intensite moyen du foreground, sur la region evaluee.
+
+    C'est l'information que `normalize_volume` DETRUIT : elle divise chaque
+    volume par son propre p99.5, donc le reseau ne voit jamais ce nombre. Mesure
+    du 2026-09-04 : corr(niveau du foreground de la source, gain oracle requis)
+    = -0.76 / -0.70 / -0.88 selon le contraste. Le gain a appliquer est donc
+    largement lisible dans la source elle-meme.
+    """
+    v = _region(vol).astype(np.float64)
+    m = v > FG_THRESHOLD
+    return float(v[m].mean()) if m.any() else 0.0
+
+
+def mode_scaled_identity(args) -> None:
+    """Temoin « recopier la source, rééchelonnée par UN scalaire ».
+
+    Pourquoi ce temoin et pas seulement l'identite : 80 % de l'energie de
+    l'erreur de ce pipeline est une erreur d'ECHELLE d'intensite (mesure du
+    2026-08-25, confirmee le 2026-08-30 par le facteur oracle). Un temoin qui
+    ignore cette composante place la barre beaucoup trop bas — l'identite brute
+    vaut 0.6235, mais la meme source rééchelonnee par un unique scalaire vaut
+    0.2274 sur le volume entier, soit MIEUX que le modele de production (0.3795).
+    Comparer un modele a l'identite brute revient donc a lui crediter un gain
+    qu'un seul nombre obtient sans apprentissage.
+
+    Deux variantes sont ecrites :
+
+      scaled_identity_loo    — le scalaire est estime en LEAVE-ONE-OUT sur les
+                               AUTRES sujets apparies de la meme cellule
+                               (contraste, paire). Aucune information sur la
+                               cible du sujet evalue n'entre dans son calcul :
+                               c'est un temoin DEPLOYABLE, et c'est celui qu'un
+                               modele doit battre.
+      scaled_identity_srclevel
+                             — le scalaire est le rapport entre le niveau
+                               ATTENDU du champ cible (moyenne leave-one-out des
+                               autres sujets) et le niveau REELLEMENT OBSERVE
+                               dans le volume source. Aussi deployable que le
+                               LOO, mais il exploite le niveau absolu de la
+                               source — precisement l'information que
+                               `normalize_volume` supprime avant que le reseau
+                               ne la voie. C'est le temoin qui rend le defaut 04
+                               de l'audit falsifiable : si cet estimateur bat le
+                               LOO nu, c'est que la source contient bien le
+                               signal, et que le pipeline le jette.
+      scaled_identity_oracle — le scalaire optimal du sujet lui-meme. NON
+                               deployable ; c'est une borne superieure sur ce
+                               qu'une correction purement globale peut donner,
+                               utile pour separer « erreur d'echelle » et
+                               « erreur de structure ».
+
+ATTENTION, n = 3. Avec trois sujets apparies, un LOO sur une cellule qui
+contient un outlier est tres bruite : mesure sur la tranche, le sujet 0009 a un
+7T environ deux fois plus sombre que les deux autres (gains 7T_to_* de
+[2.19, 2.66, 5.31]), et le LOO nu lui attribue 2.43 au lieu de 5.31. Les
+cellules impliquant 7T portent donc l'essentiel de l'erreur du temoin LOO. Ne
+pas lire ces temoins comme des methodes, mais comme des BORNES.
+
+    Le scalaire est ajuste SUR LA REGION EVALUEE : optimiser une echelle sur une
+    region et la noter sur une autre n'aurait pas de sens.
+    """
+    root = Path(load_env("local")["data_root"])
+    cache = VolumeCache(root)
+    _check_against_official(cache, args.check_pairs, args.tol)
+
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    summary: Dict[str, Dict[str, float]] = {}
+
+    if len(SUBJECTS) < 2:
+        raise SystemExit(
+            f"Le temoin LOO exige au moins 2 sujets apparies ; reçu {len(SUBJECTS)}."
+        )
+
+    for mod in args.modalities:
+        per_pair_loo: Dict[str, List[Tuple[float, float]]] = {}
+        per_pair_src: Dict[str, List[Tuple[float, float]]] = {}
+        per_pair_orc: Dict[str, List[Tuple[float, float]]] = {}
+        for pair in PAIRS:
+            src_f, tgt_f = pair.split("_to_")
+            # gains oracle et niveaux de foreground de tous les sujets, pour le LOO
+            gains = {sid: _global_gain(cache(mod, src_f, sid), cache(mod, tgt_f, sid))
+                     for sid in SUBJECTS}
+            lvl_tgt = {sid: _fg_level(cache(mod, tgt_f, sid)) for sid in SUBJECTS}
+            for sid in SUBJECTS:
+                src = cache(mod, src_f, sid)
+                tgt = cache(mod, tgt_f, sid)
+                a_loo = float(np.mean([gains[o] for o in SUBJECTS if o != sid]))
+                # Niveau cible ATTENDU (LOO, aucune info sur la cible du sujet
+                # evalue) rapporte au niveau OBSERVE dans sa propre source.
+                lvl_src_obs = _fg_level(src)
+                exp_tgt = float(np.mean([lvl_tgt[o] for o in SUBJECTS if o != sid]))
+                a_src = (exp_tgt / lvl_src_obs) if lvl_src_obs > 1e-9 else 1.0
+                for store, a in ((per_pair_loo, a_loo), (per_pair_src, a_src),
+                                 (per_pair_orc, gains[sid])):
+                    store.setdefault(pair, []).append(
+                        (official_nrmse(a * src, tgt), official_ssim(a * src, tgt)))
+            vl = per_pair_loo[pair]; vs = per_pair_src[pair]; vo = per_pair_orc[pair]
+            print(f"  {mod:8s} {pair:14s} LOO={np.mean([x[0] for x in vl]):.4f} "
+                  f"srclevel={np.mean([x[0] for x in vs]):.4f} "
+                  f"oracle={np.mean([x[0] for x in vo]):.4f} "
+                  f"| gains={[round(gains[s], 3) for s in SUBJECTS]}", flush=True)
+
+        for name, per_pair in (("scaled_identity_loo", per_pair_loo),
+                               ("scaled_identity_srclevel", per_pair_src),
+                               ("scaled_identity_oracle", per_pair_orc)):
+            rows = _aggregate(per_pair, method=name)
+            out = OUTDIR / f"{name}_{mod}.csv"
+            with open(out, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                w.writeheader(); w.writerows(rows)
+            m_n = float(np.mean([r["nrmse_mean"] for r in rows]))
+            m_s = float(np.mean([r["ssim_mean"] for r in rows]))
+            summary.setdefault(mod, {})[name] = m_n
+            print(f"  -> {out}   moyenne nRMSE={m_n:.4f} SSIM={m_s:.4f}", flush=True)
+        print(flush=True)
+
+    keys = ["scaled_identity_loo", "scaled_identity_srclevel", "scaled_identity_oracle"]
+    labels = ["LOO (deployable)", "srclevel (deployable)", "oracle (borne)"]
+    print(f"=== Temoins rééchelonnes, region {_region_label()} ===")
+    print(f"{'contraste':10s}" + "".join(f"{l:>24s}" for l in labels))
+    for mod in args.modalities:
+        print(f"{mod:10s}" + "".join(f"{summary[mod][k]:24.4f}" for k in keys))
+    if len(args.modalities) > 1:
+        print(f"{'MOYENNE':10s}" + "".join(
+            f"{np.mean([summary[m][k] for m in args.modalities]):24.4f}" for k in keys))
 
 
 # --------------------------------------------------------------------------- #
@@ -544,7 +749,16 @@ def mode_table(args) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["identity", "sharpness", "calibration", "recalib", "table"], required=True)
+    ap.add_argument("--mode", choices=["identity", "scaled_identity", "sharpness",
+                                       "calibration", "recalib", "table"], required=True)
+    # RÉGION. Défaut `slab` = la tranche axiale [150, 180) que le classement note
+    # réellement. `full` ne sert qu'à rejouer un chiffre historique : tous les
+    # nombres du CHANGELOG antérieurs au 2026-09-04 sont en `full`, donc NON
+    # comparables au classement. Voir common/io.py::Z_CLIP_RANGE.
+    ap.add_argument("--region", choices=["slab", "full"], default="slab",
+                    help="region evaluee : 'slab' = tranche axiale [150,180) notee par "
+                         "le classement (defaut) ; 'full' = volume entier (historique, "
+                         "non comparable au classement)")
     ap.add_argument("--modalities", nargs="+", default=MODALITIES)
     ap.add_argument("--pairs", nargs="+", default=PAIRS)
     ap.add_argument("--subjects", nargs="+", default=["0006"])
@@ -563,9 +777,11 @@ def main():
                     help="repertoire de sortie ; en passer un NOUVEAU par campagne, "
                          "sous peine d'ecraser les CSV d'une campagne precedente")
     args = ap.parse_args()
-    global OUTDIR
+    global OUTDIR, REGION
     OUTDIR = Path(args.outdir)
-    {"identity": mode_identity, "sharpness": mode_sharpness,
+    REGION = args.region
+    {"identity": mode_identity, "scaled_identity": mode_scaled_identity,
+     "sharpness": mode_sharpness,
      "calibration": mode_calibration, "recalib": mode_recalib,
      "table": mode_table}[args.mode](args)
 

@@ -41,6 +41,70 @@ SPLIT_MAP: dict = {
 }
 IDX_TO_SPLIT = {v: k for k, v in SPLIT_MAP.items()}
 
+# --------------------------------------------------------------------------- #
+# Région notée par le classement                                              #
+# --------------------------------------------------------------------------- #
+
+# Le classement ne note PAS le volume entier : il note une tranche axiale de 30
+# coupes, forme (364, 436, 30) sur la grille 0.5mm. La vérité terrain du serveur
+# est figée sur cette plage.
+#
+#   ~/Code/MRIxFields2026/Submission/build_submission/README.md:114
+#     « Both pred and seg are sliced along axial [150, 180) ... the GT is fixed
+#       at [150, 180), so other ranges will fail evaluation. »
+#   Constante officielle : Baseline/mrixfields/zclip_constants.py::Z_CLIP_RANGE
+#
+# `src/submission/build_task3_submission.py` appliquait déjà ce clip (l'arbre de
+# soumission était correct), mais AUCUN script d'évaluation ne le faisait : tous
+# les chiffres du CHANGELOG jusqu'au 2026-09-04 portent sur les 364 coupes, une
+# région 12x plus grande et beaucoup plus vide (78.8 % de fond contre 54.8 %
+# dans la tranche). Mesuré sur le vectorisé de production, l'écart vaut 0.021 en
+# nRMSE (0.3795 -> 0.3584) et 0.059 en SSIM (0.8995 -> 0.8402) — plus que la
+# taille des effets arbitrés depuis un mois (AdaGN 0.0006, flip 0.0001,
+# ordre 3 0.0031). Et il ne se déplace pas uniformément d'une méthode à l'autre
+# (le modèle gagne 5.6 % relatif en passant à la tranche, une source
+# rééchelonnée 21.5 %), donc un classement peut s'y inverser.
+Z_CLIP_RANGE: Tuple[int, int] = (150, 180)
+
+# Axe axial dans l'orientation native du jeu (LAS, affine diag(-0.5, 0.5, 0.5)) :
+# axe 0 = L, axe 1 = A, axe 2 = S. C'est aussi l'axe le long duquel
+# `img.slicer[:, :, z0:z1]` découpe côté soumission, et celui que l'évaluateur
+# officiel utilise pour moyenner le SSIM (`slice_axis=2`).
+Z_CLIP_AXIS = 2
+
+
+def apply_z_clip(
+    vol: np.ndarray,
+    z_range: Optional[Tuple[int, int]] = None,
+) -> np.ndarray:
+    """Restreint un volume à la tranche axiale notée par le classement.
+
+    Args:
+        vol: Volume (H, W, D) sur la grille 0.5mm du challenge.
+        z_range: (z_start, z_end) exclusif à droite. None = Z_CLIP_RANGE.
+
+    Returns:
+        Vue (H, W, z_end - z_start).
+
+    Raises:
+        ValueError: si le volume est trop court pour la plage demandée — mieux
+            vaut une exception qu'une tranche silencieusement tronquée, qui
+            produirait un nRMSE calculé sur une région différente de la vérité.
+    """
+    z0, z1 = Z_CLIP_RANGE if z_range is None else z_range
+    if vol.ndim < 3:
+        raise ValueError(f"apply_z_clip attend un volume 3D, reçu ndim={vol.ndim}")
+    depth = vol.shape[Z_CLIP_AXIS]
+    if depth < z1:
+        raise ValueError(
+            f"Volume de profondeur {depth} trop court pour la tranche notée "
+            f"[{z0}, {z1}). La grille du challenge est 364x436x364 @0.5mm ; un "
+            "volume plus court signifie qu'il est déjà découpé, ou qu'il est à "
+            "une autre résolution — dans les deux cas la comparaison au "
+            "classement est invalide."
+        )
+    return vol[:, :, z0:z1]
+
 # Filename regex: {R,P}_{modality}_{field}_{subject_id}.nii.gz
 FILE_RE = re.compile(r"^[A-Z]_([A-Z0-9]+)_([0-9.]+T)_(\d+)\.nii\.gz$")
 

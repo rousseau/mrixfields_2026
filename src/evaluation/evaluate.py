@@ -30,6 +30,8 @@ import nibabel.processing as nib_proc
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from common.io import Z_CLIP_RANGE, apply_z_clip
+
 # --------------------------------------------------------------------------- #
 #  Challenge constants
 # --------------------------------------------------------------------------- #
@@ -243,11 +245,16 @@ def prepare_pair_dir(
     target_dir: Path,
     tmpbase: Path,
     modality: str,
+    region: str = "slab",
 ) -> Tuple[Optional[Path], Optional[Path]]:
     """Create official pred/target dirs for ONE pair, with resampling.
 
     Args:
         matrix: {subject: {tgt_field: pred_path}} for a fixed source field.
+        region: "slab" (défaut) découpe pred ET vérité sur la tranche axiale
+            [150, 180) que le classement note réellement, avant de les passer à
+            l'évaluateur officiel. "full" garde les 364 coupes — historique,
+            NON comparable au classement. Voir common.io.Z_CLIP_RANGE.
     """
     pred_out = tmpbase / f"{src_field}_to_{tgt_field}" / "pred"
     tgt_out = tmpbase / f"{src_field}_to_{tgt_field}" / "gt"
@@ -289,8 +296,20 @@ def prepare_pair_dir(
             pred_resampled = nib_proc.resample_from_to(pred_img, gt_img, order=3, mode="constant", cval=0.0)
             pred_data = pred_resampled.get_fdata(dtype=np.float32)
 
-        nib.save(nib.Nifti1Image(pred_data, gt_nii.affine, gt_nii.header), str(pred_out / official_name))
-        shutil.copy2(gt_src, tgt_out / official_name)
+        pred_affine, pred_header = gt_nii.affine, gt_nii.header
+        if region == "slab":
+            # Découpe pred ET vérité sur la tranche notée, et déplace l'origine
+            # de l'affine en conséquence pour que les deux restent superposés.
+            # `img.slicer` fait exactement cela côté soumission officielle.
+            z0, z1 = Z_CLIP_RANGE
+            gt_clipped = nib.Nifti1Image(gt_data, gt_nii.affine, gt_nii.header).slicer[:, :, z0:z1]
+            pred_data = apply_z_clip(pred_data)
+            gt_data = gt_clipped.get_fdata(dtype=np.float32)
+            pred_affine, pred_header = gt_clipped.affine, gt_clipped.header
+            nib.save(nib.Nifti1Image(gt_data, pred_affine, pred_header), str(tgt_out / official_name))
+        else:
+            shutil.copy2(gt_src, tgt_out / official_name)
+        nib.save(nib.Nifti1Image(pred_data, pred_affine, pred_header), str(pred_out / official_name))
         count += 1
 
     if count == 0:
@@ -341,8 +360,13 @@ def evaluate_task(
     metrics: List[str],
     device: str,
     output_csv: Path,
+    region: str = "slab",
 ) -> List[Dict]:
-    """Evaluate all pairs for a given task."""
+    """Evaluate all pairs for a given task.
+
+    `region` : "slab" (défaut) = tranche axiale [150, 180) notée par le
+    classement ; "full" = volume entier (historique, non comparable).
+    """
     pairs = TASK_PAIRS[task]
     matrix = build_prediction_matrix(pred_dir, modality=modality)
     total, expected = print_matrix(matrix, pairs, method, task, modality)
@@ -351,7 +375,12 @@ def evaluate_task(
         print(f"❌ Évaluation impossible: {total}/{expected} prédictions manquantes")
         return []
 
+    z0, z1 = Z_CLIP_RANGE
     print(f"✅ Cohorte complète pour {task}: {total}/{expected} prédictions")
+    print(f"   Région évaluée : "
+          + (f"tranche axiale [{z0}, {z1}) — celle que note le classement"
+             if region == "slab" else
+             "VOLUME ENTIER — historique, NON comparable au classement"))
 
     all_results = []
     with tempfile.TemporaryDirectory(prefix=f"mrix_eval_{method}_{task}_") as tmpdir:
@@ -361,7 +390,7 @@ def evaluate_task(
             print(f"\n--- Pair: {src_field} → {tgt_field} ---")
             # Pass only the sub-matrix for this specific source
             src_matrix = matrix.get(src_field, {})
-            pair_pred, pair_tgt = prepare_pair_dir(src_matrix, src_field, tgt_field, target_dir, tmpbase, modality)
+            pair_pred, pair_tgt = prepare_pair_dir(src_matrix, src_field, tgt_field, target_dir, tmpbase, modality, region)
 
             if pair_pred is None:
                 print(f"⚠️  Aucune prédiction pour {src_field}→{tgt_field}, SKIP")
@@ -436,6 +465,14 @@ Exemples:
     parser.add_argument("--metrics", type=str, default="nrmse,ssim,lpips")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--output-csv", type=str, default=None)
+    # RÉGION. Défaut `slab` : le classement ne note que la tranche axiale
+    # [150, 180), forme (364, 436, 30). `full` = volume entier, ce que mesuraient
+    # tous les chiffres antérieurs au 2026-09-04 — non comparable au classement.
+    # Voir common/io.py::Z_CLIP_RANGE.
+    parser.add_argument("--region", type=str, default="slab", choices=["slab", "full"],
+                        help="region evaluee : 'slab' = tranche axiale [150,180) notee "
+                             "par le classement (defaut) ; 'full' = volume entier "
+                             "(historique, non comparable au classement)")
     return parser.parse_args()
 
 
@@ -474,6 +511,7 @@ def main():
         metrics=metrics,
         device=args.device,
         output_csv=output_csv,
+        region=args.region,
     )
 
     if results:
