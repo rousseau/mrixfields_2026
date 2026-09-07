@@ -1,0 +1,167 @@
+# DERIVEE DE vectorized_trajectory_l1.yaml LE 2026-09-07 — volet 2 du plan.
+#
+# Deux changements, tous deux mesures sur le PLAFOND de representation
+# (results/mmfm/representation_20260906/manifest.md), et qui se composent :
+#   - vae.checkpoint : MedVAE affine par perte perceptuelle LPIPS  -> -6.7 %
+#   - field_norm_stats_hi125.json (`hi` x1.25, moins d'ecretage)   -> -13.2 %
+#   - les deux ensemble : 0.1140 -> 0.0901 de nRMSE sur la tranche notee, soit -21.0 %,
+#     et la part propre au VAE (plancher protocolaire retire) 0.0911 -> 0.0585, -36 %.
+#     Le SSIM monte aussi (0.8984 -> 0.9227), ce n'est donc pas un arbitrage.
+#
+# CE QUE CE RUN TESTE, et qui n'est PAS acquis : que ce gain de representation se
+# TRANSMETTE au score. Le compteur "propriete interne amelioree qui ne se transmet pas"
+# est a 2 (2026-09-01 et 2026-09-02, ce dernier : -0.0072 de plafond -> +0.0004 de
+# score). Ce troisieme essai a un gain 3x plus grand et, pour la premiere fois, il est
+# ATTRIBUABLE : le cache passe par le chemin TUILE, celui de la production, alors que
+# l'adoption LPIPS du 2026-09-02 avait ete encodee par la fenetre glissante de MedVAE
+# (cache 1989e9d1) et comparee a une production tuilee — deux variables au lieu d'une.
+#
+# IMPERATIF a l'inference : passer --field_norm_stats configs/mmfm/field_norm_stats_hi125.json
+# et NON field_norm_stats.json. La sortie est denormalisee avec les stats du champ CIBLE ;
+# une table differente produit une sortie a la mauvaise echelle et perd le run. Depuis le
+# 2026-09-07 _check_cache_consistency refuse ce cas au lieu de le laisser passer.
+# ─────────────────────────────────────────────────────────────────────────────
+# VARIANTE D'ATTRIBUTION — `configs/mmfm/vectorized_trajectory.yaml` avec UNE
+# SEULE clé changée : `train.loss: mse` -> `l1`. Tout le reste est identique
+# (couplage OT chaîné, spline multi-marginale, flip par pas, time_scale, FiLM,
+# standardisation du latent), de sorte que l'écart mesuré s'attribue à la perte
+# et à rien d'autre.
+#
+# CE QU'ON TESTE. Le run du 2026-09-05 (4 correctifs, `mse`) a rendu, à recette
+# d'inférence partagée sur la tranche notée : nRMSE 0.3549 contre 0.3581 pour la
+# production (gain 0.0031, SOUS le plancher de bruit de 0.002) mais SSIM 0.8098
+# contre 0.8379 — une perte neuf fois plus grande que le gain.
+#
+# L'HYPOTHÈSE. La chute de SSIM vient du passage à `mse`. Le flow matching exige
+# une ESPÉRANCE conditionnelle, donc un coût quadratique — c'est théoriquement
+# juste, et c'est ce que font les trois références. Mais la mesure du 2026-08-26
+# établit que sur ces cibles la MÉDIANE conserve 106-144 % des hautes fréquences
+# par rapport à la moyenne. `l1` est donc un estimateur du mauvais objet qui
+# rendait accidentellement service au SSIM, métrique sensible au flou.
+#
+# CE QUE LE RÉSULTAT VOUDRA DIRE.
+#   - SSIM remonte vers 0.84 sans perdre le nRMSE : l'attribution est établie, et
+#     il faut assumer un arbitrage perception/distorsion explicite plutôt qu'un
+#     choix théorique appliqué à l'aveugle.
+#   - SSIM ne remonte pas : l'attribution est FAUSSE, la perte n'y est pour rien,
+#     et la dégradation vient d'un des trois autres correctifs (le plus suspect
+#     étant la spline, qui change la géométrie des cibles).
+# Dans les deux cas on apprend quelque chose — c'est ce qui justifie le run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_vectorized_l1_hi125
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint: outputs/medvae/runs/medvae_finetune_lpips/weights/model_final.pth
+  # `model_final` et non `model_best` : c'est model_final que le banc du 2026-09-07 a
+  # mesure (val_loss 0.2291 contre 0.2288, ecart negligeable). Le cache LPIPS existant
+  # `1989e9d1` avait ete bati avec model_best — il ne correspond donc pas a la mesure.
+  latent_channels: 1
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  # TEMPS. `sinusoidal_time_embedding` a max_period=10000 : elle attend des
+  # INDICES de pas dans [0, 1000), pas un temps dans [0,1]. Sans ce facteur,
+  # l'embedding s'effondre en une rampe scalaire (rang effectif 1.22 sur 4 aux
+  # 5 temps de champ). Les deux références font ce produit.
+  time_scale: 1000.0
+  # MÉCANISME de conditionnement. En `concat`, 384 canaux de conditionnement
+  # affrontent 2 x 129024 canaux de latent à travers un seul Linear : 0.026 % de
+  # la variance d'entrée. En `film`, le conditionnement module (scale, shift)
+  # l'état normalisé de CHAQUE bloc résiduel — sa force ne dépend plus de la
+  # dimension du latent. C'est le mécanisme des deux références.
+  time_cond: film
+  # STANDARDISATION DE L'ENTRÉE. Mesuré sur 240 volumes du cache de production
+  # (medvae_finetune_c4d1e200) : moyenne 19.913378, écart-type 18.125440. Les
+  # LayerNorm du réseau sont toutes APRÈS `input_proj`, donc aucune ne rattrape
+  # le décalage : elles normalisent la SOMME déjà projetée. Laisser (0.0, 1.0)
+  # présente au réseau une entrée dont la composante continue vaut 1.1 fois sa
+  # propre variation.
+  # NOTE : `vectorized_r2_std.yaml` avait trouvé 18.0788 pour l'échelle, mais
+  # laissait latent_mean à 0.0 — la moitié du correctif seulement.
+  # A RECALCULER SUR LE NOUVEAU CACHE — etape silencieuse, aucun script ne la fait.
+  # Ce sont des statistiques DU CACHE : changer le checkpoint VAE et le `hi` deplace la
+  # distribution. Precedent : le cache `ff550d64` a fait passer latent_scale de 18.125 a
+  # 13.551 (-25 %). Les valeurs ci-dessous sont des PLACEHOLDERS a remplacer.
+  latent_mean: 19.913378
+  latent_scale: 18.125440
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: retro_train
+  output_subdir: mmfm/vectorized_l1_hi125
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_6109b0b0/retro_train
+  # OBLIGATOIRE ici : le couplage OT chaîné lit tous les latents d'un contraste.
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  # ── Les quatre correctifs de l'objectif (point 3 du plan d'audit) ──
+  marginal_mode: trajectory
+  loss: l1
+  flip_per_step: true
+  # ──────────────────────────────────────────────────────────────────
+  # batch_size reste à 1 : en mode trajectoire il ne sert plus à rendre l'OT
+  # non dégénéré (le couplage est calculé hors boucle sur tout le cache, pas sur
+  # le lot), seulement à moyenner le gradient. L'augmenter est possible et sans
+  # risque algorithmique, contrairement au régime `pairwise`.
+  batch_size: 1
+  total_iters: 25000
+  # SANS OBJET en mode trajectoire : la trajectoire traverse tous les champs à
+  # chaque pas, il n'y a plus de transition à tirer. Conservés pour que la
+  # config reste lisible en `pairwise`.
+  num_targets_per_step: 1
+  adjacent_only: false
+  identity_prob: 0.1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  accumulation_steps: 1
+  save_every: 2500
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

@@ -1,0 +1,96 @@
+{
+  "split": "retro_train",
+  "percentile_lower": 0.5,
+  "percentile_upper": 99.5,
+  "target_spacing": [
+    2.0,
+    2.0,
+    2.0
+  ],
+  "stats": {
+    "T1W": {
+      "0.1T": {
+        "lo": 0.0,
+        "hi": 0.9231642261147499,
+        "n": 100
+      },
+      "1.5T": {
+        "lo": 0.0,
+        "hi": 0.6040162965655327,
+        "n": 104
+      },
+      "3T": {
+        "lo": 0.0,
+        "hi": 0.7765624672174454,
+        "n": 143
+      },
+      "5T": {
+        "lo": 0.0,
+        "hi": 0.4504511132836342,
+        "n": 121
+      },
+      "7T": {
+        "lo": 0.0,
+        "hi": 0.40440652519464493,
+        "n": 235
+      }
+    },
+    "T2W": {
+      "0.1T": {
+        "lo": 0.0,
+        "hi": 0.7885313406586647,
+        "n": 100
+      },
+      "1.5T": {
+        "lo": 0.0,
+        "hi": 0.7671453058719635,
+        "n": 221
+      },
+      "3T": {
+        "lo": 0.0,
+        "hi": 0.7913818955421448,
+        "n": 142
+      },
+      "5T": {
+        "lo": 0.0,
+        "hi": 0.7126911729574203,
+        "n": 43
+      },
+      "7T": {
+        "lo": 0.0,
+        "hi": 0.6650269031524658,
+        "n": 81
+      }
+    },
+    "T2FLAIR": {
+      "0.1T": {
+        "lo": 0.0,
+        "hi": 0.9047853201627731,
+        "n": 99
+      },
+      "1.5T": {
+        "lo": 0.0,
+        "hi": 0.8427570760250092,
+        "n": 221
+      },
+      "3T": {
+        "lo": 0.0,
+        "hi": 0.6613548099994659,
+        "n": 143
+      },
+      "5T": {
+        "lo": 0.0,
+        "hi": 0.7180095091462135,
+        "n": 102
+      },
+      "7T": {
+        "lo": 0.0,
+        "hi": 0.5078073404729366,
+        "n": 84
+      }
+    }
+  },
+  "hi_scale_applied": 1.25,
+  "derived_from": "configs/mmfm/field_norm_stats.json",
+  "provenance": "Genere le 2026-09-07 : les `hi` de field_norm_stats.json multiplies par 1.25, `lo` inchange (il vaut 0.0 partout). MESURE qui motive ce choix : la table d'origine sature 25-50 % des voxels de cerveau selon la cellule (T2FLAIR@3T 50.0 %, T1W@3T 37.1 %, T1W@7T 25.1 %) et l'ecretage n'est pas inversible. Balayage de hi_scale sur 15 volumes (results/mmfm/representation_20260906/manifest.md) : x0.5 -> 0.3900, x0.75 -> 0.2028, x1.0 -> 0.1140, x1.25 -> 0.0989, x1.5 -> 0.1001, x2.0 -> 0.1053 de nRMSE sur la tranche notee. Optimum plat entre x1.25 et x1.5 ; x1.25 retenu car il laisse tous les `hi` sous 1.0 (max 0.9232) alors que x1.5 en met trois au-dessus, rendant une part de [-1,1] physiquement inatteignable sur des donnees dans [0,1]."
+}
