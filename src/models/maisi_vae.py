@@ -128,7 +128,26 @@ class MedVAEFineTuneWrapper(MRIxFieldsVAE):
         return self._latent_shape
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode → mode (µ) de la distribution postérieure.
+        """Encode → un ÉCHANTILLON de la distribution postérieure.
+
+        ATTENTION — ce n'est PAS le mode, contrairement à ce que ce fichier a
+        affirmé jusqu'au 2026-09-06. `MVAE.encode()` en 3D
+        (`medvae/medvae_main.py:106`) appelle `self.model(patch, decode=False)`,
+        et `AutoencoderKL_3D.forward` a `sample_posterior=True` par défaut
+        (`medvae/models/autoencoder_kl_3d.py:111-118`) : il renvoie
+        `posterior.sample()`.
+
+        Conséquence MESURÉE (2026-09-06) : deux appels sur la même entrée
+        diffèrent, rapport bruit/signal du latent 2.3e-3. Le cache de latents
+        n'est donc pas reproductible, et le latent du cache n'est pas celui que
+        l'inférence recalcule pour le même volume.
+
+        Effet sur la FIDÉLITÉ de reconstruction : nul à la quatrième décimale
+        (`results/mmfm/representation_20260906/summary.csv` : bras `prod`
+        0.0597323 contre `prod_mode` 0.0597482 de nRMSE). Ne pas attendre de gain
+        de score en corrigeant ce point — le corriger pour la REPRODUCTIBILITÉ.
+
+        Utiliser `encode_mode()` pour la version déterministe.
 
         Args:
             x: (B, 1, H, W, D) in [-1, 1]
@@ -136,7 +155,15 @@ class MedVAEFineTuneWrapper(MRIxFieldsVAE):
         Returns:
             z: (B, C, H', W', D')
         """
-        return self.medvae.encode(x)  # returns mode directly
+        return self.medvae.encode(x)
+
+    def encode_mode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode → MODE (µ) de la postérieure, déterministe.
+
+        Court-circuite la fenêtre glissante de `MVAE.encode` : à utiliser sur des
+        entrées qui tiennent en mémoire (typiquement une tuile de `tiled_encode`).
+        """
+        return self.inner.encode(x).mode()
 
     def encode_dist(self, x: torch.Tensor):
         """Encode → DiagonalGaussianDistribution (pour fine-tuning)."""

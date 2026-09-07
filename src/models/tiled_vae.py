@@ -40,14 +40,46 @@ __all__ = ["tiled_encode", "tiled_decode", "DOWNSAMPLE"]
 DOWNSAMPLE = 4  # medvae_4_1_3d : /4 par dimension
 
 
+def _check_downsample(vae) -> None:
+    """Refuse un modèle dont le facteur de compression n'est pas DOWNSAMPLE.
+
+    `DOWNSAMPLE` est une CONSTANTE de module : avec `medvae_8_1_3d`, le latent d'une
+    tuile est 8× plus petit par axe, le crop `[li:li + lh]` avec `lh = tuile // 4`
+    déborde, et PyTorch tronque les tranches hors bornes SANS lever d'exception —
+    on obtient un latent assemblé à la mauvaise échelle et une reconstruction fausse,
+    sans aucun signal. Mesuré : le bras `medvae8` du banc de représentation a dû
+    passer par la fenêtre glissante officielle pour cette raison.
+    """
+    name = getattr(getattr(vae, "medvae", None), "model_name", None)
+    if name is None:
+        name = getattr(vae, "model_name", None)
+    if name is None:
+        return                      # objet sans nom de modèle : rien à vérifier
+    try:
+        factor = int(str(name).split("_")[1])
+    except (IndexError, ValueError):
+        return
+    if factor != DOWNSAMPLE:
+        raise ValueError(
+            f"tiled_encode/tiled_decode codent DOWNSAMPLE={DOWNSAMPLE} en dur, mais "
+            f"'{name}' compresse d'un facteur {factor}. Utiliser la fenêtre glissante "
+            f"de MedVAE (MVAE.encode/decode) pour ce modèle, ou paramétrer DOWNSAMPLE."
+        )
+
+
 def _as_latent(z) -> torch.Tensor:
     """Normalise la sortie d'`encode()` en tenseur.
 
-    Selon l'objet passé, `encode()` renvoie soit directement le mode (wrapper
-    `MVAE`, `MedVAEFineTuneWrapper`), soit un `DiagonalGaussianDistribution`
-    (l'`AutoencoderKL` interne), soit un tuple (mean, logvar). On prend toujours
-    le MODE (déterministe) : l'échantillonnage n'a de sens qu'à l'entraînement
-    du VAE, pas pour construire un cache de latents.
+    Selon l'objet passé, `encode()` renvoie soit un tenseur (wrapper `MVAE`,
+    `MedVAEFineTuneWrapper`), soit un `DiagonalGaussianDistribution`
+    (l'`AutoencoderKL` interne), soit un tuple (mean, logvar).
+
+    ATTENTION — quand l'objet est un `MVAE`/`MedVAEFineTuneWrapper`, le tenseur
+    reçu ici est un ÉCHANTILLON de la postérieure, pas le mode : la première
+    branche le renvoie tel quel et il n'y a rien à en extraire. Le commentaire
+    « on prend toujours le MODE » qui figurait ici jusqu'au 2026-09-06 était faux
+    (voir `models/maisi_vae.py::encode`). Effet mesuré sur la reconstruction :
+    nul ; effet sur la reproductibilité du cache : réel.
 
     ATTENTION — tester `hasattr(z, "mode")` en premier est un PIÈGE : un
     `torch.Tensor` possède lui aussi une méthode `.mode()` (le mode STATISTIQUE,
@@ -100,6 +132,7 @@ def tiled_encode(
     """
     if margin % DOWNSAMPLE != 0:
         raise ValueError(f"margin={margin} doit être un multiple de {DOWNSAMPLE}")
+    _check_downsample(vae)
     device = x.device
     _, _, H, W, D = x.shape
     th, tw, td = tile
@@ -151,6 +184,7 @@ def tiled_decode(
     """
     if margin % DOWNSAMPLE != 0:
         raise ValueError(f"margin={margin} doit être un multiple de {DOWNSAMPLE}")
+    _check_downsample(vae)
     device = z.device
     _, _, h, w, d = z.shape
     H, W, D = h * DOWNSAMPLE, w * DOWNSAMPLE, d * DOWNSAMPLE

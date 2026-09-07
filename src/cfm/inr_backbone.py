@@ -100,6 +100,17 @@ def sample_points(
         # ~4.4 % en L2 relatif (mesuré, results/mmfm/audit_20260825/latent_drift.csv),
         # ce qui constituait le plancher irréductible de l'audit. La graine est
         # dérivée du contenu pour rester indépendante de l'ordre d'appel.
+        #
+        # PIÈGE MESURÉ (2026-09-06) — cette graine est CONSTANTE : elle ne dépend
+        # que de `n` et `num_points`. C'est ce qu'on veut pour AJUSTER un `z`
+        # (Algorithme 2, appel unique par volume), et c'est un défaut grave pour le
+        # MÉTA-ENTRAÎNEMENT, qui appelle cette fonction à chaque pas : les 50 000
+        # pas du backbone de production ont vu les MÊMES 16 384 coordonnées, soit
+        # 0.198 % de la grille (espacement moyen 8.0 voxels). Vérifié : deux appels
+        # rendent des indices identiques. Conséquence mesurable sur le checkpoint de
+        # production : après 50 000 pas les poids partagés sont à 1.01x / 1.01x /
+        # 1.16x de leur initialisation SIREN — la base n'a jamais été apprise.
+        # `meta_train_step` passe désormais un générateur qui AVANCE à chaque pas.
         generator = torch.Generator(device=coords.device)
         generator.manual_seed(int(n) * 1_000_003 + int(num_points))
     idx = torch.randperm(n, device=coords.device, generator=generator)[:num_points]

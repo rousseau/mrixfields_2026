@@ -207,6 +207,17 @@ def main():
     z_reg_warmup_frac = float(train_cfg.get("z_reg_warmup_frac", 0.1))
     z_reg_warmup_iters = max(1, int(total_iters * z_reg_warmup_frac))
 
+    # TIRAGE DES COORDONNÉES. Sans générateur explicite, `sample_points` en
+    # fabrique un dont la graine ne dépend que de (n, num_points) : les 50 000 pas
+    # du backbone de production ont donc vu les MÊMES 16 384 coordonnées, soit
+    # 0.198 % de la grille (vérifié le 2026-09-06, et corroboré par les poids
+    # partagés restés à 1.01x de leur initialisation après 50 000 pas — voir
+    # results/mmfm/inr_capacity_20260906/manifest.md). Le générateur ci-dessous
+    # AVANCE à chaque pas : `theta` voit tout le volume au fil de l'entraînement,
+    # tout en restant reproductible d'un run à l'autre par sa graine initiale.
+    sample_gen = torch.Generator(device=device)
+    sample_gen.manual_seed(int(train_cfg.get("sample_seed", 20260906)) + start_iter)
+
     t0 = time.time()
     last_log_t = t0
     recent_losses: List[float] = []
@@ -218,7 +229,7 @@ def main():
         cur_z_reg_weight = z_reg_weight * min(1.0, step / z_reg_warmup_iters)
         loss, grad_norm, jac_penalty = meta_train_step(
             backbone, batch, coords_full, optimizer, points_per_step, grad_clip=grad_clip,
-            z_reg_weight=cur_z_reg_weight,
+            z_reg_weight=cur_z_reg_weight, generator=sample_gen,
         )
         scheduler.step()
         ema.update(backbone)

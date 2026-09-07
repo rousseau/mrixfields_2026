@@ -63,6 +63,175 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-07 — **Validation de la couche de représentation : le VAE est bon, l'INR est affamé, et le « plafond » mesurait surtout le protocole**
+
+**Verdict : les deux briques de représentation fonctionnent correctement pour ce
+qu'on leur donne. Le déficit de l'INR est un déficit de BUDGET (facteur 252), pas
+de famille de modèles. Et 60 % du « plafond de représentation » n'est pas
+imputable au VAE.** Manifestes :
+`results/mmfm/representation_20260906/manifest.md` et
+`results/mmfm/inr_capacity_20260906/manifest.md`. Scripts :
+`src/cfm/bench_representation.py`, `src/cfm/bench_inr_capacity.py`.
+
+### 1. Le plafond 0.1048 n'était pas une propriété du VAE
+
+La chaîne complète a été relancée **avec l'identité à la place du VAE**. Sujet 0006,
+3 contrastes × 5 champs, tranche notée [150, 180).
+
+| | nRMSE tranche notée |
+|---|---|
+| `noop` (contrôle, doit valoir 0) | **0.0000** |
+| **chaîne complète SANS VAE** | **0.0685** |
+| chaîne complète AVEC MedVAE (`prod`) | 0.1140 |
+
+Décomposition du plancher protocolaire : **écrêtage au percentile 99.5 = 0.0359**,
+rééchantillonnage 0.5 → 1 → 0.5 mm = 0.0326, **crop 192×224×192 = 0.0000** (mesuré,
+`protocol` et `protocol_nocrop` identiques à la 4ᵉ décimale).
+
+Et la part protocolaire varie de **11 %** (T2FLAIR@3T) à **71 %** (T2FLAIR@0.1T)
+selon la cellule : **comparer deux cellules du plafond compare surtout deux
+quantités d'écrêtage.** Le chiffre « 0.10–0.13 pour un prédicteur parfait », cité
+depuis le 2026-08-26, est confirmé en ordre de grandeur et mal attribué.
+
+### 2. Les écarts à la recette officielle MedVAE sont neutres ou favorables
+
+| écart au standard amont | VAE seul nRMSE | chaîne notée | verdict |
+|---|---|---|---|
+| **production** | 0.0597 | 0.1140 | référence |
+| échantillon → **mode** de la postérieure | 0.0597 | 0.1139 | **neutre** |
+| bfloat16 → **float32** | 0.0597 | 0.1140 | **neutre** |
+| tuilage maison → **fenêtre glissante officielle** | 0.0599 | 0.1168 | **le maison gagne**, et 1.7× plus vite |
+| **recette officielle complète** (min-max + CropForeground) | 0.0737 | 0.1509 | **+32 %, nettement pire** |
+| percentile + CropForeground | 0.1167 | 0.1215 | `CropForeground` coûte **4.7 dB** |
+| `medvae_8_1_3d` au lieu du 4× | 0.1384 | 0.2195 | **bien pire** — le 4× est le bon choix |
+
+**Aucun écart au standard n'est un défaut de performance.** `medvae_4_1_3d` est en
+outre le seul autre poids 3D disponible en dehors du 8× (`factory.py`
+::`FILE_DICT_ASSOCIATIONS`), que les auteurs mesurent eux-mêmes à −3.29 dB
+(26.23 contre 29.52 PSNR, Table 4 du papier). **La question « a-t-on choisi la bonne
+brique 3D ? » se ferme : oui, et il n'y a pas de second choix.**
+
+### 3. Un vrai défaut, sans effet sur la fidélité
+
+`MVAE.encode()` en 3D renvoie `posterior.sample()`, **pas le mode** — trois
+commentaires du dépôt affirmaient le contraire (`maisi_vae.py:139`,
+`tiled_vae.py:50`, `finetune_medvae.py:287`). Mesuré : deux appels diffèrent,
+bruit/signal du latent **2.3e-3**. Effet sur la reconstruction : **nul à la 4ᵉ
+décimale**. C'est un défaut de **reproductibilité du cache**, pas un levier de score.
+Commentaires corrigés, `encode_mode()` ajouté.
+
+### 4. Le seul levier réel côté VAE : l'écrêtage
+
+L'erreur ABSOLUE du VAE est constante (PSNR 31.3–31.5 dB quelle que soit la
+normalisation) ; seule l'occupation de la dynamique change l'erreur relative.
+Balayage du `hi` fixe par (contraste, champ) — **forme transposable à la traduction**,
+contrairement aux percentiles par volume :
+
+| `hi` × | 0.5 | 0.75 | **1.0 (prod)** | **1.25** | 1.5 | 2.0 |
+|---|---|---|---|---|---|---|
+| nRMSE tranche notée | 0.3900 | 0.2028 | **0.1140** | **0.0989** | 0.1001 | 0.1053 |
+
+**Optimum à `hi` × 1.25 : −13.2 %.** Le mécanisme est mesuré : la table
+`field_norm_stats.json` sature 25–50 % des voxels de cerveau selon la cellule
+(T2FLAIR@3T 50.0 %, T1W@3T 37.1 %, T1W@7T 25.1 %), et l'écrêtage n'est pas inversible.
+Le MedVAE perceptuel gagne en plus **−6.8 %** (0.1063 contre 0.1140) — soit un
+cinquième du gain annoncé le 2026-08-25 sous la géométrie du fine-tuning.
+
+### 5. L'INR : ce n'est pas la famille, c'est le budget
+
+Même volume, même entrée normalisée, même métrique que le banc VAE. T1W × {0.1T, 3T,
+7T}. Le témoin qui manquait à toute interprétation : **ce que vaut un budget de N
+nombres dépensé de la façon la plus bête possible** (grille basse résolution
+ré-interpolée).
+
+| représentation | budget/volume | nRMSE | nRMSE premier plan | PSNR |
+|---|---|---|---|---|
+| *témoin trivial 11×13×11* | *1 536* | *0.2381* | *0.6641* | *18.91* |
+| **INR production** (20 pas SGD) | **512 effectifs** | 0.1448 | 0.4367 | 23.41 |
+| INR, 200 pas de SGD | 512 | 0.1417 | 0.4276 | 23.61 |
+| INR, modulation directe (Adam) | 1 536 | 0.1396 | 0.4062 | 23.72 |
+| + `modulate_scale` | 3 072 | 0.1268 | 0.3748 | 24.61 |
+| + LoRA rang 4 | ~13 k | 0.1019 | 0.3086 | 26.61 |
+| + LoRA rang 16 | ~51 k | 0.0737 | 0.2203 | 29.45 |
+| **+ LoRA rang 64** | **~200 k** | **0.0531** | **0.1548** | **32.32** |
+| *témoin trivial 48×56×48* | *129 024* | *0.0954* | *0.2835* | *27.21* |
+| **MedVAE pré-entraîné** | 129 024 | 0.0587 | 0.1832 | 31.82 |
+| **MedVAE affiné LPIPS** | 129 024 | 0.0503 | 0.1576 | 33.14 |
+
+**Les deux représentations valent exactement la même chose par unité de budget** :
+l'INR bat son témoin trivial de −34 % en premier plan (0.4367 contre 0.6641),
+MedVAE bat le sien de −35 % (0.1832 contre 0.2835). L'écart entre eux n'est pas un
+écart de qualité : c'est **512 nombres contre 129 024, un facteur 252**.
+
+**À budget comparable, l'INR dépasse MedVAE pré-entraîné** (0.1548 contre 0.1832 en
+premier plan) et rejoint le MedVAE perceptuel (0.1576) — **sans réentraîner le SIREN**,
+en optimisant seulement la modulation.
+
+**Ce n'est pas un problème d'optimisation** : 20 pas → 200 pas de SGD ne gagne que
++0.2 dB, et l'optimisation directe des 1 536 décalages par Adam donne le même
+résultat que la production. **Le hypernetwork de 66 M paramètres n'apporte donc
+rien** (1 Go de checkpoint, 0.98 s/itération) — et sa jacobienne est de rang 512,
+inférieur aux 1 536 décalages : **la capacité réelle par volume est 512**, pas
+129 024 comme l'annonce `inr.yaml:48`.
+
+Conséquence sur une phrase répétée depuis des mois — « le handicap de l'INR est
+représentationnel » : **vrai au sens du budget, faux au sens de la famille**. Aucun
+correctif de mécanisme ne pouvait combler un facteur 252.
+
+### 6. Deux défauts d'entraînement de l'INR, vérifiés et corrigés
+
+**A. Les 50 000 pas de méta-entraînement ont vu les MÊMES 16 384 coordonnées.**
+`meta_train_step` était appelé sans générateur (`train_inr_backbone.py:219`) et
+`sample_points` en fabriquait un dont la graine ne dépend que de `(n, num_points)`
+(`inr_backbone.py:104`) — donc constante. Vérifié : deux appels rendent des indices
+identiques. `θ` n'a jamais été supervisé ailleurs que sur **0.198 %** de la grille
+(espacement moyen 8.0 voxels). **CORRIGÉ** : un générateur qui avance à chaque pas
+(recouvrement entre deux tirages : 30/16384, conforme au hasard), tandis que
+l'ajustement de `z` reste figé, comme il doit l'être.
+
+**B. Après 50 000 pas, la base SIREN est restée son initialisation aléatoire.**
+RMS des poids EMA contre la valeur exacte de l'init : `first` **1.01×**,
+`hidden.0` **1.01×**, `hidden.4` 1.16×, seul `final` à 3.00×. A explique B.
+
+Ces deux défauts sont réels et gratuits à corriger, mais **ils n'expliquent pas
+l'écart de 8.4 dB** : le banc les contourne et retrouve 32.32 dB dès que le budget
+monte. C'est bien la capacité qui borne.
+
+### 7. Le banc VAE historique (`results/benchmark_vae/`) est invalide
+
+Deux causes vérifiées dans le code, chacune suffisante :
+1. **il alimente MedVAE en [0, 1]** (`benchmark_vae.py:77`) là où la recette amont et
+   la production utilisent [−1, 1] ;
+2. **`PatchedVAE` laisse 14.89 % des voxels sans aucun patch** (`patched_vae.py:106` :
+   `range(0, h - ph + 1, sh)` ne couvre pas la queue) — simulé exactement sur la
+   géométrie du banc : 81 patches, 8 601 152 voxels jamais écrits, qui sortent à zéro
+   et entrent quand même dans les métriques.
+
+Aucun des deux ne touche la production, mais **ces CSV ne peuvent pas départager deux
+architectures**. Le présent banc les remplace pour cette question.
+
+### Réserves, à ne pas perdre
+
+- **Un seul sujet** (0006). Les écarts entre variantes portent sur 15 volumes appariés
+  et sont fiables ; le NIVEAU absolu ne l'est qu'à ±13 % (le banc reproduit le plafond
+  publié à +0.0135 près, même signe sur 13 cellules sur 15).
+- **Le PSNR de ce banc n'est PAS comparable au 29.52 dB publié** : 82 % de nos volumes
+  est du fond plat trivialement reconstruit, là où la recette amont recadre sur le
+  cerveau. Restreinte au premier plan, notre erreur relative vaut 0.2642 et non 0.0597.
+  Ne pas écrire « nous faisons mieux que le papier ».
+- Le bras `prod_margin32` **ne mesurait pas la marge** : à marge 32 la tuile élargie
+  fait 176 sur l'axe W et MedVAE la re-découpe en fenêtres de 88 (`roi_size_calc`,
+  `gpu_dim=160`). Vérifié. Bras propres relancés avec `gpu_dim=256`.
+- Les chiffres `mod_*` sont obtenus sur le SIREN **gelé** de production, méta-entraîné
+  pour une modulation par décalage seul : ce sont des **planchers**, pas des plafonds.
+- **`scripts/run_task3_eval.sh` ne passe pas `--center_crop_only`** alors que tous les
+  chiffres publiés l'ont utilisé : toute mesure passée par ce pilote sortirait sous une
+  autre géométrie. Vérifié, non corrigé.
+- Rien ici ne dit ce que le score de bout en bout deviendrait. Le 2026-09-02 a établi
+  qu'un gain de représentation de −0.0072 s'était transmis en **+0.0004** sur le score.
+
+---
+
 ## 2026-09-06 (soir) — **Cache SANS normalisation : NÉGATIF. Le niveau atteint le réseau, mais MedVAE perd sa dynamique.**
 
 **Verdict : le défaut 04 est réel, et sa correction naïve est pire que le mal.**
