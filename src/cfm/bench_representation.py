@@ -210,6 +210,12 @@ ARMS = {a.name: a for a in [
         "reechantillonnage seul.", use_vae=False, norm="minmax"),
     Arm("protocol_nocrop", "chaine sans VAE et sans crop 192x224x192 : isole le cout du crop.",
         use_vae=False, crop="none"),
+    # Le plancher protocolaire de la recette CORRIGEE. Sans lui, comparer `lpips_hi125`
+    # au temoin `protocol` melange deux choses : le VAE et l'ecretage. `protocol` est le
+    # plancher de la recette de PRODUCTION (hi x1.0) ; celui-ci est le plancher de la
+    # recette a hi x1.25, et c'est a lui qu'il faut comparer le correctif.
+    Arm("protocol_hi125", "chaine complete SANS VAE, avec `hi` x1.25 : le plancher de la "
+        "recette corrigee.", use_vae=False, hi_scale=1.25),
 
     # --- production et ses variantes une-a-une ------------------------------
     Arm("prod", "recette de PRODUCTION exacte : field_fixed + 1mm + crop centre + tuiles + bf16 + "
@@ -399,9 +405,16 @@ def roundtrip(arm: Arm, vol_norm: np.ndarray, device) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 
 
-def run_cell(arm: Arm, nii_path: Path, lo: float, hi: float, device) -> dict:
+def run_cell(arm: Arm, nii_path: Path, lo: float, hi: float, device,
+             return_volumes: bool = False):
     """Reproduit la geometrie de `infer_mmfm_unified.process_volume_unified`
-    avec le flow retire, et renvoie les trois familles de metriques."""
+    avec le flow retire, et renvoie les trois familles de metriques.
+
+    `return_volumes=True` renvoie en plus `(verite_native, prediction_native)`, sur
+    la grille 0.5mm et deja masques — c'est ce que consomme
+    `figures_representation_protocol.py`. Les figures empruntent ainsi EXACTEMENT le
+    meme chemin que les chiffres : une figure produite par un code parallele finirait
+    par illustrer autre chose que ce qu'on a mesure."""
     t0 = time.time()
     img_src = nib.load(str(nii_path))
     vol_native = img_src.get_fdata(dtype=np.float32)
@@ -481,6 +494,8 @@ def run_cell(arm: Arm, nii_path: Path, lo: float, hi: float, device) -> dict:
     m["nrmse_full"] = nrmse(pred_native, vol_native)
     m["ssim_full"] = ssim3d(pred_native, vol_native)
     m["seconds"] = time.time() - t0
+    if return_volumes:
+        return m, vol_native, pred_native
     return m
 
 

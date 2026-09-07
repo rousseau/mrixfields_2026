@@ -227,6 +227,40 @@ la même chaîne**, et c'est le premier qui est hors norme par rapport au reste 
 
 ---
 
+## La figure — et ce qu'elle a appris en plus du tableau
+
+`src/cfm/figures_representation_protocol.py` produit
+`protocole_{T1W_7T,T2FLAIR_3T}_0006.png` : vérité / protocole seul / production /
+protocole seul corrigé / correctif, avec les cartes d'erreur **sur une échelle
+commune**, sur une coupe tirée de la tranche **réellement notée** `[150, 180)`. Les
+volumes viennent de `bench_representation.run_cell(..., return_volumes=True)`, donc du
+même code que les chiffres — pas d'un chemin parallèle.
+
+**La quatrième colonne n'est pas cosmétique.** Une première version comparait le
+correctif directement au témoin `protocol`, et donnait à lire que *l'ajout d'un VAE
+fait baisser l'erreur sous le témoin sans VAE* — absurde. La cause : les deux
+n'utilisent pas le même écrêtage. Chaque VAE doit être lu contre le plancher de **sa
+propre** recette, d'où la colonne `protocol_hi125`.
+
+Et c'est cette colonne qui apprend le plus :
+
+| cellule | protocole seul (`hi` ×1.0) | protocole seul (`hi` ×1.25) | chute |
+|---|---|---|---|
+| T1W@7T | 0.0981 | **0.0395** | **−60 %** |
+| T2FLAIR@3T | 0.1247 | **0.0357** | **−71 %** |
+
+**Le plancher protocolaire n'est pas une constante du protocole : c'est presque
+entièrement l'écrêtage, et il est réductible.** La décomposition moyenne donnée plus
+haut (écrêtage 0.0359, rééchantillonnage 0.0326, sur 15 volumes) sous-estime largement
+la part de l'écrêtage dans les cellules où la table sature le plus — jusqu'à 0.12 en
+T2FLAIR@3T, où elle saturait 50 % des voxels de cerveau.
+
+Conséquence sur la lecture du −21 % : **il vient majoritairement de l'abaissement du
+plancher, pas d'une amélioration du VAE.** La part propre au VAE, elle, bouge peu —
+`sqrt(total² − plancher²)` vaut 0.063 en production contre 0.070 avec le correctif sur
+T2FLAIR@3T. Le gain est réel et il porte sur la bonne quantité, mais il ne dit rien de
+neuf sur MedVAE : il dit que l'on écrêtait trop.
+
 ## Le banc VAE historique (`results/benchmark_vae/`) est invalide — deux causes vérifiées
 
 C'est ce banc qui a servi à choisir MedVAE parmi AEKL / Pythae / VQ-VAE / RHVAE / MAISI.
