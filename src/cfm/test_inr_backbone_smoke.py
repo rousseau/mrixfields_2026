@@ -173,6 +173,15 @@ def test_meta_training_converges(
 
     n = volumes.shape[0]
     losses, jac_penalties = [], []
+    # TIRAGE DES COORDONNEES — meme correctif que train_inr_backbone.py (2026-09-07).
+    # Sans generateur explicite, `sample_points` en fabrique un dont la graine ne
+    # depend que de (n_points_grille, num_points) : la boucle verrait alors les MEMES
+    # coordonnees a chaque pas. C'est le defaut mesure sur le backbone de production
+    # (les 50 000 pas ont vu 0.198 % de la grille, et les poids partages sont restes a
+    # 1.01x de leur initialisation). Un smoke test qui tourne dans un autre regime que
+    # la production ne valide pas la production.
+    sample_gen = torch.Generator(device=device)
+    sample_gen.manual_seed(20260906)
     t0 = time.time()
     for step in range(n_steps):
         idx = torch.randperm(n, device=device)[:BATCH_SIZE]
@@ -180,6 +189,7 @@ def test_meta_training_converges(
         cur_z_reg_weight = z_reg_weight * min(1.0, step / warmup_iters)
         loss, _grad_norm, jac_penalty = meta_train_step(
             backbone, batch, coords_full, optimizer, POINTS_PER_STEP, z_reg_weight=cur_z_reg_weight,
+            generator=sample_gen,
         )
         losses.append(loss)
         jac_penalties.append(jac_penalty)

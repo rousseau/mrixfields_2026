@@ -465,7 +465,12 @@ def infer_single(
     if parsed is None:
         raise ValueError(f"Filename does not match official format: {input_path.name}")
 
-    mod = modality or parsed["field"]
+    # `parsed["modality"]` et non `parsed["field"]` : la coquille faisait que `mod`
+    # valait un champ magnetique. Sans effet sur les chiffres publies (le mode batch
+    # resout `mod` depuis sa propre boucle et n'appelle jamais infer_single), et
+    # l'echec etait bruyant car MODALITIES et DOMAINS sont disjoints — mais l'usage
+    # mono-volume documente ne pouvait pas fonctionner.
+    mod = modality or parsed["modality"]
     src = src_field or parsed["field"]
 
     fixed_lo = fixed_hi = tgt_lo = tgt_hi = None
@@ -764,7 +769,12 @@ def parse_args():
     p.add_argument("--field_norm_stats", default=None,
                    help="Chemin JSON produit par compute_field_norm_stats.py — requis avec "
                         "--norm_mode field_fixed")
-    p.add_argument("--center_crop_only", action="store_true")
+    p.add_argument("--center_crop_only", action="store_true", default=None,
+                   help="Un SEUL crop centré, comme le precompute du cache "
+                        "(defaut : cle inference.center_crop_only de la config). "
+                        "Sans lui, l'inference decoupe 8 fenetres decalees de -16 a +7 "
+                        "voxels et les fusionne par Hann — aucune n'est le crop sur "
+                        "lequel le cache a ete encode. Mesure : 104 s/volume contre 16.")
     p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--no_ema", action="store_true")
     p.add_argument("--upsample_order", type=int, default=None,
@@ -785,9 +795,10 @@ def _flag(cfg_infer: dict, key: str, cli_value) -> bool:
     return bool(cfg_infer.get(key, False)) if cli_value is None else bool(cli_value)
 
 
-def _check_cache_consistency(cfg: dict, norm_mode: str, compat_source_norm: bool) -> None:
-    """GARDE-FOU — le cache de latents dit avec quelle normalisation il a été bâti ;
-    l'inférence doit s'y conformer.
+def _check_cache_consistency(cfg: dict, norm_mode: str, compat_source_norm: bool,
+                             field_norm_stats_path: Optional[str] = None) -> None:
+    """GARDE-FOU — le cache de latents dit comment il a été bâti ; l'inférence doit
+    s'y conformer.
 
     C'est exactement le contrôle qui manquait : le cache INR de production
     (`inr_932b0b37`) porte `field_norm_stats_path: None`, donc des percentiles PAR
@@ -795,6 +806,23 @@ def _check_cache_consistency(cfg: dict, norm_mode: str, compat_source_norm: bool
     latent déplacé de 69 % en L2 relatif. Rien ne le signalait, parce que
     `cache_prebakes_prep=True` fait que l'entraînement ne rappelle jamais
     `prep_latent` : les deux chemins ne se croisent nulle part.
+
+    ÉLARGI LE 2026-09-07. Le contrôle ne portait que sur « stats par champ présentes
+    ou non ». Il vérifie désormais aussi :
+
+      - QUEL fichier de normalisation (pas seulement s'il y en a un). Faire passer un
+        modèle entraîné sous `field_norm_stats_hi125.json` par une évaluation qui
+        dénormalise avec `field_norm_stats.json` produit une sortie à la mauvaise
+        échelle — le run est perdu, sans aucun signal.
+      - LE CHECKPOINT VAE. Un cache encodé par MedVAE-LPIPS décodé par les poids
+        Stanford bruts, ou l'inverse, vaut 0.1048 contre 0.0976 de plafond.
+      - LE SCHÉMA D'ENCODAGE (`tiled` contre `medvae_sliding_window`). Les deux
+        portaient le même `cache_id` jusqu'au 2026-09-07 ; l'écart mesuré entre eux
+        est de 0.1140 contre 0.1168 sur la tranche notée.
+
+    Les caches antérieurs au 2026-09-07 ne portent pas `encode_scheme` : le contrôle
+    correspondant est alors ignoré (on ne peut pas inventer une provenance absente),
+    et il le dit.
     """
     cache_dir = cfg.get("data", {}).get("latent_cache_dir")
     if not cache_dir:
@@ -803,17 +831,64 @@ def _check_cache_consistency(cfg: dict, norm_mode: str, compat_source_norm: bool
     if not index.exists():
         return
     with open(index) as f:
-        built_with_field_norm = json.load(f).get("field_norm_stats_path") is not None
+        meta = json.load(f)
+
+    problems: List[str] = []
+
+    # ── 1. normalisation de la source : présence, puis identité du fichier
+    cache_fns = meta.get("field_norm_stats_path")
+    built_with_field_norm = cache_fns is not None
     infer_uses_field_norm = (norm_mode == "field_fixed") and not compat_source_norm
     if built_with_field_norm != infer_uses_field_norm:
+        problems.append(
+            f"  normalisation : cache field_norm_stats_path "
+            f"{'renseigné' if built_with_field_norm else 'ABSENT (percentiles par volume)'}, "
+            f"inférence norm_mode={norm_mode!r} compat_source_norm={compat_source_norm}.\n"
+            "    -> Le flow recevrait un latent hors de sa distribution d'entraînement.\n"
+            "       Mettre inference.compat_source_norm à true, ou régénérer le cache."
+        )
+    elif built_with_field_norm and field_norm_stats_path:
+        if Path(cache_fns).name != Path(field_norm_stats_path).name:
+            problems.append(
+                f"  TABLE DE NORMALISATION DIFFÉRENTE :\n"
+                f"    cache     : {cache_fns}\n"
+                f"    inférence : {field_norm_stats_path}\n"
+                "    -> La sortie serait dénormalisée à une autre échelle que celle de\n"
+                "       l'entraînement. C'est une perte silencieuse du run entier."
+            )
+
+    # ── 2. checkpoint VAE
+    cache_ckpt = meta.get("vae_checkpoint", "__absent__")
+    cfg_ckpt = cfg.get("vae", {}).get("checkpoint")
+    if cache_ckpt != "__absent__" and (cache_ckpt or None) != (cfg_ckpt or None):
+        problems.append(
+            f"  CHECKPOINT VAE DIFFÉRENT :\n"
+            f"    cache  : {cache_ckpt or '(poids pré-entraînés)'}\n"
+            f"    config : {cfg_ckpt or '(poids pré-entraînés)'}"
+        )
+
+    # ── 3. schéma d'encodage
+    cache_scheme = meta.get("encode_scheme")
+    raw_tile = cfg.get("data", {}).get("encode_tile")
+    cfg_scheme = "tiled" if raw_tile else "medvae_sliding_window"
+    if cache_scheme is None:
+        print(f"  [cache] {index.name} sans `encode_scheme` (antérieur au 2026-09-07) — "
+              f"schéma d'encodage NON vérifié.")
+    elif cache_scheme != cfg_scheme:
+        problems.append(
+            f"  SCHÉMA D'ENCODAGE DIFFÉRENT :\n"
+            f"    cache  : {cache_scheme}\n"
+            f"    config : {cfg_scheme} (data.encode_tile={raw_tile})\n"
+            "    -> Deux distributions de latents différentes. Écart mesuré :\n"
+            "       0.1140 (tuilé) contre 0.1168 (fenêtre glissante) sur la tranche notée."
+        )
+
+    if problems:
         raise SystemExit(
-            "INCOHÉRENCE cache / inférence sur la normalisation de la source.\n"
-            f"  cache     {index} : field_norm_stats_path "
-            f"{'renseigné' if built_with_field_norm else 'ABSENT (percentiles par volume)'}\n"
-            f"  inférence : norm_mode={norm_mode!r}, compat_source_norm={compat_source_norm}\n"
-            "Le flow recevrait un latent hors de la distribution sur laquelle il a été\n"
-            "entraîné. Mettre inference.compat_source_norm à true (ou régénérer le cache\n"
-            "avec --field-norm-stats). Voir results/mmfm/audit_20260825/manifest.md."
+            f"INCOHÉRENCE cache / inférence — cache : {index}\n"
+            + "\n".join(problems)
+            + "\nVoir results/mmfm/audit_20260825/manifest.md et "
+              "results/mmfm/representation_20260906/manifest.md."
         )
 
 
@@ -824,7 +899,7 @@ def main():
     compat_source_norm = _flag(cfg_infer, "compat_source_norm", args.compat_source_norm)
     _check_cache_consistency(
         resolve_paths(load_yaml_with_include(args.config), load_env(args.env)),
-        norm_mode, compat_source_norm,
+        norm_mode, compat_source_norm, args.field_norm_stats,
     )
     if args.input:
         infer_single(
@@ -832,7 +907,7 @@ def main():
             tgt_field=args.tgt_field, output_path=args.output,
             src_field=args.src_field, modality=args.modality, env_path=args.env,
             n_steps=args.n_steps, norm_mode=args.norm_mode,
-            center_crop_only=args.center_crop_only,
+            center_crop_only=_flag(cfg_infer, 'center_crop_only', args.center_crop_only),
             use_ema=not args.no_ema, device=args.device,
             compat_orientation=_flag(cfg_infer, 'compat_orientation', args.compat_orientation),
             compat_source_norm=_flag(cfg_infer, 'compat_source_norm', args.compat_source_norm),
@@ -861,7 +936,7 @@ def main():
                 else (json.load(open(cfg_infer["intensity_recalibration"]))
                       if cfg_infer.get("intensity_recalibration") else None)),
             env_path=args.env, n_steps=args.n_steps, norm_mode=args.norm_mode,
-            center_crop_only=args.center_crop_only,
+            center_crop_only=_flag(cfg_infer, 'center_crop_only', args.center_crop_only),
             use_ema=not args.no_ema, skip_existing=args.skip_existing, device=args.device,
             compat_orientation=_flag(cfg_infer, 'compat_orientation', args.compat_orientation),
             compat_source_norm=_flag(cfg_infer, 'compat_source_norm', args.compat_source_norm),

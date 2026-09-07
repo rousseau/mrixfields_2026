@@ -99,9 +99,12 @@ def main():
 
     # Même clé de hash que precompute_mmfm_latents.py (VAE + prétraitement) —
     # seul le payload (spatial vs aplati) diffère, sous une racine distincte.
+    # Depuis le 2026-09-07 la clé inclut le SCHÉMA D'ENCODAGE : ce script tuile
+    # (`tiled_encode`), l'autre non, et les deux portaient le même identifiant.
     cache_id = flat_latent_cache_id(
         cfg, target_spacing, volume_size, p_lo, p_hi,
         field_norm_stats_path=args.field_norm_stats,
+        encode_tile=tile, encode_tile_margin=tile_margin, amp_dtype=amp_dtype_name,
     )
     cache_dir = Path(args.cache_root) / cache_id / split
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -194,6 +197,15 @@ def main():
         "percentile_lower": p_lo,
         "percentile_upper": p_hi,
         "field_norm_stats_path": args.field_norm_stats,
+        "vae_checkpoint": cfg.get("vae", {}).get("checkpoint"),
+        # PROVENANCE DE L'ENCODAGE (2026-09-07). Sans ces champs, rien dans le cache
+        # ne disait avec quel schéma il avait été encodé — et deux schémas
+        # incompatibles portaient le même `cache_id`. C'est `index.json` qui fait
+        # foi : `_check_cache_consistency` le relit avant toute inférence.
+        "encode_scheme": "tiled" if tile else "medvae_sliding_window",
+        "encode_tile": list(tile) if tile else None,
+        "encode_tile_margin": tile_margin if tile else None,
+        "amp_dtype": amp_dtype_name,
         "samples": index,
     }
     index_path = cache_dir / "index.json"

@@ -94,40 +94,46 @@ class PatchedVAE(nn.Module):
     def _get_patches(
         self, x: torch.Tensor
     ) -> List[Tuple[torch.Tensor, Tuple[int, int, int]]]:
-        """Extract patches from input volume."""
+        """Extract patches from input volume — COUVERTURE COMPLÈTE garantie.
+
+        CORRIGÉ LE 2026-09-07. L'ancienne version itérait `range(0, L - P + 1, S)`
+        et n'atteignait donc jamais la queue d'un axe quand `(L - P) % S != 0`. Le
+        bloc dit « boundary » qui suivait ne réparait rien :
+
+          - sa condition `if d + pd > x.shape[4]` compare `d` à `x.shape[4]`, or
+            `d` EST `x.shape[4]` (dépaqueté ligne au-dessus) : elle vaut donc
+            `pd > 0`, toujours vraie ;
+          - `i_start`/`j_start`/`k_start` étaient des CONSTANTES (`h-ph`, `w-pw`,
+            `d-pd`) n'utilisant ni `i` ni `j` de la double boucle, si bien que le
+            déduplicateur ne laissait passer qu'UN patch, celui du coin extrême.
+
+        Coût mesuré sur la géométrie du banc VAE (volume natif 364×436×364, patch
+        112×128×80, recouvrement 0.25 → pas 84×96×60) : couverture par axe
+        1.0000 / 0.9541 / 0.8791, soit 81 patches et **8 601 152 voxels (14.89 %)
+        jamais écrits**. Ces voxels sortaient à EXACTEMENT zéro (`weights_map` nul
+        puis `clamp(min=1e-8)`) et entraient quand même dans MAE/MSE/SSIM/nRMSE —
+        d'où l'invalidation de `results/benchmark_vae/metrics/benchmark_results*.csv`.
+
+        La règle `sorted(set(range(0, L - P + 1, S)) | {max(0, L - P)})` ajoute la
+        position de queue de chaque axe : le dernier patch chevauche son voisin, ce
+        que la pondération de recouvrement gère déjà.
+        """
         b, c, h, w, d = x.shape
         ph, pw, pd = self.patch_size
         sh, sw, sd = self.stride
 
+        def _starts(length: int, patch: int, stride: int) -> List[int]:
+            if patch >= length:
+                return [0]
+            return sorted(set(range(0, length - patch + 1, stride)) | {length - patch})
+
         patches = []
         positions = []
-
-        # Sliding window extraction
-        for i in range(0, h - ph + 1, sh):
-            for j in range(0, w - pw + 1, sw):
-                for k in range(0, d - pd + 1, sd):
-                    patch = x[:, :, i : i + ph, j : j + pw, k : k + pd]
-                    patches.append(patch)
+        for i in _starts(h, ph, sh):
+            for j in _starts(w, pw, sw):
+                for k in _starts(d, pd, sd):
+                    patches.append(x[:, :, i : i + ph, j : j + pw, k : k + pd])
                     positions.append((i, j, k))
-
-        # Handle boundaries with padding
-        # Right/bottom/depth boundaries
-        for i in range(0, h - ph + 1, sh):
-            for j in range(0, w - pw + 1, sw):
-                if d + pd > x.shape[4]:  # depth boundary
-                    i_start = max(0, h - ph)
-                    j_start = max(0, w - pw)
-                    k_start = max(0, d - pd)
-                    patch = x[
-                        :,
-                        :,
-                        i_start : i_start + ph,
-                        j_start : j_start + pw,
-                        k_start : k_start + pd,
-                    ]
-                    if (i_start, j_start, k_start) not in positions:
-                        patches.append(patch)
-                        positions.append((i_start, j_start, k_start))
 
         return patches, positions
 

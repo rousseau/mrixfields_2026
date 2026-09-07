@@ -61,7 +61,7 @@ def load_prospective_volume(
     field: str,
     subject_id: str,
 ) -> Optional[np.ndarray]:
-    """Load, normalize and return a prospective volume as float32 numpy in [0,1]."""
+    """Load, normalize and return a prospective volume as float32 numpy in [-1,1]."""
     data_root = Path(data_root)
     vol_dir = data_root / "Training_prospective" / modality / field
     if not vol_dir.exists():
@@ -74,11 +74,20 @@ def load_prospective_volume(
     nii = nib.load(str(candidates[0]))
     vol = nii.get_fdata(dtype=np.float32)
 
-    # Percentile normalization → [0, 1]
+    # Percentile normalization → [-1, 1]
+    #
+    # CORRIGÉ LE 2026-09-07. Ce banc renvoyait [0, 1], alors que le contrat de la
+    # maison est [-1, 1] (`models/vae_base.py:74` : « single-channel 3D volume,
+    # range [-1, 1] »), que `common/io.py::normalize_volume` applique bien `*2-1`,
+    # et que la recette amont de MedVAE fait `ScaleIntensity(0,1)` PUIS
+    # `Normalize(mean=0.5, std=0.5)` (`medvae/utils/loaders.py::load_mri_3d`).
+    # Les VAE étaient donc évalués hors de leur distribution d'entraînement, ce qui
+    # invalide `results/benchmark_vae/metrics/benchmark_results{,_legacy}.csv` et le
+    # classement de `docs/VAE_PERFORMANCE.md` qui en découle.
     p_lo, p_hi = np.percentile(vol, 0.5), np.percentile(vol, 99.5)
     vol = np.clip(vol, p_lo, p_hi)
     vol = (vol - p_lo) / (p_hi - p_lo + 1e-8)
-    return vol.astype(np.float32)
+    return (vol * 2.0 - 1.0).astype(np.float32)
 
 
 def crop_or_pad(vol: np.ndarray, target: tuple) -> np.ndarray:
@@ -121,11 +130,11 @@ def save_reconstruction_figure(
     ]
 
     for i, (o_slice, r_slice, name) in enumerate(views):
-        axes[i, 0].imshow(o_slice, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[i, 0].imshow(o_slice, cmap="gray", vmin=-1.0, vmax=1.0)
         axes[i, 0].set_title(f"{name} - original")
         axes[i, 0].axis("off")
 
-        axes[i, 1].imshow(r_slice, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[i, 1].imshow(r_slice, cmap="gray", vmin=-1.0, vmax=1.0)
         axes[i, 1].set_title(f"{name} - recon")
         axes[i, 1].axis("off")
 
@@ -144,7 +153,7 @@ def encode_decode(
     device: torch.device,
     use_patched: bool,
 ) -> np.ndarray:
-    """Run encode-decode on a volume; return reconstruction as numpy float32 in [0,1]."""
+    """Run encode-decode on a volume; return reconstruction as numpy float32 in [-1,1]."""
     if use_patched:
         vae_wrapped = PatchedVAE(vae, patch_size=PATCH_SIZE, overlap=PATCH_OVERLAP)
         vae_wrapped = vae_wrapped.to(device)
@@ -162,8 +171,11 @@ def encode_decode(
         # Reverse crop: pad back to original vol shape for fair metric computation
         vol = vol_crop  # compare against the cropped version for consistency
 
-    # Clip to [0, 1]
-    xhat = np.clip(xhat, 0.0, 1.0)
+    # Clip to [-1, 1] — la plage de sortie du VAE, cf. la normalisation d'entree.
+    # Clipper a [0, 1] (ancien comportement) ecrasait toute la moitie negative de la
+    # reconstruction et rendait les metriques inexploitables des lors que l'entree est
+    # correctement en [-1, 1].
+    xhat = np.clip(xhat, -1.0, 1.0)
     return vol, xhat
 
 

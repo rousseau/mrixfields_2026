@@ -432,6 +432,9 @@ def flat_latent_cache_id(
     p_lo: float,
     p_hi: float,
     field_norm_stats_path: Optional[str] = None,
+    encode_tile=None,
+    encode_tile_margin: Optional[int] = None,
+    amp_dtype: Optional[str] = None,
 ) -> str:
     """Cache identifier for FlatLatentCacheDataset — shared by
     precompute_mmfm_latents.py (writer) and train_mmfm_3d.py (reader) so both
@@ -444,6 +447,35 @@ def flat_latent_cache_id(
     (see normalize_volume_fixed). Included in the hash so switching between
     per-volume and per-field normalization always yields a fresh cache_id
     rather than silently reusing latents encoded under the other scheme.
+
+    encode_tile / encode_tile_margin / amp_dtype — AJOUTÉS LE 2026-09-07, et la
+    collision qu'ils réparent avait DÉJÀ servi.
+
+    Le SCHÉMA D'ENCODAGE ne faisait pas partie de la clé, alors que les deux
+    scripts d'écriture n'encodent pas de la même façon :
+      - `precompute_unet_latents.py:162` appelle `tiled_encode` (tuiles jointives
+        96x112x96 + marge de contexte 16) ;
+      - `precompute_mmfm_latents.py:149` appelle `vae.encode` DIRECTEMENT, donc la
+        fenêtre glissante gaussienne interne de MedVAE (`roi_size_calc`,
+        `gpu_dim=160`) — une troisième géométrie, à fenêtres recouvrantes.
+    Les deux sortent en `flat_dim=129024`, donc aucune vérification de forme ne
+    bronche. Et les deux produisaient le MÊME identifiant.
+
+    Conséquence déjà consommée : `medvae_finetune_1989e9d1` (adoption LPIPS,
+    2026-09-02) et `medvae_finetune_ff550d64` (cache sans normalisation,
+    2026-09-06) ont été écrits par `precompute_mmfm_latents.py`, donc NON TUILÉS,
+    puis comparés à `medvae_finetune_c4d1e200` qui l'est. Les deux verdicts
+    négatifs de ces campagnes portaient donc deux variables et pas une. L'écart
+    entre les deux schémas est mesuré : 0.1140 contre 0.1168 de nRMSE sur la
+    tranche notée (`results/mmfm/representation_20260906/manifest.md`).
+
+    NOTE DE COMPATIBILITÉ : les répertoires de cache existants portent des noms
+    produits par l'ANCIENNE clé, que cette fonction ne peut plus reproduire. Ils
+    restent utilisables — les configs de production fixent `latent_cache_dir` en
+    dur — et c'est `index.json` qui fait foi sur leur provenance (il porte
+    désormais `encode_tile`/`encode_tile_margin`/`amp_dtype`/`encode_scheme`).
+    Le garde-fou qui protège réellement est
+    `infer_mmfm_unified._check_cache_consistency`, pas le nom du répertoire.
     """
     vae_cfg = cfg.get("vae", {})
     key = "|".join([
@@ -454,6 +486,9 @@ def flat_latent_cache_id(
         f"{p_lo}",
         f"{p_hi}",
         f"field_norm={field_norm_stats_path or ''}",
+        f"tile={tuple(encode_tile) if encode_tile else None}",
+        f"margin={encode_tile_margin}",
+        f"amp={amp_dtype or ''}",
     ])
     h = _hashlib.sha1(key.encode()).hexdigest()[:8]
     return f"{vae_cfg.get('vae_type', 'vae')}_{h}"

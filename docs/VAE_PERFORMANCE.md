@@ -1,3 +1,11 @@
+> **⚠️ INVALIDE — marqué le 2026-09-07.** Le classement ci-dessous provient de
+> `src/vae3d/benchmark_vae.py`, qui alimentait les VAE en [0, 1] au lieu de [−1, 1]
+> (+21 % de nRMSE mesurés) et dont `PatchedVAE` laissait 14.89 % des voxels à zéro
+> tout en les comptant dans les métriques. La recommandation « Pythae_VAE » n'a pas
+> d'autre source que ce banc et n'est donc **pas** étayée.
+> Détail : `results/benchmark_vae/INVALIDE.md`. Référence de remplacement :
+> `results/mmfm/representation_20260906/manifest.md`.
+
 # VAE Performance Benchmarks — MRIxFields 2026
 
 ## Overall Ranking (by Mean MAE on prospective data)

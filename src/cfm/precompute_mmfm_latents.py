@@ -90,9 +90,26 @@ def main():
     print("Chargement du VAE...")
     vae = load_vae(cfg, device)
 
+    # ATTENTION — CE SCRIPT NE TUILE PAS. `vae.encode(x)` ci-dessous passe par la
+    # fenêtre glissante gaussienne interne de MedVAE (`roi_size_calc`, `gpu_dim=160`),
+    # pas par `tiled_encode`. Ce n'est donc PAS le chemin d'encodage de la production :
+    # le cache de production `medvae_finetune_c4d1e200` a été produit par
+    # `precompute_unet_latents.py` (qui tuile) puis aplati par
+    # `convert_unet_cache_to_flat.py`. Écart mesuré entre les deux schémas :
+    # 0.1140 contre 0.1168 de nRMSE sur la tranche notée
+    # (`results/mmfm/representation_20260906/manifest.md`).
+    #
+    # Jusqu'au 2026-09-07 le schéma d'encodage n'entrait pas dans la clé de cache, de
+    # sorte que les caches `1989e9d1` (LPIPS) et `ff550d64` (identity) — écrits par ce
+    # script, donc non tuilés — ont été comparés à `c4d1e200` qui l'est. Les deux
+    # verdicts négatifs correspondants portaient deux variables et pas une.
+    #
+    # `encode_tile=None` ci-dessous dit la vérité sur ce que ce script fait ; pour
+    # reproduire la production, utiliser precompute_unet_latents.py + conversion.
     cache_id = flat_latent_cache_id(
         cfg, target_spacing, volume_size, p_lo, p_hi,
         field_norm_stats_path=args.field_norm_stats,
+        encode_tile=None, encode_tile_margin=None, amp_dtype=amp_dtype_name,
     )
     cache_dir = Path(args.cache_root) / cache_id / split
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -176,6 +193,15 @@ def main():
         "percentile_lower": p_lo,
         "percentile_upper": p_hi,
         "field_norm_stats_path": args.field_norm_stats,
+        "vae_checkpoint": cfg.get("vae", {}).get("checkpoint"),
+        # PROVENANCE DE L'ENCODAGE (2026-09-07). Sans ces champs, rien dans le cache
+        # ne disait avec quel schéma il avait été encodé — et deux schémas
+        # incompatibles portaient le même `cache_id`. C'est `index.json` qui fait
+        # foi : `_check_cache_consistency` le relit avant toute inférence.
+        "encode_scheme": "medvae_sliding_window",
+        "encode_tile": None,
+        "encode_tile_margin": None,
+        "amp_dtype": amp_dtype_name,
         "samples": index,
     }
     index_path = cache_dir / "index.json"

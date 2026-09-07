@@ -804,6 +804,8 @@ def train(
             cache_id = flat_latent_cache_id(
                 cfg, target_spacing, volume_size, p_lo, p_hi,
                 field_norm_stats_path=field_norm_stats_path,
+                encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
+                amp_dtype=amp_dtype_name,
             )
             cache_dir = cache_root / cache_id / split
         ds_cfg = dict(data_cfg)
