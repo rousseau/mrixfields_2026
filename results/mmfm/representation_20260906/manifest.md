@@ -212,12 +212,18 @@ avec un décalage systématique de **+0.0135** (0.1184 contre 0.1048), de même 
 |---|---|---|
 | moyenne, volume entier | 0.1048 | 0.1184 |
 
-Deux causes possibles, non départagées ici : le banc ne porte que sur le sujet 0006
-alors que le chiffre publié moyenne 3 sujets, et le chemin publié passe par
-`infer_mmfm_unified` (recomposition par patches pondérés possible) là où le banc
-utilise le crop centré. **L'écart ne change aucune conclusion de cette page** : toutes
-les variantes empruntent le même chemin, donc les différences entre variantes sont
-valides même si le niveau absolu diffère de 13 % du chiffre publié.
+**CAUSE TROUVÉE (2026-09-07 soir).** L'hypothèse posée ici au conditionnel — « le
+chemin publié passe par `infer_mmfm_unified` (recomposition par patches pondérés
+possible) là où le banc utilise le crop centré » — **est confirmée**. Le plafond publié
+a été produit par `scripts/run_task3_eval.sh`, qui ne passe pas `--center_crop_only` :
+`outputs/mmfm/ceiling_vectorized` tourne à **104.0 s/volume**, contre 16–17 s/volume
+pour les runs en crop centré. C'est un facteur 6.3, soit exactement 8 passes. Voir
+l'entrée du 2026-09-07 (soir) du CHANGELOG.
+
+**L'écart ne change aucune conclusion de cette page** : toutes les variantes du banc
+empruntent le même chemin, donc les différences entre variantes restent valides. Ce
+qu'il change, c'est le statut du chiffre publié : **0.1048 et 0.1184 ne mesurent pas
+la même chaîne**, et c'est le premier qui est hors norme par rapport au reste du dépôt.
 
 ---
 

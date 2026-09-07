@@ -36,9 +36,9 @@ plus bête possible** — une grille basse résolution ré-interpolée linéaire
 | INR, Adam sur `z` via le hypernetwork | 512 | *0.4341* | *0.4809* | *13.83* (diverge) |
 | INR, modulation DIRECTE (shift), Adam | 1 536 | 0.1396 | 0.7796 | 23.72 |
 | + `modulate_scale` | 3 072 | 0.1268 | 0.7962 | 24.61 |
-| + LoRA rang 4 | ~13 k | 0.1019 | 0.8525 | 26.61 |
-| + LoRA rang 16 | ~51 k | 0.0737 | 0.9027 | 29.45 |
-| **+ LoRA rang 64** | **~200 k** | **0.0531** | **0.9351** | **32.32** |
+| + LoRA rang 4 | 12 812 | 0.1019 | 0.8525 | 26.61 |
+| + LoRA rang 16 | 46 640 | 0.0737 | 0.9027 | 29.45 |
+| **+ LoRA rang 64** | **181 952** | **0.0531** | **0.9351** | **32.32** |
 | *témoin trivial : grille 48×56×48* | *129 024* | *0.0954* | *0.8889* | *27.21* |
 | **MedVAE pré-entraîné** | 129 024 | 0.0587 | 0.9551 | 31.82 |
 | **MedVAE affiné LPIPS** | 129 024 | 0.0503 | 0.9673 | 33.14 |
@@ -52,7 +52,7 @@ puisque 82 % du volume est du fond plat trivialement reconstruit :
 |---|---|---|
 | *témoin trivial 11×13×11* | *1 536* | *0.6641* |
 | INR production | 512 | 0.4367 |
-| + LoRA rang 64 | ~200 k | 0.1548 |
+| + LoRA rang 64 | 181 952 | 0.1548 |
 | *témoin trivial 48×56×48* | *129 024* | *0.2835* |
 | MedVAE pré-entraîné | 129 024 | 0.1832 |
 | MedVAE affiné LPIPS | 129 024 | 0.1576 |
@@ -103,8 +103,8 @@ famille de modèles**. Aucun correctif de mécanisme INR ne pouvait combler 252�
 
 ### 2. La capacité est le levier, et l'échelle est monotone et raide
 
-De 1 536 à 200 000 valeurs de modulation : **+8.6 dB** (23.72 → 32.32), sans toucher aux
-poids du SIREN, sans réentraîner quoi que ce soit. À ~200 k valeurs, l'INR **dépasse
+De 1 536 à 181 952 valeurs de modulation : **+8.6 dB** (23.72 → 32.32), sans toucher aux
+poids du SIREN, sans réentraîner quoi que ce soit. À 181 952 valeurs, l'INR **dépasse
 MedVAE pré-entraîné** (32.32 contre 31.82) et approche le MedVAE perceptuel (33.14).
 
 Le code disait déjà où était le levier (`inr_backbone.py:150`, « le seul levier qui fasse
@@ -162,9 +162,23 @@ Le schéma Functa/MedFuncta est déjà implémenté (`inr_backbone.py:341` : `hy
 ```yaml
 inr_backbone:
   hyper_hidden_dim: 0        # supprime le goulot de rang 512 ET les 66 M paramètres
-  lora_rank: 16              # modulation_dim ~51k  (ou 64 -> ~200k)
-  latent_dim: 51456          # doit égaler modulation_dim quand hyper_hidden_dim=0
+  lora_rank: 16              # modulation_dim = 46 640  (ou 64 -> 181 952)
+  latent_dim: 46640          # doit égaler modulation_dim quand hyper_hidden_dim=0
 ```
+
+**Les valeurs exactes**, à ne pas recalculer de tête (`ModulatedSIREN.modulation_dim`,
+`hidden_dim=256`, `num_hidden_layers=6`, donc `Σ fout = 1536` et `Σ fin = 3 + 5×256 = 1283`) :
+
+| `lora_rank` | `modulation_dim` = `latent_dim` requis |
+|---|---|
+| 4 | **12 812** |
+| 16 | **46 640** (48 176 avec `modulate_scale`) |
+| 64 | **181 952** (183 488 avec `modulate_scale`) |
+
+*(Une version antérieure de cette page annonçait `latent_dim: 51456` — valeur fausse,
+qu'aucune combinaison ne produit et qui aurait fait échouer `INRBackbone.__init__` par
+`ValueError` au premier lancement. Les valeurs ci-dessus sont celles que la colonne
+`capacity` de `cells.csv` porte effectivement.)*
 
 et, dans `train_inr_backbone.py`, passer un générateur qui **avance à chaque pas** pour
 que `θ` voie autre chose que 0.198 % du volume.

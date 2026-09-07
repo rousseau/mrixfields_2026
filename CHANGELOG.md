@@ -63,6 +63,68 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-07 (soir) — **Le tableau de référence compare DEUX géométries d'inférence. Vérifié par la durée des runs.**
+
+**Verdict : à partir du 2026-08-27, tous les chiffres passés par
+`scripts/run_task3_eval.sh` ont été produits en 8 fenêtres décalées fusionnées
+par Hann, pendant que les chiffres antérieurs l'étaient en crop centré unique.
+Les deux familles sont comparées dans le même tableau.**
+
+`--center_crop_only` est déclaré `action="store_true"` sans `default=None`
+(`infer_mmfm_unified.py:767`) et n'est jamais lu par `_flag()` : **aucune clé de
+config ne peut l'activer**, il faut le taper. `scripts/run_task3_eval.sh:37-43` ne
+le tape pas. La branche par défaut (`infer_mmfm_unified.py:355-372`) découpe 8
+fenêtres décalées de −16 à +7 voxels et les fusionne par produit de Hann, alors
+que **tout le cache de latents a été encodé sur un crop centré unique**
+(`precompute_*_latents.py:154`).
+
+### La signature est binaire, et je l'ai mesurée moi-même
+
+Écart médian entre fichiers de prédiction consécutifs, robuste aux reprises :
+
+| run | s/volume | géométrie |
+|---|---|---|
+| `compare_20260905/production` (`--center_crop_only` documenté) | **16.0** | crop centré |
+| `compare_20260905/trajectory_l1` (idem) | **16.0** | crop centré |
+| `mmfm/vectorized` (production, 0.3794) | **17.0** | crop centré |
+| `mmfm/inr_std` (0.3749) | **9.0** | crop centré |
+| **`mmfm/vec_rbest`** (R-best, **0.3737**) | **104.0** | **8 fenêtres** |
+| **`mmfm/ceiling_vectorized`** (plafond **0.1048**) | **104.0** | **8 fenêtres** |
+| `mmfm/vec_lpips`, `vec_batch8`, `ceiling_lpips` | 104.0 | 8 fenêtres |
+
+Rapport 6.1–6.5× entre les deux familles, exactement 8 passes plus le coût fixe
+d'E/S. La coupure est chronologique et sans exception : elle tombe le 2026-08-27,
+date de création du pilote.
+
+### Ce que cela touche
+
+- **R-best 0.3737**, désigné meilleur flow dans `AGENTS.md`, est comparé à
+  « production 0.3794 » qui est en crop centré. **L'écart de 0.0057 n'est pas
+  attribuable** : il mélange le réglage et la géométrie.
+- **Le plafond de représentation 0.1048** (et son successeur LPIPS 0.0976), cités
+  partout depuis le 2026-08-27, sont en 8 fenêtres.
+- Cela **explique l'écart resté ouvert hier** : le banc
+  `results/mmfm/representation_20260906/` donnait 0.1184 contre 0.1048 publié,
+  « +0.0135, même signe sur 13 cellules sur 15 », avec l'hypothèse écrite au
+  conditionnel « le chemin publié passe par `infer_mmfm_unified` (recomposition
+  par patches pondérés possible) ». **L'hypothèse est confirmée.**
+
+### Ce que cela ne touche PAS
+
+L'entrée du 2026-09-05 (« la recette d'inférence ne comptait pas : 0.3581 contre
+0.3584, soit 0.0003 ») comparait **deux runs en crop centré** — les fichiers
+stockés de `mmfm/vectorized` sont à 17.0 s/volume. Elle ne mesure donc **pas**
+l'effet des 8 fenêtres, qui reste inconnu.
+
+### Correctif
+
+Une ligne dans `scripts/run_task3_eval.sh`. Mais la question ouverte n'est pas le
+correctif : c'est **de combien** les 8 fenêtres déplacent le score, et donc si le
+classement des variantes tient. Une seule ré-inférence de `vec_rbest` avec le
+drapeau (49 min mesurées) le dit.
+
+---
+
 ## 2026-09-07 — **Validation de la couche de représentation : le VAE est bon, l'INR est affamé, et le « plafond » mesurait surtout le protocole**
 
 **Verdict : les deux briques de représentation fonctionnent correctement pour ce
@@ -167,9 +229,9 @@ ré-interpolée).
 | INR, 200 pas de SGD | 512 | 0.1417 | 0.4276 | 23.61 |
 | INR, modulation directe (Adam) | 1 536 | 0.1396 | 0.4062 | 23.72 |
 | + `modulate_scale` | 3 072 | 0.1268 | 0.3748 | 24.61 |
-| + LoRA rang 4 | ~13 k | 0.1019 | 0.3086 | 26.61 |
-| + LoRA rang 16 | ~51 k | 0.0737 | 0.2203 | 29.45 |
-| **+ LoRA rang 64** | **~200 k** | **0.0531** | **0.1548** | **32.32** |
+| + LoRA rang 4 | 12 812 | 0.1019 | 0.3086 | 26.61 |
+| + LoRA rang 16 | 46 640 | 0.0737 | 0.2203 | 29.45 |
+| **+ LoRA rang 64** | **181 952** | **0.0531** | **0.1548** | **32.32** |
 | *témoin trivial 48×56×48* | *129 024* | *0.0954* | *0.2835* | *27.21* |
 | **MedVAE pré-entraîné** | 129 024 | 0.0587 | 0.1832 | 31.82 |
 | **MedVAE affiné LPIPS** | 129 024 | 0.0503 | 0.1576 | 33.14 |
@@ -243,7 +305,7 @@ architectures**. Le présent banc les remplace pour cette question.
 1. **`hi` × 1.25 dans `field_norm_stats.json` + checkpoint LPIPS** — −21.0 % de
    l'erreur de représentation, SSIM +0.024, **coût : régénérer le cache de latents**
    (~5 h 30) et réentraîner le flow (~2 h). Aucun code à écrire.
-2. **INR : `hyper_hidden_dim: 0` + `lora_rank: 16` à `64`, `latent_dim = modulation_dim`**
+2. **INR : `hyper_hidden_dim: 0` + `lora_rank: 16` (`latent_dim: 46640`) ou `64` (`latent_dim: 181952`)**
    — options déjà présentes, jamais activées. Supprime d'un coup le goulot de rang 512
    ET les 66 M paramètres du hypernetwork (1 Go de checkpoint, 0.98 s/itération).
    Attention à l'initialisation LoRA : `fit_latent` part de `z = 0`, donc `A` et `B`
