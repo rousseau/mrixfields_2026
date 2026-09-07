@@ -100,6 +100,7 @@ depuis le 2026-08-26, est confirmé en ordre de grandeur et mal attribué.
 | **production** | 0.0597 | 0.1140 | référence |
 | échantillon → **mode** de la postérieure | 0.0597 | 0.1139 | **neutre** |
 | bfloat16 → **float32** | 0.0597 | 0.1140 | **neutre** |
+| marge de contexte 16 → **32** | 0.0594 | 0.1138 | **neutre** (−0.0003, +0.043 dB) |
 | tuilage maison → **fenêtre glissante officielle** | 0.0599 | 0.1168 | **le maison gagne**, et 1.7× plus vite |
 | **recette officielle complète** (min-max + CropForeground) | 0.0737 | 0.1509 | **+32 %, nettement pire** |
 | percentile + CropForeground | 0.1167 | 0.1215 | `CropForeground` coûte **4.7 dB** |
@@ -269,7 +270,10 @@ de VAE 3D. Tous mesurés, tous neutres ou négatifs.
   Ne pas écrire « nous faisons mieux que le papier ».
 - Le bras `prod_margin32` **ne mesurait pas la marge** : à marge 32 la tuile élargie
   fait 176 sur l'axe W et MedVAE la re-découpe en fenêtres de 88 (`roi_size_calc`,
-  `gpu_dim=160`). Vérifié. Bras propres relancés avec `gpu_dim=256`.
+  `gpu_dim=160`). Vérifié, puis **repris proprement** avec `gpu_dim=256` (une seule
+  fenêtre des deux côtés) : marge 32 − marge 16 = **−0.0003 nRMSE, +0.043 dB**. La
+  conclusion tient, elle est maintenant établie. Le piège, lui, reste armé pour toute
+  future expérience qui dépasserait 160 sur un axe.
 - Les chiffres `mod_*` sont obtenus sur le SIREN **gelé** de production, méta-entraîné
   pour une modulation par décalage seul : ce sont des **planchers**, pas des plafonds.
 - **`scripts/run_task3_eval.sh` ne passe pas `--center_crop_only`** alors que tous les

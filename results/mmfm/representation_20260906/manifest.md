@@ -111,12 +111,23 @@ convolutions complètent par des zéros.
 | 32 | 160×176×160 | 160×**88**×160 — **re-découpé en fenêtres glissantes** |
 
 Le chiffre 0.1137 est donc celui de « marge 32 **+ sous-tuilage en W** », pas celui de
-la marge. La conclusion « augmenter la marge ne sert à rien » **n'était pas établie**.
-Les bras `prod_margin16_clean` / `prod_margin32_clean` (`gpu_dim = 256`, une seule
-fenêtre dans les deux cas) la tranchent proprement — voir
-`results/mmfm/representation_20260906_d/`.
+la marge. La conclusion « augmenter la marge ne sert à rien » n'était pas établie.
 
-La production, elle, est bien dans le régime propre : à marge 16 tout passe sous 160.
+**Reprise propre** (`gpu_dim = 256`, une seule fenêtre dans les deux cas, 15 volumes,
+`results/mmfm/representation_20260906_d/`) :
+
+| | VAE seul nRMSE | SSIM | PSNR | chaîne notée |
+|---|---|---|---|---|
+| marge 16 | 0.0597 | 0.9414 | 31.43 | 0.1140 |
+| marge 32 | 0.0594 | 0.9419 | 31.47 | 0.1138 |
+| **écart** | **−0.00030** | +0.0005 | **+0.043 dB** | −0.0002 |
+
+**La conclusion tient : la marge de 16 suffit.** Elle est maintenant établie sur une
+expérience où la marge est la seule variable qui change. Contrôle de cohérence :
+`prod_margin16_clean` (avec `gpu_dim = 256`) donne exactement les mêmes chiffres que
+`prod` — ce qui était attendu, puisqu'à marge 16 la tuile élargie passe déjà sous 160.
+
+La production est donc bien dans le régime propre.
 
 ### Un défaut réel, mais sans effet sur la fidélité
 
