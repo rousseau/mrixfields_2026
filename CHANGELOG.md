@@ -63,7 +63,70 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-07 (nuit) — **Les 8 fenêtres : l'alarme est levée sur le nRMSE, et un LEVIER apparaît là où on ne le cherchait pas**
+
+**Verdict en deux temps.** Le tableau de référence n'est pas corrompu — l'écart entre
+les deux géométries vaut **+0.0005 en région `full`** (26/60 paires, p = 0.37), quatre
+fois sous le plancher de bruit. Mais sur la région **réellement notée**, moyenner 8
+générations décalées vaut **0.0034 de nRMSE** (12/60 paires, p = 3.2e−06) — plus que la
+plupart des effets arbitrés ce dernier mois. Détail :
+`results/mmfm/geometry_20260907/manifest.md`.
+
+**Une seule variable** : même checkpoint R-best, même config, même table de
+normalisation, mêmes 180 volumes. Seul `--center_crop_only` change. Ré-inférence
+complète en 0.80 h à **16.0 s/volume**, contre 104.1 pour le run d'origine — le rapport
+6.5× attendu de 8 passes, ce qui confirme le diagnostic par construction.
+
+**Contrôle passé avant toute comparaison** : les prédictions STOCKÉES rejouées sous
+l'évaluateur d'aujourd'hui, région `full`, redonnent **0.4441 / 0.9042** en T1W, soit
+exactement le chiffre publié le 2026-08-27. L'évaluateur n'a pas bougé.
+
+### Les deux régions
+
+| | 8 fenêtres | crop centré | écart | signes |
+|---|---|---|---|---|
+| **nRMSE, région `full`** | **0.3737** | **0.3742** | **+0.0005** | 26/60, p = 0.37 |
+| SSIM, région `full` | 0.9047 | 0.8987 | −0.0060 | |
+| **nRMSE, région `slab`** | **0.3516** | **0.3550** | **+0.0034** | **12/60, p = 3.2e−06** |
+| SSIM, région `slab` | 0.8499 | 0.8394 | −0.0105 | |
+
+### Ce que ça règle
+
+**L'avance de R-best sur la production (0.0057) tient** : la géométrie n'en explique que
+9 %. « R-best est le meilleur flow » (`AGENTS.md`) reste établi. Et le plafond de
+représentation 0.1048 reste comparable aux scores en région `full`.
+
+Reste que le SSIM et le LPIPS se déplacent de 0.006 et 0.006 en `full`, de 0.010 et
+0.010 en `slab` : **ces deux métriques-là ne sont pas comparables entre les deux
+familles de runs**, et l'inventaire est de 15 runs sur 30 dans chaque camp.
+
+### Ce que ça ouvre, et qui n'était pas la question
+
+> Moyenner 8 générations décalées est une **réduction de variance par ensemble** qui
+> paie 0.0034 sur la région notée, avec p = 3.2e−06.
+
+À situer : flip 0.0001, AdaGN 0.0006, plancher de bruit 0.002, ordre 3 0.0031, les 4
+correctifs du flow 0.0031, **les 8 fenêtres 0.0034**, l1 contre mse 0.0064.
+
+C'était utilisé par accident depuis le 2026-08-27. **C'est maintenant un choix** :
+`scripts/run_task3_eval.sh` prend la géométrie en 6ᵉ argument, défaut `8win`, et
+l'imprime en tête de run. Coût 6.5× le temps machine.
+
+**Réserves.** Un seul checkpoint ; le mécanisme est générique mais son ampleur dépend de
+la corrélation des erreurs entre fenêtres. Le nombre de fenêtres (8) et les décalages
+(−16, +7) viennent de la grille par défaut, jamais balayés. Et le LPIPS va en sens
+inverse du nRMSE et du SSIM — c'est un lissage, pas un gain de netteté.
+
+---
+
 ## 2026-09-07 (soir) — **Le tableau de référence compare DEUX géométries d'inférence. Vérifié par la durée des runs.**
+
+> **SUITE MESURÉE LE MÊME JOUR (entrée « nuit » ci-dessus) : l'alarme portée ici est
+> LEVÉE sur le nRMSE.** L'écart entre les deux géométries vaut +0.0005 en région
+> `full`, celle des chiffres publiés (26/60 paires, p = 0.37) — l'avance de R-best sur
+> la production tient. Elle reste fondée sur le SSIM et le LPIPS (0.006), et sur la
+> région notée où les 8 fenêtres sont MEILLEURES de 0.0034 (p = 3.2e−06). Lire les deux
+> entrées ensemble.
 
 **Verdict : à partir du 2026-08-27, tous les chiffres passés par
 `scripts/run_task3_eval.sh` ont été produits en 8 fenêtres décalées fusionnées

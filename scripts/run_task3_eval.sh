@@ -8,27 +8,46 @@
 # controle unique, EMA non chauffee). Un seul chemin, parametre.
 #
 # Usage :
-#   bash scripts/run_task3_eval.sh <config.yaml> <method> <tag> [outdir] [field_norm_stats.json]
+#   bash scripts/run_task3_eval.sh <config.yaml> <method> <tag> [outdir] \
+#        [field_norm_stats.json] [8win|cc]
 # Exemple :
 #   bash scripts/run_task3_eval.sh configs/mmfm/vectorized_r1_time.yaml \
 #        mmfm3d_vectorized vec_r1_time results/mmfm/staircase_20260827
 #
-# DEUX CORRECTIFS DU 2026-09-07, tous deux mesures :
+# TROIS CORRECTIFS DU 2026-09-07, tous mesures :
 #
-#  1. `--center_crop_only` est desormais passe. Sans lui, `infer_mmfm_unified.py`
-#     decoupe 8 fenetres decalees de -16 a +7 voxels et les fusionne par Hann, alors
-#     que TOUT le cache de latents a ete encode sur un crop centre unique. Mesure sur
-#     l'ecart median entre fichiers de prediction : 104.0 s/volume pour les runs passes
-#     par ce pilote (vec_rbest, vec_lpips, vec_batch8, ceiling_vectorized,
-#     ceiling_lpips) contre 16-17 s/volume pour ceux en crop centre (production,
-#     compare_20260905). Rapport 6.3x, soit exactement 8 passes. Les deux familles
-#     etaient comparees dans le meme tableau. Voir CHANGELOG 2026-09-07 (soir).
+#  1. LA GEOMETRIE EST DESORMAIS EXPLICITE (6e argument), elle etait implicite.
+#     `--center_crop_only` etait declare `action="store_true"` sans `default=None` et
+#     n'etait lu par aucune cle de config : il fallait le taper, et ce pilote ne le
+#     tapait pas. Consequence, mesuree sur l'ecart median entre fichiers de prediction :
+#     104 s/volume pour les 15 runs passes par ce pilote (vec_rbest, vec_r1_time,
+#     vec_batch8, vec_lpips, valid_rbest, ceiling_*, calib_*, ablations n_steps) contre
+#     9-34 s/volume pour les 15 autres. Deux geometries comparees dans le meme tableau,
+#     sans que rien ne le dise.
+#
+#     CE QUE LA MESURE A TRANCHE (results/mmfm/geometry_20260907/, R-best, 180 volumes,
+#     seule la geometrie change) :
+#       - region FULL, celle des chiffres publies : ecart +0.0005, 26/60 paires,
+#         p = 0.37. INDISCERNABLE. Le tableau de reference historique n'est donc PAS
+#         corrompu, et l'avance de R-best sur la production (0.0057) tient.
+#       - region SLAB, celle que le classement note reellement : ecart +0.0034,
+#         12/60 paires, p = 3.2e-06. Les 8 fenetres sont MEILLEURES, de facon
+#         consistante, et de plus que le plancher de bruit (0.002) — plus meme que
+#         AdaGN (0.0006), le flip (0.0001), l'ordre 3 (0.0031) ou les 4 correctifs du
+#         flow (0.0031).
+#
+#     Le defaut reste donc `8win` : moyenner 8 generations decalees est une reduction
+#     de variance qui paie sur la region notee. Ce n'est plus un accident, c'est un
+#     choix, et il coute 6.5x le temps machine. `cc` sert a comparer aux chiffres
+#     anterieurs au 2026-08-27 et va 6.5x plus vite.
 #
 #  2. Le chemin du JSON de normalisation etait CODE EN DUR sur
 #     `configs/mmfm/field_norm_stats.json`. Il sert a normaliser la source ET a
 #     denormaliser la sortie avec les stats du champ CIBLE : evaluer un modele
 #     entraine sous une autre table produit une sortie a la mauvaise echelle, et le
 #     run est perdu. Il est maintenant le 5e argument.
+#
+#  3. La geometrie et la table utilisees sont IMPRIMEES en tete de run.
 set -euo pipefail
 
 CONFIG=${1:?config manquante}
@@ -36,6 +55,13 @@ METHOD=${2:?method manquante}
 TAG=${3:?tag manquant}
 OUTDIR=${4:-results/mmfm/staircase_20260827}
 FIELD_NORM_STATS=${5:-configs/mmfm/field_norm_stats.json}
+GEOMETRY=${6:-8win}          # 8win (defaut, meilleur sur la region notee) | cc
+
+case "$GEOMETRY" in
+  8win) CROP_FLAG=() ;;
+  cc)   CROP_FLAG=(--center_crop_only) ;;
+  *)    echo "GEOMETRY doit valoir '8win' ou 'cc', pas '$GEOMETRY'"; exit 1 ;;
+esac
 
 cd "$(dirname "$0")/.."
 export PYTHONPATH=src
@@ -53,7 +79,9 @@ echo "=== $TAG ==="
 echo "config           : $CONFIG"
 echo "checkpoint       : $CKPT"
 echo "field_norm_stats : $FIELD_NORM_STATS"
-echo "geometrie        : crop centre unique (--center_crop_only)"
+if [ "$GEOMETRY" = "cc" ]; then GEO_DESC="un seul crop centre, comme le cache"
+else GEO_DESC="8 fenetres decalees fusionnees par Hann"; fi
+echo "geometrie        : $GEOMETRY  ($GEO_DESC)"
 
 echo "--- inference (3 contrastes, 20 paires, 3 sujets) ---"
 python src/cfm/infer_mmfm_unified.py \
@@ -62,7 +90,7 @@ python src/cfm/infer_mmfm_unified.py \
     --split Training_prospective \
     --modalities T1W T2W T2FLAIR \
     --field_norm_stats "$FIELD_NORM_STATS" \
-    --center_crop_only \
+    "${CROP_FLAG[@]}" \
     --skip_existing
 
 # ATTENTION : `--skip_existing` ne recalcule rien si les predictions existent deja.
