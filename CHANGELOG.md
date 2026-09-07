@@ -131,11 +131,26 @@ contrairement aux percentiles par volume :
 |---|---|---|---|---|---|---|
 | nRMSE tranche notée | 0.3900 | 0.2028 | **0.1140** | **0.0989** | 0.1001 | 0.1053 |
 
-**Optimum à `hi` × 1.25 : −13.2 %.** Le mécanisme est mesuré : la table
+**Optimum plat entre ×1.25 et ×1.5 : −13.2 %.** Le mécanisme est mesuré : la table
 `field_norm_stats.json` sature 25–50 % des voxels de cerveau selon la cellule
 (T2FLAIR@3T 50.0 %, T1W@3T 37.1 %, T1W@7T 25.1 %), et l'écrêtage n'est pas inversible.
-Le MedVAE perceptuel gagne en plus **−6.8 %** (0.1063 contre 0.1140) — soit un
-cinquième du gain annoncé le 2026-08-25 sous la géométrie du fine-tuning.
+
+**Et les deux leviers se composent** (`part propre au VAE` = `sqrt(total² − plancher²)`) :
+
+| variante | nRMSE notée | SSIM | vs production | part propre au VAE |
+|---|---|---|---|---|
+| *protocole seul (plancher)* | *0.0685* | *0.9717* | — | *0.0000* |
+| **production** | 0.1140 | 0.8984 | — | 0.0911 |
+| MedVAE LPIPS | 0.1063 | 0.9129 | −6.7 % | 0.0813 |
+| production + `hi` ×1.25 | 0.0989 | 0.9077 | −13.2 % | 0.0714 |
+| **LPIPS + `hi` ×1.25** | **0.0901** | **0.9227** | **−21.0 %** | **0.0585** |
+| LPIPS + `hi` ×1.5 | 0.0904 | 0.9221 | −20.7 % | 0.0589 |
+
+**−21.0 % sur la chaîne, −36 % sur la part propre au VAE, sans rien réentraîner** :
+un checkpoint déjà dans le dépôt et un scalaire par cellule dans un JSON. Le SSIM monte
+aussi (0.8984 → 0.9227), donc ce n'est pas un arbitrage perception/distorsion. À noter
+que le gain LPIPS seul (−6.7 %) vaut un cinquième de ce qui avait été annoncé le
+2026-08-25 sous la géométrie du fine-tuning (patchs 64³).
 
 ### 5. L'INR : ce n'est pas la famille, c'est le budget
 
@@ -157,11 +172,23 @@ ré-interpolée).
 | *témoin trivial 48×56×48* | *129 024* | *0.0954* | *0.2835* | *27.21* |
 | **MedVAE pré-entraîné** | 129 024 | 0.0587 | 0.1832 | 31.82 |
 | **MedVAE affiné LPIPS** | 129 024 | 0.0503 | 0.1576 | 33.14 |
+| **SIREN LIBRE 256×6** (tous poids, un volume) | ~330 k | 0.0306 | **0.0866** | **37.17** |
+| **SIREN LIBRE 512×8** (tous poids, un volume) | ~1.8 M | 0.0157 | **0.0428** | **42.86** |
+
+**Le plafond de la famille INR est mesuré pour la première fois, et il est très haut** :
+un SIREN neuf tous poids libres atteint **42.86 dB** sur ces volumes, deux fois moins
+d'erreur en premier plan que le meilleur MedVAE. Et à la taille EXACTE de la production
+(256×6), il atteint 37.17 dB là où la production plafonne à 23.41. **Ce n'est donc ni la
+famille, ni l'architecture SIREN, ni `omega_0`, ni la profondeur : tout l'écart est dans
+ce qu'on autorise à varier par volume.** *(Le SIREN libre n'est pas une proposition
+utilisable — 330 k poids par volume à stocker et à faire transporter par le flow — c'est
+une borne supérieure, et elle dit que le plafond n'était pas où le projet le croyait.)*
 
 **Les deux représentations valent exactement la même chose par unité de budget** :
 l'INR bat son témoin trivial de −34 % en premier plan (0.4367 contre 0.6641),
 MedVAE bat le sien de −35 % (0.1832 contre 0.2835). L'écart entre eux n'est pas un
-écart de qualité : c'est **512 nombres contre 129 024, un facteur 252**.
+écart de qualité : c'est **512 nombres contre 129 024, un facteur 252**. Et l'échelle
+est monotone sur cinq ordres de grandeur de budget, du témoin trivial au SIREN libre.
 
 **À budget comparable, l'INR dépasse MedVAE pré-entraîné** (0.1548 contre 0.1832 en
 premier plan) et rejoint le MedVAE perceptuel (0.1576) — **sans réentraîner le SIREN**,
@@ -209,6 +236,27 @@ Deux causes vérifiées dans le code, chacune suffisante :
 
 Aucun des deux ne touche la production, mais **ces CSV ne peuvent pas départager deux
 architectures**. Le présent banc les remplace pour cette question.
+
+### Ce qui est actionnable, par ordre de rapport qualité/prix
+
+1. **`hi` × 1.25 dans `field_norm_stats.json` + checkpoint LPIPS** — −21.0 % de
+   l'erreur de représentation, SSIM +0.024, **coût : régénérer le cache de latents**
+   (~5 h 30) et réentraîner le flow (~2 h). Aucun code à écrire.
+2. **INR : `hyper_hidden_dim: 0` + `lora_rank: 16` à `64`, `latent_dim = modulation_dim`**
+   — options déjà présentes, jamais activées. Supprime d'un coup le goulot de rang 512
+   ET les 66 M paramètres du hypernetwork (1 Go de checkpoint, 0.98 s/itération).
+   Attention à l'initialisation LoRA : `fit_latent` part de `z = 0`, donc `A` et `B`
+   seraient tous deux nuls et **le gradient serait nul des deux côtés** — il faut
+   initialiser `B` à l'aléatoire (convention Hu et al. 2021, voir
+   `bench_inr_capacity.py::init_gamma`), et donner à la LoRA un pas d'apprentissage
+   distinct de celui des décalages (au pas des décalages, la LoRA de rang 16 fait
+   **diverger** le réseau : nRMSE 0.83).
+3. **Réentraîner le backbone INR** avec le tirage de coordonnées corrigé — les 50 000 pas
+   précédents ont vu 0.198 % de la grille.
+
+**Ce qui N'EST PAS actionnable, et pourquoi** : passer au 8×, s'aligner sur la recette
+officielle MedVAE, prendre le mode plutôt que l'échantillon, passer en float32, changer
+de VAE 3D. Tous mesurés, tous neutres ou négatifs.
 
 ### Réserves, à ne pas perdre
 

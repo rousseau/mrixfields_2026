@@ -42,8 +42,49 @@ plus bête possible** — une grille basse résolution ré-interpolée linéaire
 | *témoin trivial : grille 48×56×48* | *129 024* | *0.0954* | *0.8889* | *27.21* |
 | **MedVAE pré-entraîné** | 129 024 | 0.0587 | 0.9551 | 31.82 |
 | **MedVAE affiné LPIPS** | 129 024 | 0.0503 | 0.9673 | 33.14 |
+| **SIREN LIBRE 256×6** (tous poids, un volume) | ~330 k | **0.0306** | 0.9710 | **37.17** |
+| **SIREN LIBRE 512×8** (tous poids, un volume) | ~1.8 M | **0.0157** | **0.9905** | **42.86** |
+
+Et la même échelle en **erreur restreinte au premier plan** — la seule honnête ici,
+puisque 82 % du volume est du fond plat trivialement reconstruit :
+
+| représentation | budget | nRMSE premier plan |
+|---|---|---|
+| *témoin trivial 11×13×11* | *1 536* | *0.6641* |
+| INR production | 512 | 0.4367 |
+| + LoRA rang 64 | ~200 k | 0.1548 |
+| *témoin trivial 48×56×48* | *129 024* | *0.2835* |
+| MedVAE pré-entraîné | 129 024 | 0.1832 |
+| MedVAE affiné LPIPS | 129 024 | 0.1576 |
+| **SIREN libre 256×6** | ~330 k | **0.0866** |
+| **SIREN libre 512×8** | ~1.8 M | **0.0428** |
 
 ---
+
+## Le plafond de la famille INR, mesuré pour la première fois
+
+Un SIREN **neuf**, tous poids libres, ajusté sur UN volume (3 000 pas d'Adam) :
+
+| | nRMSE | premier plan | SSIM | PSNR |
+|---|---|---|---|---|
+| taille de production (256×6, ~330 k) | 0.0306 | 0.0866 | 0.9710 | **37.17 dB** |
+| plus grand (512×8, ~1.8 M) | 0.0157 | **0.0428** | 0.9905 | **42.86 dB** |
+
+**La famille INR représente ces volumes quasi sans perte** — 42.9 dB, deux fois moins
+d'erreur en premier plan que le meilleur MedVAE (0.0428 contre 0.1576). La prédiction
+de la littérature (>35–40 dB pour un sur-apprentissage mono-volume) est vérifiée sur
+ces données précises.
+
+**Cela ferme définitivement la question posée** : ce n'est ni la famille de modèles, ni
+l'architecture SIREN, ni `omega_0`, ni la profondeur. Un SIREN à la taille EXACTE de la
+production atteint 37.17 dB quand la production plafonne à 23.41 dB. **Tout l'écart est
+dans ce que l'on autorise à varier par volume** — 512 nombres en production, 330 000
+pour le SIREN libre.
+
+*(Réserve : le SIREN libre n'est pas une représentation utilisable telle quelle pour la
+tâche — il faudrait stocker 330 k poids par volume et le flow devrait opérer dessus.
+C'est une BORNE SUPÉRIEURE de la famille, pas une proposition. Ce qu'elle établit, c'est
+que le plafond n'est pas là où le projet le croyait.)*
 
 ## Trois lectures, dans l'ordre d'importance
 

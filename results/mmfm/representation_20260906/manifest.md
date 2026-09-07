@@ -153,10 +153,41 @@ côtés : **−0.0154 de nRMSE sur la chaîne complète, soit 13.5 % relatif.**
 
 **Réserve décisive sur `prod_volpct` et `prod_p999`** : les percentiles PAR VOLUME sont
 exactement inversibles pour une reconstruction identité, mais **indisponibles en
-traduction** — on ne connaît pas les percentiles du volume cible. Le gain de 13.5 %
-mesuré ici est un plafond, pas un résultat transposable tel quel. La forme
-transposable serait un `hi` FIXE par (contraste, champ) recalculé à un percentile plus
-haut ; c'est ce que le balayage `hi_scale` de la campagne complémentaire mesure.
+traduction** — on ne connaît pas les percentiles du volume cible. Le gain mesuré avec
+eux est un plafond, pas un résultat transposable tel quel. La forme transposable est un
+`hi` FIXE par (contraste, champ), simplement desserré : c'est le balayage `hi_scale`.
+
+### Le balayage `hi_scale` — la forme transposable, et son optimum
+
+`hi_scale` multiplie le `hi` de `field_norm_stats.json`. C'est toujours une borne fixe
+par (contraste, champ), donc **utilisable en traduction**, contrairement aux percentiles
+par volume. 15 volumes, tranche notée :
+
+| `hi` × | 0.5 | 0.75 | **1.0 (prod)** | **1.25** | 1.5 | 2.0 |
+|---|---|---|---|---|---|---|
+| nRMSE | 0.3900 | 0.2028 | **0.1140** | **0.0989** | 0.1001 | 0.1053 |
+| SSIM | 0.7901 | 0.8569 | 0.8984 | **0.9077** | 0.9089 | 0.9085 |
+
+**Optimum plat entre ×1.25 et ×1.5, à −13.2 %.** Le mécanisme est mesuré : la table
+sature 25–50 % des voxels de cerveau selon la cellule (T2FLAIR@3T 50.0 %, T1W@3T 37.1 %,
+T1W@7T 25.1 %), et l'écrêtage n'est pas inversible.
+
+### Les deux leviers se composent
+
+| variante | nRMSE tranche notée | SSIM | vs production | part propre au VAE¹ |
+|---|---|---|---|---|
+| *protocole seul (plancher)* | *0.0685* | *0.9717* | — | *0.0000* |
+| **production** | 0.1140 | 0.8984 | — | 0.0911 |
+| MedVAE LPIPS | 0.1063 | 0.9129 | −6.7 % | 0.0813 |
+| production + `hi` ×1.25 | 0.0989 | 0.9077 | −13.2 % | 0.0714 |
+| **LPIPS + `hi` ×1.25** | **0.0901** | **0.9227** | **−21.0 %** | **0.0585** |
+| LPIPS + `hi` ×1.5 | 0.0904 | 0.9221 | −20.7 % | 0.0589 |
+
+¹ `sqrt(total² − plancher²)`, les deux termes étant approximativement orthogonaux.
+
+**−21.0 % sur la chaîne complète et −36 % sur la part propre au VAE, sans réentraîner
+quoi que ce soit** : un checkpoint déjà présent dans le dépôt et un scalaire par cellule
+dans un JSON. Le SSIM monte aussi (0.8984 → 0.9227), donc ce n'est pas un arbitrage.
 
 ---
 
