@@ -196,10 +196,28 @@ def test_trajectory_can_bend(model, latent_dim: int, n_steps: int = 100,
 
 def zero_baseline_from_cache(cache_dir: str, modality: str = "T2W",
                              n: int = 8, loss: str = "l1",
-                             adjacent_only: bool = False) -> float:
+                             adjacent_only: bool = False,
+                             marginal_mode: str = "trajectory") -> float:
     """Loss d'un predicteur qui renvoie 0 partout, sur les vraies cibles
     u = (z_j - z_i)/dt. Trois lignes qui auraient arrete le projet des le debut :
     un flow dont la loss ne bat pas la constante nulle n'a rien appris.
+
+    REGIME MARGINAL (ajoute le 2026-09-07). En `marginal_mode: trajectory` --- le
+    DEFAUT de mmfm_core.py:720 et le mode de toutes les configs recentes --- la
+    cible n'est pas une pente de corde entre deux marginales independantes mais la
+    DERIVEE DE LA SPLINE cubique a travers les K marginales couplees
+    (`_compute_flow_trajectory`, `u_t = W'(t) @ Z`). Les deux grandeurs ne sont pas
+    du meme ordre : mesure sur le cache de production, base de corde 15.29 / 14.61 /
+    15.55 contre base de spline 28.68 / 25.49 / 28.19 (T1W / T2W / T2FLAIR), soit un
+    facteur 1.74 a 1.88.
+
+    Cette fonction ignorait `marginal_mode` et calculait toujours la corde. Elle
+    faisait donc ECHOUER la porte sur un run parfaitement sain : sur la config du
+    meilleur resultat a ce jour (`vectorized_trajectory_l1.yaml`, score 0.3485),
+    loss finale 16.7417 contre une base de 15.0703 donnait un ratio de 1.111 et un
+    code de sortie 1. Contre la bonne base (25.5), le ratio vaut 0.66. C'est
+    exactement le piege que le paragraphe suivant decrit, applique a un regime que
+    le code ne connaissait pas.
 
     REGIME DE PAIRES. `adjacent_only` change l'echelle des cibles : `dt` y vaut
     toujours 0.25 au lieu d'aller jusqu'a 1.0, donc `u = (z_j - z_i)/dt` est ~4x
@@ -239,6 +257,23 @@ def zero_baseline_from_cache(cache_dir: str, modality: str = "T2W",
             z = o["latent"] if isinstance(o, dict) and "latent" in o else o
             out.append(torch.as_tensor(z).float().reshape(-1))
         return torch.stack(out)
+
+    if marginal_mode == "trajectory":
+        # Meme operateur que l'entrainement : _compute_flow_trajectory contracte
+        # `w1 = _spline_weights(t_anchor, t, 1)` le long de l'axe des marginales.
+        # On moyenne sur 64 temps tires uniformement dans [0,1], comme la boucle
+        # d'entrainement qui tire `t = torch.rand(B)` a chaque pas.
+        import numpy as np
+        from cfm.mmfm_core import _spline_weights
+        Z = torch.stack([load(f, n, 10 + k) for k, f in enumerate(fields)], dim=1)
+        t_anchor = tuple(k / (len(fields) - 1) for k in range(len(fields)))
+        tq = np.random.default_rng(0).random(64)
+        w1 = torch.as_tensor(_spline_weights(t_anchor, tq, 1), dtype=torch.float32)
+        acc = []
+        for q in range(w1.shape[0]):        # boucle sur t : evite un tenseur (64, n, D)
+            u = torch.einsum("k,nkd->nd", w1[q], Z)
+            acc.append(u.abs().mean().item() if loss == "l1" else (u ** 2).mean().item())
+        return sum(acc) / len(acc)
 
     vals = []
     for i in range(len(fields)):
@@ -344,8 +379,12 @@ def run(cfg_path: str, checkpoint: str | None, metrics: str | None) -> int:
         if cache and Path(cache).exists():
             loss_kind = "l2" if cfg["train"].get("loss", "l1") == "l2" else "l1"
             adj = bool(cfg["train"].get("adjacent_only", False))
+            # Meme defaut que mmfm_core.py:720 : une config sans `marginal_mode`
+            # s'entraine en trajectoire, la base doit donc l'etre aussi.
+            mm = str(cfg["train"].get("marginal_mode", "trajectory")).lower()
             try:
-                base = zero_baseline_from_cache(cache, loss=loss_kind, adjacent_only=adj)
+                base = zero_baseline_from_cache(cache, loss=loss_kind, adjacent_only=adj,
+                                                marginal_mode=mm)
             except Exception as exc:                      # schema de cache inattendu
                 print(f"  n/a  la loss bat « predire zero » : cache illisible ({exc})")
             else:
