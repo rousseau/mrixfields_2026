@@ -63,6 +63,105 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-08 — **Volet 2 : NÉGATIF, et pour la première fois le mécanisme est nommé. Améliorer la représentation a rendu le travail du flow PLUS DUR.**
+
+**Verdict : −21 % de plafond de représentation ont produit +7.4 % de score.** Ce n'est
+plus une non-transmission comme les 2026-09-01 et 2026-09-02 : c'est une
+**anti-corrélation**, et la décomposition la localise. CSV :
+`results/mmfm/hi125_20260907/`. Config : `configs/mmfm/vectorized_l1_hi125.yaml`.
+Cache : `medvae_finetune_6109b0b0` (1939 volumes, chemin TUILÉ, 2 h 50).
+
+Recette d'inférence partagée avec les repères : crop centré, tranche notée [150, 180),
+180 volumes, table `field_norm_stats_hi125.json` à la dénormalisation.
+
+| tranche notée | T1W | T2W | T2FLAIR | nRMSE | SSIM |
+|---|---|---|---|---|---|
+| **LPIPS + `hi` ×1.25** | 0.4579 | 0.3147 | 0.3499 | **0.3742** | **0.8334** |
+| l1 + 4 correctifs (repère) | 0.4249 | 0.3018 | 0.3189 | **0.3485** | 0.8220 |
+| production | 0.4034 | 0.3215 | 0.3493 | 0.3581 | 0.8379 |
+| *témoin srclevel* | | | | *0.2561* | — |
+
+**+0.0257 de nRMSE (+7.4 %), payé par un gain de SSIM de +0.0114** contre le repère.
+Le SSIM reste sous la production (−0.0045). Les trois contrastes reculent en nRMSE.
+
+### Ce n'est PAS un entraînement raté, et ce n'est PAS l'amplification d'échelle
+
+Deux contrôles écartent les explications faciles.
+
+**Le mécanisme du flow est intact, et à un cheveu du repère.** La loss n'est pas
+comparable entre caches (échelles de latent différentes) mais son RATIO à la base
+« prédire zéro » l'est : **0.621 contre 0.623** pour le repère. Porte mécanistique
+5/5. Entraînement 22.45 → 14.87 en 120.9 min à 3.49 it/s, identique au repère.
+
+**L'amplification par `hi` ×1.25 est déjà comptée dans le plafond.** Le bras
+`lpips_hi125` du banc fait l'aller-retour COMPLET, dénormalisation incluse, et il
+s'améliore (0.1140 → 0.0901). Le facteur 1.25 sur la sortie n'explique donc pas la
+dégradation.
+
+### La décomposition, qui localise le défaut
+
+Convention du projet, `score² ≈ plafond² + flow²` :
+
+| | score | plafond | terme de flow |
+|---|---|---|---|
+| l1 + 4 correctifs | 0.3485 | 0.1140 | **0.3293** |
+| LPIPS + `hi` ×1.25 | 0.3742 | 0.0901 | **0.3632** |
+| écart | +7.4 % | **−21.0 %** | **+10.3 %** |
+
+> **Le plafond baisse de 21 %, le terme de flow monte de 10 %, et le second l'emporte.**
+
+C'est un résultat neuf. Les deux nulls précédents laissaient ouverte l'idée que le
+gain de représentation était simplement « absorbé ». Ici il est **plus que compensé** :
+les latents améliorés sont plus difficiles à transporter. Deux causes candidates, non
+départagées :
+
+1. **Occupation de la dynamique.** `hi` ×1.25 fait passer l'écart-type du foreground de
+   0.406 à 0.347 et `latent_scale` de 18.125 à 15.924 (−12 %). Le déplacement entre
+   champs que le flow doit produire rétrécit avec le signal, alors que son erreur
+   propre, elle, ne rétrécit pas forcément.
+2. **Géométrie des latents perceptuels.** Le MedVAE-LPIPS produit un latent d'une autre
+   distribution ; rien ne dit qu'il soit aussi linéairement transportable. Le 2026-09-02
+   avait déjà noté que « la loss n'est pas comparable entre VAE ».
+
+**L'expérience qui les sépare, et elle est bon marché** : réentraîner avec le
+checkpoint LPIPS SEUL (table `hi` ×1.0). Le cache LPIPS existe déjà (`1989e9d1`) mais il
+est encodé par la fenêtre glissante et non tuilé — donc inutilisable pour une
+attribution propre. Coût : une régénération de cache (2 h 50) plus 2 h d'entraînement.
+
+### Ce que cela dit du plafond comme guide
+
+**Troisième fois, et la plus nette : le plafond de représentation ne prédit pas le
+score.** 2026-09-01 : −6.9 % de plafond annoncés → +0.0004. 2026-09-02 : −0.0072 →
++0.0004. 2026-09-08 : **−21 % → +7.4 %, de signe opposé.**
+
+Le plafond mesure ce qu'un flow PARFAIT obtiendrait. Il est donc muet sur la difficulté
+que la représentation impose au flow réel — et cette campagne montre que les deux
+peuvent bouger en sens contraire. **Ne plus arbitrer une adoption sur le plafond seul.**
+
+### Ce qui reste acquis de la validation du 2026-09-07
+
+Rien de ce résultat n'invalide la campagne de validation : MedVAE est bien paramétré,
+la table sature bien 25–50 % des voxels de cerveau, le plancher protocolaire tombe bien
+de 60 à 71 % quand on desserre l'écrêtage, et l'INR est bien affamé et non mal réglé.
+Ce qui tombe, c'est **l'inférence de ces faits vers le score**.
+
+### Réserves
+
+- **Deux variables à la fois** (checkpoint LPIPS et `hi` ×1.25), par choix assumé pour
+  tenir dans une journée. L'attribution entre les deux n'est pas faite.
+- Le plafond 0.0901 est mesuré sur 15 volumes / 1 sujet, le score sur 180 volumes /
+  3 sujets. La décomposition structurelle mélange donc deux échantillons.
+- L'orthogonalité `score² ≈ plafond² + flow²` est une convention du projet, pas un
+  théorème.
+- Incident de conduite : la chaîne est morte d'une `erreur de syntaxe ligne 157` parce
+  que j'ai édité `run_volet2_chain.sh` PENDANT son exécution — bash lit ses scripts par
+  décalage d'octets. Les 180 prédictions étaient intactes, l'évaluation a été relancée à
+  la main. **Ne jamais éditer un script en cours d'exécution.**
+- `measure_flow_geometry.py` (porte [5b], géométrie des poids réels) n'a pas tourné,
+  emportée par le même incident. À lancer.
+
+---
+
 ## 2026-09-07 (nuit) — **Les 8 fenêtres : l'alarme est levée sur le nRMSE, et un LEVIER apparaît là où on ne le cherchait pas**
 
 **Verdict en deux temps.** Le tableau de référence n'est pas corrompu — l'écart entre
