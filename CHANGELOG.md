@@ -84,6 +84,46 @@ Recette d'inférence partagée avec les repères : crop centré, tranche notée 
 **+0.0257 de nRMSE (+7.4 %), payé par un gain de SSIM de +0.0114** contre le repère.
 Le SSIM reste sous la production (−0.0045). Les trois contrastes reculent en nRMSE.
 
+### Test apparié, et le contrôle qui le rend lisible
+
+La référence a été **ré-évaluée aujourd'hui** sur ses prédictions stockées, par le même
+évaluateur et la même région : **0.3485**, exactement la valeur archivée. Le contrôle
+passe, la comparaison est propre.
+
+| | valeur |
+|---|---|
+| nouveau meilleur sur | **21/60 paires**, signes **p = 0.027** |
+| écart moyen | **+0.0256** |
+| écart **médian** | **+0.0094** |
+| min / max | −0.0632 / **+0.2194** |
+| SSIM : nouveau meilleur sur | **46/60 paires**, +0.0115 |
+
+La dégradation est significative, mais la moyenne vaut près de trois fois la médiane :
+**elle n'est pas diffuse, elle est portée par quelques paires.**
+
+### 79 % de la dégradation vient d'UN SEUL champ source : 3T
+
+| champ SOURCE | écart moyen | dégradé sur |
+|---|---|---|
+| 0.1T | +0.0167 | 7/12 |
+| 1.5T | −0.0021 | 7/12 |
+| **3T** | **+0.1008** | **10/12** |
+| 5T | +0.0136 | 9/12 |
+| 7T | −0.0009 | 6/12 |
+
+Les 12 paires de source 3T pèsent **+1.2100 sur +1.5378**, soit **79 %**. Sans elles,
+l'écart moyen tombe à **+0.0068** — trois fois le plancher de bruit, mais quatre fois
+moins que le chiffre global. Les sept pires paires sur huit ont 3T pour source
+(T2FLAIR 3T→7T +0.2194, T1W 3T→5T +0.2023, T1W 3T→7T +0.1961…).
+
+**Et 3T est exactement là où l'ancienne table écrêtait le plus** : la mesure du
+2026-09-07 donne T2FLAIR@3T **50.0 %** et T1W@3T **37.1 %** de voxels de premier plan
+saturés — les deux plus fortes valeurs des 15 cellules. **Les cellules que le correctif
+change le plus sont celles qui cassent le plus.** Le mécanisme n'est pas établi, mais la
+corrélation est nette et elle désigne l'expérience suivante : un `hi_scale` **par
+cellule** plutôt qu'un facteur uniforme — les cellules peu écrêtées n'avaient rien à
+gagner et ont quand même payé le changement de distribution.
+
 ### Ce n'est PAS un entraînement raté, et ce n'est PAS l'amplification d'échelle
 
 Deux contrôles écartent les explications faciles.
@@ -148,7 +188,8 @@ Ce qui tombe, c'est **l'inférence de ces faits vers le score**.
 ### Réserves
 
 - **Deux variables à la fois** (checkpoint LPIPS et `hi` ×1.25), par choix assumé pour
-  tenir dans une journée. L'attribution entre les deux n'est pas faite.
+  tenir dans une journée. L'attribution entre les deux n'est pas faite. La localisation
+  sur 3T pointe plutôt vers `hi` ×1.25 que vers le checkpoint, mais ne le démontre pas.
 - Le plafond 0.0901 est mesuré sur 15 volumes / 1 sujet, le score sur 180 volumes /
   3 sujets. La décomposition structurelle mélange donc deux échantillons.
 - L'orthogonalité `score² ≈ plafond² + flow²` est une convention du projet, pas un
