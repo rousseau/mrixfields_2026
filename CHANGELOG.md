@@ -63,6 +63,39 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-09/10 — Figures qualitatives INR vs MedVAE, checkpoints ACTUELS (les anciennes dataient d'avant l'audit EMA/orientation)
+
+Les seules figures INR vs MedVAE du dépôt (`comparison_20260801_final/
+figures_representation_capacity/`) montraient un INR périmé : `z=4096`
+(remplacé par 129024 le 2026-08-10), **antérieur** à l'audit du 2026-08-25
+(EMA non chauffée + orientation LAS/RAS). Script :
+`src/cfm/figures_representation_capacity_current.py` (aucun chemin
+parallèle — appelle directement `bench_representation.roundtrip`/
+`bench_inr_capacity.load_production_backbone`). Manifeste complet :
+`results/mmfm/qualitative_representation_20260909/manifest.md`.
+
+**Jeu A** (9 cellules, T1W × {0006,0007,0009} × {0.1T,3T,7T}, auto-reconstruction
+1mm normalisée) : moyenne MedVAE nRMSE **0.0518**/SSIM **0.9528** contre INR
+déployé (20 pas SGD, procédure de production) nRMSE **0.1292**/SSIM **0.8046**.
+Confirme visuellement le lissage de l'INR déployé sur les 9 cellules.
+
+**Jeu B** (3 cellules, sujet 0006, même SIREN gelé, modulation LoRA r=64
+optimisée par Adam à la place des 20 pas SGD de production) :
+
+| | MedVAE | INR déployé (512 eff.) | INR plafond (LoRA r=64, ~182k eff.) |
+|---|---|---|---|
+| nRMSE moyen | 0.0587 | 0.1448 | **0.0531** |
+| SSIM moyen | 0.9551 | 0.8057 | 0.9351 |
+
+**À budget comparable, l'INR plafond bat MedVAE pré-entraîné en nRMSE** —
+confirme visuellement (pas seulement en CSV) la conclusion du 2026-09-07 :
+le handicap de l'INR déployé est un budget de modulation (512 valeurs/volume),
+pas un défaut de la famille SIREN. Le plafond LoRA n'est pas déployable tel
+quel (~182k valeurs/volume, ~5-10 min d'Adam par volume ici) — c'est une borne
+de capacité, pas une proposition d'architecture.
+
+---
+
 ## 2026-09-08 — **Volet 2 : NÉGATIF, et pour la première fois le mécanisme est nommé. Améliorer la représentation a rendu le travail du flow PLUS DUR.**
 
 **Verdict : −21 % de plafond de représentation ont produit +7.4 % de score.** Ce n'est
