@@ -73,6 +73,7 @@ def _backbone_config_from_cfg(cfg: dict) -> INRBackboneConfig:
         bg_threshold=float(m.get("bg_threshold", -0.9)),
         modulate_scale=bool(m.get("modulate_scale", False)),
         lora_rank=int(m.get("lora_rank", 0)),
+        lora_inner_lr=(float(m["lora_inner_lr"]) if m.get("lora_inner_lr") is not None else None),
     )
 
 

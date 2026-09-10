@@ -248,6 +248,56 @@ class ModulatedSIREN(nn.Module):
         assert off == gamma.shape[1], f"gamma mal découpé : {off} != {gamma.shape[1]}"
         return out
 
+    @torch.no_grad()
+    def lora_mask(self) -> Tensor:
+        """Masque booléen (modulation_dim,) : True sur les composantes LoRA
+        (blocs A+B de chaque couche). Portage de
+        `bench_inr_capacity.py::gamma_layout` en méthode d'instance — sert à
+        donner à la modulation directe (`hyper_hidden_dim=0`) un traitement
+        distinct (init, taux d'apprentissage) pour sa portion LoRA. Masque
+        entièrement `False` si `lora_rank=0`."""
+        mask = torch.zeros(self.modulation_dim, dtype=torch.bool)
+        r = self.lora_rank
+        if r == 0:
+            return mask
+        off = 0
+        for fin, fout in self._layer_dims():
+            off += fout
+            if self.modulate_scale:
+                off += fout
+            mask[off:off + fout * r + fin * r] = True
+            off += fout * r + fin * r
+        return mask
+
+    @torch.no_grad()
+    def init_direct_modulation(self, device, generator: Optional[torch.Generator] = None,
+                               b_scale: float = 1e-2) -> Tensor:
+        """Point de départ de `z` quand `z` EST `gamma` directement
+        (`hyper_hidden_dim=0`). Portage de `bench_inr_capacity.py::init_gamma`.
+
+        Zéro partout (shift = identité, A = 0) SAUF la portion `B` de chaque
+        bloc LoRA, initialisée aléatoire : `A=0 ET B=0` simultanément rend le
+        gradient LoRA nul des deux côtés (`dL/dA ∝ x@B=0`, `dL/dB ∝ A=0`),
+        mort pour toujours — convention Hu et al. 2021 (LoRA), déjà validée
+        par le sondage `bench_inr_capacity.py` sur ce même SIREN gelé."""
+        g = torch.zeros(1, self.modulation_dim, device=device)
+        r = self.lora_rank
+        if r == 0:
+            return g
+        gen = generator
+        if gen is None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(7)
+        off = 0
+        for fin, fout in self._layer_dims():
+            off += fout
+            if self.modulate_scale:
+                off += fout
+            off += fout * r                                   # A reste a zero
+            g[0, off:off + fin * r] = torch.randn(fin * r, device=device, generator=gen) * b_scale
+            off += fin * r
+        return g
+
     def forward(self, coords: Tensor, gamma: Tensor) -> Tensor:
         """coords: (B, N, in_dim). gamma: (B, modulation_dim). -> (B, N, out_dim)."""
         mods = self._split(gamma)
@@ -306,6 +356,14 @@ class INRBackboneConfig:
     #                    pas (mesuré, cf. comparison_20260807_1mm/manifest.md).
     modulate_scale: bool = False
     lora_rank: int = 0
+    # Requis quand hyper_hidden_dim=0 ET lora_rank>0 (modulation directe +
+    # LoRA) : `z` EST alors `gamma`, et la portion LoRA de `z` a besoin de son
+    # propre pas de descente, distinct de celui des décalages (`inner_lr`).
+    # Au pas des décalages (échelle ~1e-2), la LoRA diverge dès le premier pas
+    # (mesuré par bench_inr_capacity.py::mod_lora* : nRMSE 0.83 sans ce
+    # traitement séparé). `None` = comportement historique inchangé (aucun
+    # effet tant que ce combo n'est pas activé).
+    lora_inner_lr: Optional[float] = None
 
 
 def diff_inr_configs(current: "INRBackboneConfig", expected: Optional[dict]) -> list:
@@ -366,6 +424,19 @@ class INRBackbone(nn.Module):
         else:
             self.hypernet = Hypernetwork(cfg.latent_dim, self.siren.modulation_dim, cfg.hyper_hidden_dim)
 
+        # z EST gamma sous modulation directe : si lora_rank>0, sa portion LoRA
+        # a besoin d'une init non nulle et d'un pas propre (voir fit_latent) —
+        # sans quoi le gradient LoRA est mort des deux côtés, pour toujours.
+        self._direct_lora = (cfg.hyper_hidden_dim == 0 and cfg.lora_rank > 0)
+        if self._direct_lora:
+            if cfg.lora_inner_lr is None:
+                raise ValueError(
+                    "lora_inner_lr est requis quand hyper_hidden_dim=0 et lora_rank>0 "
+                    "(modulation directe + LoRA) : la portion LoRA de z a besoin d'un "
+                    "pas distinct de inner_lr, sinon elle diverge ou reste morte."
+                )
+            self.register_buffer("_lora_mask", self.siren.lora_mask(), persistent=False)
+
     def decode(self, coords: Tensor, z: Tensor) -> Tensor:
         """coords: (B, N, 3), z: (B, latent_dim) -> (B, N, 1) intensities."""
         gamma = self.hypernet(z)
@@ -374,7 +445,7 @@ class INRBackbone(nn.Module):
     def fit_latent(
         self, coords: Tensor, targets: Tensor, num_steps: int, lr: float,
         z_init: Optional[Tensor] = None, create_graph: bool = False,
-        chunk_size: Optional[int] = None,
+        chunk_size: Optional[int] = None, lora_init_generator: Optional[torch.Generator] = None,
     ) -> Tensor:
         """MetaSDF-style inner loop: gradient descent on `z` only, (theta,
         psi) untouched. coords/targets: (B, N, ·). Returns z: (B, latent_dim).
@@ -394,9 +465,29 @@ class INRBackbone(nn.Module):
         b = coords.shape[0]
         device = coords.device
         n = coords.shape[1]
-        z = (torch.zeros(b, self.cfg.latent_dim, device=device) if z_init is None else z_init).clone()
+        if z_init is not None:
+            z = z_init.clone()
+        elif self._direct_lora:
+            z = self.siren.init_direct_modulation(
+                device, generator=lora_init_generator
+            ).expand(b, -1).clone()
+        else:
+            z = torch.zeros(b, self.cfg.latent_dim, device=device)
         z.requires_grad_(True)
         chunked = (not create_graph) and chunk_size is not None and n > chunk_size
+
+        # Sous modulation directe+LoRA, la portion LoRA de z a besoin d'un pas
+        # distinct de celui des décalages (voir INRBackboneConfig.lora_inner_lr) —
+        # sinon, au pas des décalages, elle diverge dès le premier pas (mesuré
+        # par bench_inr_capacity.py). `step_lr` reste un simple float dans le
+        # cas historique (lora_rank=0 ou hypernetwork actif) : comportement
+        # inchangé bit à bit.
+        if self._direct_lora:
+            step_lr = torch.full((self.cfg.latent_dim,), lr, device=device, dtype=torch.float32)
+            step_lr[self._lora_mask.to(device)] = self.cfg.lora_inner_lr
+            step_lr = step_lr.unsqueeze(0)
+        else:
+            step_lr = lr
 
         # Same normalization as _weighted_mse, but hoisted out of the loop so
         # every chunk divides by the SAME (global) weight mean — computing it
@@ -429,7 +520,7 @@ class INRBackbone(nn.Module):
                     part = ((pred_c - targets[:, sl]) ** 2 * w_full[:, sl]).sum() / n
                     (g,) = torch.autograd.grad(part, z)
                     grad_z = grad_z + g
-            z = z - lr * grad_z
+            z = z - step_lr * grad_z
             if not create_graph:
                 z = z.detach().requires_grad_(True)
         return z
@@ -489,7 +580,8 @@ def meta_train_step(
     coords, values = sample_points(coords_full, values_full, num_points, generator)
     coords_b = coords.unsqueeze(0).expand(b, -1, -1)
 
-    z = backbone.fit_latent(coords_b, values, backbone.cfg.inner_steps_train, backbone.cfg.inner_lr, create_graph=True)
+    z = backbone.fit_latent(coords_b, values, backbone.cfg.inner_steps_train, backbone.cfg.inner_lr,
+                            create_graph=True, lora_init_generator=generator)
     pred = backbone.decode(coords_b, z)
     recon_loss = _weighted_mse(pred, values, backbone.cfg.fg_weight, backbone.cfg.bg_threshold)
 

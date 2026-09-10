@@ -63,6 +63,41 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-10 — INR `hyper_hidden_dim=0`+`lora_rank=16` : bug d'init LoRA corrigé, mécanisme confirmé, PAUSE avant la production (l'optimiseur, pas la modulation, est le facteur limitant)
+
+Tentative d'entraîner un backbone INR nativement en modulation directe
+(bypass du hypernetwork, goulot de rang 512 déjà diagnostiqué le 2026-09-07)
++ LoRA rang 16 (~46640 valeurs/volume, même ordre de grandeur que le latent
+MedVAE — le rang 64 du 2026-09-07, ~182k, avait été jugé trop grand pour le
+flow matching). Manifeste complet : `results/mmfm/inr_direct_lora16_smoke_20260910/manifest.md`.
+
+**Bug trouvé et corrigé AVANT tout calcul de production** : `INRBackbone.fit_latent`
+initialisait toujours `z` à zéro ; avec `hyper_hidden_dim=0`, `z` EST `gamma`,
+donc les tranches LoRA `A` ET `B` démarraient à zéro — gradient LoRA mort des
+deux côtés, pour toujours. Confirmé empiriquement : `lora_rank=16` sans
+correctif (nRMSE_fg=0.2082) est indiscernable de `lora_rank=0` (0.2070).
+Corrigé dans `src/cfm/inr_backbone.py` (init B aléatoire + taux d'apprentissage
+LoRA séparé, convention déjà validée par `bench_inr_capacity.py`) —
+**rétrocompatible, vérifié bit-à-bit pour `lora_rank=0`** (tout le code de
+production actuel).
+
+**Après correctif, le gain reste marginal avec la SGD de production**
+(0.2053-0.2132 selon `lora_inner_lr`, ≤0.8% vs témoin) et n'a **pas plateauné**
+à 500 pas (0.2002) — mais **Adam avec taux d'apprentissage séparés bat la
+meilleure SGD de 30.7% relatif en 6.3x moins de temps** (300 pas, nRMSE_fg
+0.1387 contre 0.2002, 70s contre 442s). **Le mécanisme LoRA est vivant et
+capable ; c'est l'optimiseur à pas fixe de la boucle interne de production
+(`fit_latent`) qui est mal adapté à un espace de modulation aussi grand,
+pas la modulation directe+LoRA elle-même.**
+
+**Décision (avec l'utilisateur) : PAUSE.** Basculer le precompute vers Adam
+est une extension de périmètre non approuvée (coût recalibré à ~13-38h de
+precompute contre 6-7h prévues) — le correctif de code est conservé (utile
+pour toute future tentative), mais l'entraînement de production (50000 pas),
+le precompute, le flow et l'évaluation Task 3 n'ont **pas** été exécutés.
+
+---
+
 ## 2026-09-09/10 — Figures qualitatives INR vs MedVAE, checkpoints ACTUELS (les anciennes dataient d'avant l'audit EMA/orientation)
 
 Les seules figures INR vs MedVAE du dépôt (`comparison_20260801_final/

@@ -86,7 +86,7 @@ BATCH_SIZE = 2
 POINTS_PER_STEP = 16384
 FG_MASK_THRESHOLD_01 = 0.05  # matches INRBackboneConfig.bg_threshold=-0.9 in [-1,1] space
 _OPTS = {"modulate_scale": False, "lora_rank": 0, "direct": False,
-         "steps": N_META_STEPS, "inner_steps": 10}
+         "steps": N_META_STEPS, "inner_steps": 10, "lora_inner_lr": None}
 
 
 def _load_smoke_volumes(device: torch.device) -> torch.Tensor:
@@ -115,7 +115,8 @@ def _make_cfg() -> INRBackboneConfig:
     """
     kw = dict(hidden_dim=256, num_hidden_layers=6,
               inner_steps_train=_OPTS["inner_steps"], inner_steps_eval=2 * _OPTS["inner_steps"],
-              modulate_scale=_OPTS["modulate_scale"], lora_rank=_OPTS["lora_rank"])
+              modulate_scale=_OPTS["modulate_scale"], lora_rank=_OPTS["lora_rank"],
+              lora_inner_lr=_OPTS["lora_inner_lr"])
     if _OPTS["direct"]:
         probe = ModulatedSIREN(hidden_dim=256, num_hidden_layers=6,
                                modulate_scale=_OPTS["modulate_scale"],
@@ -449,6 +450,9 @@ if __name__ == "__main__":
                           "plus il en faut a priori pour converger.")
     ap.add_argument("--z-reg-weight", type=float, default=0.0,
                      help="Poids de la pénalité de lissage sur z (Hutchinson VJP). 0.0 = désactivée.")
+    ap.add_argument("--lora-inner-lr", type=float, default=None,
+                     help="Pas de descente distinct pour la portion LoRA de z, requis quand "
+                          "--direct et --lora-rank>0 (sinon la LoRA diverge ou reste morte).")
     ap.add_argument("--load-checkpoint", default=None,
                      help="Recharge un backbone smoke déjà entraîné et saute [1/5] : "
                           "rejoue les portes sans repayer le méta-entraînement.")
@@ -457,7 +461,7 @@ if __name__ == "__main__":
                           "pour re-vérifier avec diagnose_inr_latent_smoothness.py.")
     args = ap.parse_args()
     _OPTS.update(modulate_scale=args.modulate_scale, lora_rank=args.lora_rank, direct=args.direct,
-                 steps=args.steps, inner_steps=args.inner_steps)
+                 steps=args.steps, inner_steps=args.inner_steps, lora_inner_lr=args.lora_inner_lr)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 70)
