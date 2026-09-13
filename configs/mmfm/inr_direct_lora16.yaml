@@ -1,0 +1,143 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM à latent INR — variante MODULATION DIRECTE + LoRA rang 16 (2026-09-10).
+#
+# Dérivée de inr.yaml (voir ce fichier pour la config de référence, backbone à
+# hypernetwork rang 512). Le bloc `inr_backbone:` DOIT correspondre exactement
+# au bloc `model:` de configs/mmfm/inr_backbone_direct_lora16.yaml — voir ce
+# fichier pour le détail du changement architectural (modulation directe,
+# gamma=z, + LoRA rang 16 ≈ 46640 valeurs/volume) et le bug d'init LoRA corrigé
+# le 2026-09-10 (results/mmfm/inr_direct_lora16_smoke_20260910/manifest.md).
+#
+# fit_optimizer=adam : le fitting de z au precompute (precompute_inr_latents.py)
+# ET à l'inférence (arch_inr.py::prep_latent) utilise Adam à taux d'apprentissage
+# séparés shift/LoRA — PAS la SGD à pas fixe de inr.yaml. Mesuré 2026-09-10 :
+# Adam (300 pas) bat la meilleure SGD (500 pas) de 30.7% relatif en 6.3x moins
+# de temps. Ces deux chemins (precompute et prep_latent) DOIVENT rester
+# identiques (même classe de risque que compat_orientation/compat_source_norm) —
+# voir arch_inr.py::prep_latent, commentaire "DOIT rester identique".
+#
+# Prérequis (backbone gelé, entraîné séparément) :
+#   1. PYTHONPATH=src python src/cfm/train_inr_backbone.py \
+#          --config configs/mmfm/inr_backbone_direct_lora16.yaml --env local
+#   2. PYTHONPATH=src python src/cfm/gate_inr_production.py \
+#          --config configs/mmfm/inr_direct_lora16.yaml --out results/mmfm/gate_inr_direct_lora16_<date>
+#   3. PYTHONPATH=src python src/cfm/precompute_inr_latents.py \
+#          --config configs/mmfm/inr_direct_lora16.yaml --env local
+#      (note le cache_id imprimé, à reporter dans data.latent_cache_dir ci-dessous,
+#       ET recalculer model.latent_mean/model.latent_scale sur ce nouveau cache
+#       — NE PAS copier ceux d'inr.yaml, mesurés sur un cache différent)
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_inr
+task_name: mmfm_inr_direct_lora16
+
+vae:
+  vae_type: identity
+
+inr_backbone:
+  checkpoint: outputs/mmfm/inr_backbone_direct_lora16/weights/model_final.pth
+  # hyper_hidden_dim=0 impose latent_dim == modulation_dim(hidden_dim=256,
+  # num_hidden_layers=6, lora_rank=16) = 46640 (vérifié à la construction).
+  latent_dim: 46640
+  hidden_dim: 256
+  num_hidden_layers: 6
+  omega_0: 30.0
+  omega_hidden: 30.0
+  hyper_hidden_dim: 0
+  lora_rank: 16
+  lora_inner_lr: 1.0e-4
+  inner_lr: 0.01
+  inner_steps_train: 10
+  inner_steps_eval: 20
+  # Non utilisé par le chemin adam (fit_new_volume_adam n'échantillonne pas un
+  # sous-ensemble fixe — il rééchantillonne adam_points_per_step à chaque pas
+  # depuis la grille complète). Gardé pour mémoire si fit_optimizer repasse à sgd.
+  fit_points: 1048576
+  fg_weight: 5.0
+  bg_threshold: -0.9
+  fit_optimizer: adam
+  adam_steps: 300
+  adam_lr_base: 1.0e-2
+  adam_lr_lora: 1.0e-3
+  adam_points_per_step: 262144
+
+model:
+  # Mesuré sur le cache inr_e124f7c5 (2026-09-13, 1939 volumes) : mean=1.77e-06,
+  # std=1.589e-02. RÉSERVE MESURÉE (pas supposée) : la dispersion PAR DIMENSION
+  # est beaucoup plus hétérogène ici que sur l'ancien cache MedVAE (ratio
+  # max/min = 49.9x contre 2.9x pour inr_932b0b37, où "un scalaire suffit"
+  # avait été jugé valide) — la portion shift (1536 dims) a un écart-type
+  # ~3x plus grand que la portion LoRA (45104 dims). Un scalaire unique reste
+  # utilisé ici (pas de normalisation par dimension implémentée dans
+  # VectorMMFM/mmfm_core.py — hors périmètre de cette extension), mais ce
+  # n'est PAS garanti aussi bien adapté que pour le cache précédent : à
+  # surveiller si le flow peine à exploiter la portion LoRA (variation de
+  # vitesse insensible au sujet, même symptôme que le bug latent_scale=0.5
+  # historique, voir inr.yaml).
+  latent_mean: 1.774392e-06
+  latent_scale: 1.589442e-02
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  split: retro_train
+  output_subdir: mmfm/inr_direct_lora16
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/inr
+  # Precompute termine le 2026-09-13 : 1939 volumes, 0 erreur, 38.3h.
+  latent_cache_dir: outputs/mmfm/latent_cache/inr/inr_e124f7c5/retro_train
+  latent_preload_ram: true
+  flip_lr_prob: 0.0
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  batch_size: 1
+  total_iters: 25000
+  num_targets_per_step: 1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  adjacent_only: false
+  identity_prob: 0.1
+  accumulation_steps: 1
+  save_every: 2500
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  compat_orientation: true
+  compat_source_norm: true
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

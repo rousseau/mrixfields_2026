@@ -51,7 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.config import load_yaml_with_include, load_env, resolve_paths
 from common.io import FILE_RE, MODALITIES, DOMAINS, SPLIT_MAP, load_nifti_volume, center_crop_or_pad_np
 from cfm.arch_inr import load_inr_backbone
-from cfm.inr_backbone import DEFAULT_FIT_CHUNK, fit_new_volume, make_coord_grid
+from cfm.inr_backbone import DEFAULT_FIT_CHUNK, fit_new_volume, fit_new_volume_adam, make_coord_grid
 
 
 def _inr_cache_id(
@@ -70,6 +70,7 @@ def _inr_cache_id(
     b = cfg.get("inr_backbone", {})
     ckpt_path = b.get("checkpoint", "")
     ckpt_mtime = Path(ckpt_path).stat().st_mtime if ckpt_path and Path(ckpt_path).exists() else 0.0
+    fit_optimizer = str(b.get("fit_optimizer", "sgd"))
     key = "|".join([
         "inr",
         str(ckpt_path),
@@ -82,6 +83,13 @@ def _inr_cache_id(
         f"{p_lo}",
         f"{p_hi}",
         f"field_norm={field_norm_stats_path or ''}",
+        f"fit_optimizer={fit_optimizer}",
+        # Ces champs ne comptent QUE si fit_optimizer=adam : les inclure
+        # inconditionnellement invaliderait le cache SGD existant si on les
+        # ajoutait plus tard avec des defauts differents.
+        (f"adam_steps={b.get('adam_steps','')}|adam_lr_base={b.get('adam_lr_base','')}|"
+         f"adam_lr_lora={b.get('adam_lr_lora','')}|adam_points_per_step={b.get('adam_points_per_step','')}"
+         if fit_optimizer == "adam" else ""),
     ])
     h = hashlib.sha1(key.encode()).hexdigest()[:8]
     return f"inr_{h}"
@@ -143,9 +151,15 @@ def main():
     backbone = load_inr_backbone(cfg, device)
     inner_lr = backbone.cfg.inner_lr
     inner_steps = backbone.cfg.inner_steps_eval
+    fit_optimizer = backbone.cfg.fit_optimizer
     coords_full = make_coord_grid(volume_size, device=device)
-    print(f"  latent_dim={backbone.cfg.latent_dim}  inner_steps_eval={inner_steps}  inner_lr={inner_lr}"
-          f"  fit_points={'dense' if fit_points is None else fit_points}  fit_chunk={fit_chunk}")
+    if fit_optimizer == "adam":
+        print(f"  latent_dim={backbone.cfg.latent_dim}  fit_optimizer=adam  "
+              f"adam_steps={backbone.cfg.adam_steps}  adam_lr_base={backbone.cfg.adam_lr_base}  "
+              f"adam_lr_lora={backbone.cfg.adam_lr_lora}  adam_points_per_step={backbone.cfg.adam_points_per_step}")
+    else:
+        print(f"  latent_dim={backbone.cfg.latent_dim}  inner_steps_eval={inner_steps}  inner_lr={inner_lr}"
+              f"  fit_points={'dense' if fit_points is None else fit_points}  fit_chunk={fit_chunk}")
 
     cache_id = _inr_cache_id(
         cfg, target_spacing, volume_size, p_lo, p_hi, fit_points,
@@ -198,11 +212,14 @@ def main():
                     )
                     vol = center_crop_or_pad_np(vol, volume_size)
                     x = torch.from_numpy(vol).unsqueeze(0).unsqueeze(0).to(device)
-                    z = fit_new_volume(
-                        backbone, x, coords_full,
-                        num_steps=inner_steps, lr=inner_lr, num_points=fit_points,
-                        chunk_size=fit_chunk,
-                    )
+                    if fit_optimizer == "adam":
+                        z = fit_new_volume_adam(backbone, x, coords_full)
+                    else:
+                        z = fit_new_volume(
+                            backbone, x, coords_full,
+                            num_steps=inner_steps, lr=inner_lr, num_points=fit_points,
+                            chunk_size=fit_chunk,
+                        )
                     z_vec = z.squeeze(0).to(torch.float32).cpu()  # (latent_dim,)
                     if flat_dim is None:
                         flat_dim = int(z_vec.shape[0])

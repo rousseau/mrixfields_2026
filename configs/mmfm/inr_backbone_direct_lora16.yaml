@@ -1,0 +1,95 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Backbone INR — variante MODULATION DIRECTE + LoRA rang 16 (2026-09-10).
+#
+# Dérivée de inr_backbone.yaml (voir ce fichier pour la config de référence
+# hypernetwork/goulot rang 512). Élimine le goulot du hypernetwork
+# (hyper_hidden_dim=0 => gamma=z directement, cfr. inr_backbone.py::INRBackbone)
+# et enrichit la modulation par une correction bas-rang des poids (lora_rank=16),
+# portant la capacité RÉELLE par volume de ~512 effectifs (rang du hypernetwork
+# actuel) à ~46640 (= modulation_dim exact pour hidden_dim=256,
+# num_hidden_layers=6, lora_rank=16 — même ordre de grandeur que le latent
+# MedVAE 129024, contrairement au rang 64 (~182k) déjà écarté pour le flow
+# matching, voir results/mmfm/inr_direct_lora16_smoke_20260910/manifest.md).
+#
+# BUG CORRIGÉ AVANT CE RUN (2026-09-10) : INRBackbone.fit_latent initialisait
+# toujours z à zéro ; avec hyper_hidden_dim=0, z EST gamma, donc la portion
+# LoRA (A ET B) démarrait à zéro — gradient mort des deux côtés. Corrigé
+# (init B aléatoire + lora_inner_lr séparé, voir inr_backbone.py). Confirmé
+# vivant par sondage (Adam bat la SGD de production de 30.7% relatif) — voir
+# le manifeste ci-dessus pour le diagnostic complet.
+#
+# fit_optimizer/adam_* : ces champs ne pilotent PAS ce script (méta-entraînement,
+# boucle interne toujours en SGD différentiable via lora_inner_lr) — ils sont
+# dupliqués ici uniquement pour que le garde-fou D0 (diff_inr_configs) les
+# embarque dans le checkpoint et les compare à inr_direct_lora16.yaml (qui, lui,
+# les utilise réellement pour le fitting au precompute/à l'inférence).
+# ─────────────────────────────────────────────────────────────────────────────
+
+task_name: mmfm_inr_backbone_direct_lora16
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  split: retro_train
+  output_subdir: mmfm/inr_backbone_direct_lora16
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+
+model:
+  # hyper_hidden_dim=0 impose latent_dim == modulation_dim (vérifié à la
+  # construction, INRBackbone.__init__ lève une ValueError sinon).
+  # modulation_dim(hidden_dim=256, num_hidden_layers=6, lora_rank=16) = 46640.
+  latent_dim: 46640
+  hidden_dim: 256
+  num_hidden_layers: 6
+  omega_0: 30.0
+  omega_hidden: 30.0
+  hyper_hidden_dim: 0
+  lora_rank: 16
+  # Calibré par balayage smoke (2026-09-10) : {1e-2, 1e-3, 1e-4} testés, 1e-4
+  # et 1e-2 quasi ex aequo (0.2053 vs 0.2055 nRMSE_fg) — 1e-4 retenu (plus
+  # conservateur/stable). Voir results/mmfm/inr_direct_lora16_smoke_20260910/manifest.md.
+  lora_inner_lr: 1.0e-4
+  inner_lr: 0.01
+  inner_steps_train: 10
+  inner_steps_eval: 20
+  fg_weight: 5.0
+  bg_threshold: -0.9
+  # Fitting au TEST-TIME (precompute/inférence) — voir l'en-tête de fichier :
+  # sans effet sur CE script, dupliqué pour la cohérence D0 avec inr_direct_lora16.yaml.
+  fit_optimizer: adam
+  adam_steps: 300
+  adam_lr_base: 1.0e-2
+  adam_lr_lora: 1.0e-3
+  adam_points_per_step: 262144
+
+train:
+  total_iters: 50000
+  batch_size: 2
+  points_per_step: 16384
+  lr: 5.0e-6
+  warmup_steps: 2000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  save_every: 2500
+  print_every: 100
+  z_reg_weight: 0.0
+  z_reg_warmup_frac: 0.1

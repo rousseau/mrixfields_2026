@@ -74,6 +74,11 @@ def _backbone_config_from_cfg(cfg: dict) -> INRBackboneConfig:
         modulate_scale=bool(m.get("modulate_scale", False)),
         lora_rank=int(m.get("lora_rank", 0)),
         lora_inner_lr=(float(m["lora_inner_lr"]) if m.get("lora_inner_lr") is not None else None),
+        fit_optimizer=str(m.get("fit_optimizer", "sgd")),
+        adam_steps=int(m.get("adam_steps", 300)),
+        adam_lr_base=float(m.get("adam_lr_base", 1e-2)),
+        adam_lr_lora=float(m.get("adam_lr_lora", 1e-3)),
+        adam_points_per_step=int(m.get("adam_points_per_step", 262144)),
     )
 
 

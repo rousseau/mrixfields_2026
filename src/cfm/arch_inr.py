@@ -32,7 +32,8 @@ from torch import Tensor, nn
 
 from cfm.arch_vector import build_vector_mmfm
 from cfm.inr_backbone import (
-    DEFAULT_FIT_CHUNK, INRBackbone, INRBackboneConfig, decode_volume, diff_inr_configs, fit_new_volume, make_coord_grid,
+    DEFAULT_FIT_CHUNK, INRBackbone, INRBackboneConfig, decode_volume, diff_inr_configs, fit_new_volume,
+    fit_new_volume_adam, make_coord_grid,
 )
 from common.dataset import FlatLatentCacheDataset
 
@@ -57,6 +58,11 @@ def _backbone_config_from_cfg(cfg: dict) -> INRBackboneConfig:
         modulate_scale=bool(b.get("modulate_scale", False)),
         lora_rank=int(b.get("lora_rank", 0)),
         lora_inner_lr=(float(b["lora_inner_lr"]) if b.get("lora_inner_lr") is not None else None),
+        fit_optimizer=str(b.get("fit_optimizer", "sgd")),
+        adam_steps=int(b.get("adam_steps", 300)),
+        adam_lr_base=float(b.get("adam_lr_base", 1e-2)),
+        adam_lr_lora=float(b.get("adam_lr_lora", 1e-3)),
+        adam_points_per_step=int(b.get("adam_points_per_step", 262144)),
     )
 
 
@@ -196,11 +202,17 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
         # unchanged (B, 1, H, W, D). The real work — meta-learned fitting
         # (NOIR Algorithm 2) — happens here, not in the (no-op) vae.
         _ensure_loaded(z.device)
-        zfit = fit_new_volume(
-            _state["backbone"], z, _state["coords"],
-            num_steps=backbone_cfg.inner_steps_eval, lr=backbone_cfg.inner_lr,
-            num_points=fit_points, chunk_size=fit_chunk,
-        )
+        # DOIT rester identique a precompute_inr_latents.py : un z source fitte
+        # differemment ici qu'au precompute est hors distribution pour le flow
+        # (meme classe de bug que compat_orientation/compat_source_norm).
+        if backbone_cfg.fit_optimizer == "adam":
+            zfit = fit_new_volume_adam(_state["backbone"], z, _state["coords"])
+        else:
+            zfit = fit_new_volume(
+                _state["backbone"], z, _state["coords"],
+                num_steps=backbone_cfg.inner_steps_eval, lr=backbone_cfg.inner_lr,
+                num_points=fit_points, chunk_size=fit_chunk,
+            )
         return zfit, None
 
     def restore_latent(z: Tensor, meta: Any) -> Tensor:

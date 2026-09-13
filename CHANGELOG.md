@@ -63,6 +63,55 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-13 — Suite du 2026-09-10 : extension Adam au precompute lancée, Task 3 NÉGATIF et SÉVÈRE (la traduction s'effondre malgré une représentation meilleure)
+
+Reprise de la pause du 2026-09-10 : extension d'Adam (taux d'apprentissage
+séparés shift/LoRA) au precompute ET à l'inférence (`fit_new_volume_adam`,
+`src/cfm/inr_backbone.py`), backbone `hyper_hidden_dim=0`+`lora_rank=16`
+entraîné en entier (50000 pas, 14h46), precompute complet (1939 volumes,
+38.3h), flow entraîné (25000 pas, 53.5min). Un bug réel trouvé et corrigé en
+cours de route : `fit_new_volume_adam` ne forçait pas `torch.enable_grad()`,
+`RuntimeError` sous le `no_grad()` de l'inférence. Manifeste complet :
+`results/mmfm/inr_direct_lora16_task3_20260913/manifest.md`.
+
+**Porte de qualité (auto-reconstruction, 8 volumes) : EXCELLENTE.** Adam
+(300 pas) : nRMSE_fg **0.1734**, gate 8/8, ratio z0/fit 2.5-2.7 — contre 0.2387
+en SGD (mécanisme historique). Ce backbone représente MIEUX les volumes que la
+production actuelle.
+
+**Task 3 (traduction, géométrie `cc`) : NÉGATIF et sévère.**
+
+| | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| Vectorisé (production) | 0.3794 | 0.8975 | 0.0941 |
+| UNet (production) | 0.4033 | 0.8949 | 0.0953 |
+| INR (production, `inr_std`) | 0.3749 | 0.8631 | 0.1557 |
+| **INR direct LoRA16 (ce run)** | **0.4587** | **0.6939** | **0.3499** |
+
+**SSIM sous le témoin identité (0.6939 contre 0.8883)** : dégradation
+perceptuelle, pas seulement absence de gain. Gain vs identité **NÉGATIF** sur
+T2W (−31.6%) et T2FLAIR (−38.7%) — pire que recopier la source. INR
+(production) bat ce nouveau backbone sur 45/60 paires.
+
+**Troisième instance du phénomène « Volet 2 »** (2026-09-08) : améliorer la
+fidélité de représentation ne se transmet pas au score, et peut le dégrader
+activement — ici de façon bien plus sévère, sur un axe différent (capacité du
+latent, pas écrêtage). Deux causes plausibles, non départagées : (1)
+hétérogénéité d'échelle par dimension mesurée à ×49.9 (contre ×2.9 pour
+l'ancien cache MedVAE) mal servie par un scalaire unique de normalisation ;
+(2) rugosité de l'espace latent (déjà mesurée ×2.2-2.9 sur l'ancien latent
+1536-d, jamais retestée à cette échelle 30× plus grande, 46640-d) — chaque `z`
+est ajusté indépendamment pour reconstruire SON volume, sans contrainte de
+continuité entre volumes voisins que le flow doit pourtant traverser.
+
+**Verdict : cette tentative (rang 16, normalisation scalaire, sans
+régularisation) est close, NÉGATIVE.** Le correctif de code (bug LoRA du
+2026-09-10 + bug `enable_grad` du 2026-09-13) reste acquis, rétrocompatible et
+réutilisable. Pistes non testées : normalisation par sous-groupe shift/LoRA,
+régularisation de lissage sur `z`, rang LoRA plus petit.
+
+---
+
 ## 2026-09-10 — INR `hyper_hidden_dim=0`+`lora_rank=16` : bug d'init LoRA corrigé, mécanisme confirmé, PAUSE avant la production (l'optimiseur, pas la modulation, est le facteur limitant)
 
 Tentative d'entraîner un backbone INR nativement en modulation directe

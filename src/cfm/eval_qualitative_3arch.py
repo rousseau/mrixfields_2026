@@ -56,6 +56,7 @@ V_PROD = "outputs/mmfm/vectorized/predictions/task3"
 U_PROD = "outputs/mmfm/unet/predictions/task3"
 I_PROD = "outputs/mmfm/inr_std/predictions/task3"   # INR CORRIGEE (audit phase B)
 I_OLD = "outputs/mmfm/inr/predictions/task3"        # INR d'avant l'audit, gardee comme temoin
+I_LORA16 = "outputs/mmfm/inr_direct_lora16/predictions/task3"  # 2026-09-13, modulation directe+LoRA r=16
 C14 = RESULTS / "comparison_20260814_all_contrasts"
 C07 = RESULTS / "comparison_20260807_1mm"
 AUD = RESULTS / "audit_20260825"
@@ -78,6 +79,15 @@ METHODS: List[Tuple[str, Dict[str, Tuple[str, str]]]] = [
         "T1W": (I_PROD, str(AUD / "task3_inr_std_T1W.csv")),
         "T2W": (I_PROD, str(AUD / "task3_inr_std_T2W.csv")),
         "T2FLAIR": (I_PROD, str(AUD / "task3_inr_std_T2FLAIR.csv")),
+    }),
+    # INR modulation directe (hyper_hidden_dim=0) + LoRA rang 16, fitting Adam
+    # au precompute/inference — voir results/mmfm/inr_direct_lora16_smoke_20260910/
+    # manifest.md pour le mecanisme, results/mmfm/inr_direct_lora16_task3_20260913/
+    # pour ce resultat Task3.
+    ("INR direct LoRA16", {
+        "T1W": (I_LORA16, "results/mmfm/inr_direct_lora16_task3_20260913/task3_inr_direct_lora16_T1W.csv"),
+        "T2W": (I_LORA16, "results/mmfm/inr_direct_lora16_task3_20260913/task3_inr_direct_lora16_T2W.csv"),
+        "T2FLAIR": (I_LORA16, "results/mmfm/inr_direct_lora16_task3_20260913/task3_inr_direct_lora16_T2FLAIR.csv"),
     }),
 ]
 

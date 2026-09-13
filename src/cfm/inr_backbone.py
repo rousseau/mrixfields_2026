@@ -364,6 +364,22 @@ class INRBackboneConfig:
     # traitement séparé). `None` = comportement historique inchangé (aucun
     # effet tant que ce combo n'est pas activé).
     lora_inner_lr: Optional[float] = None
+    # Fitting de z au TEST-TIME (precompute_inr_latents.py / arch_inr.py::prep_latent),
+    # PAS le meta-entrainement (meta_train_step reste toujours en SGD differentiable,
+    # boucle interne unrolled). "sgd" = fit_latent (comportement historique, inchange).
+    # "adam" = fit_new_volume_adam : mesure le 2026-09-10 (voir CHANGELOG et
+    # results/mmfm/inr_direct_lora16_smoke_20260910/manifest.md) qu'a modulation
+    # directe+LoRA, Adam a taux d'apprentissage separes shift/LoRA bat la SGD a pas
+    # fixe de 30.7% relatif en 6.3x moins de temps (300 pas Adam vs 500 pas SGD).
+    # Doit rester IDENTIQUE entre precompute (cache d'entrainement) et prep_latent
+    # (inference sur volume source neuf) : une divergence donnerait au flow un z
+    # source hors distribution au moment de la traduction (meme classe de bug que
+    # compat_orientation/compat_source_norm, voir results/mmfm/audit_20260825/).
+    fit_optimizer: str = "sgd"
+    adam_steps: int = 300
+    adam_lr_base: float = 1e-2
+    adam_lr_lora: float = 1e-3
+    adam_points_per_step: int = 262144
 
 
 def diff_inr_configs(current: "INRBackboneConfig", expected: Optional[dict]) -> list:
@@ -638,6 +654,78 @@ def fit_new_volume(
         z = backbone.fit_latent(coords_b, values, num_steps, lr, create_graph=False,
                                 chunk_size=chunk_size)
     return z.detach()
+
+
+def fit_new_volume_adam(
+    backbone: INRBackbone,
+    volume: Tensor,
+    coords_full: Tensor,
+    num_steps: Optional[int] = None,
+    lr_base: Optional[float] = None,
+    lr_lora: Optional[float] = None,
+    points_per_step: Optional[int] = None,
+    generator: Optional[torch.Generator] = None,
+) -> Tensor:
+    """Alternative a fit_new_volume (SGD a pas fixe) pour la modulation
+    directe+LoRA (`backbone._direct_lora`) : Adam avec deux groupes de taux
+    d'apprentissage (shift/scale vs LoRA), points ré-échantillonnés à chaque
+    pas — PAS un sous-échantillon fixe réutilisé pour tous les pas comme
+    fit_new_volume. Reproduit exactement la méthode mesurée le 2026-09-10
+    (voir results/mmfm/inr_direct_lora16_smoke_20260910/manifest.md) : Adam à
+    300 pas bat la meilleure SGD à 500 pas de 30.7% relatif, en 6.3x moins de
+    temps. Volume: (B, 1, H, W, D). Retourne z: (B, latent_dim), détaché.
+
+    Réservé au TEST-TIME (precompute_inr_latents.py, arch_inr.py::prep_latent) :
+    pas de create_graph, pas d'usage dans meta_train_step (boucle interne
+    différentiable, qui reste en SGD — voir INRBackboneConfig.fit_optimizer).
+    Un seul volume à la fois (B doit valoir 1) : la génération de mini-lots via
+    torch.randint suppose une seule cible, comme tous les appelants actuels.
+    """
+    if not backbone._direct_lora:
+        raise ValueError(
+            "fit_new_volume_adam n'a de sens que pour hyper_hidden_dim=0 + lora_rank>0 "
+            "(modulation directe+LoRA) — sinon il n'y a pas de scission shift/LoRA a faire."
+        )
+    b = volume.shape[0]
+    if b != 1:
+        raise ValueError(f"fit_new_volume_adam ne supporte qu'un seul volume a la fois (B=1), reçu B={b}.")
+    device = coords_full.device
+    num_steps = num_steps or backbone.cfg.adam_steps
+    lr_base = lr_base if lr_base is not None else backbone.cfg.adam_lr_base
+    lr_lora = lr_lora if lr_lora is not None else backbone.cfg.adam_lr_lora
+    points_per_step = points_per_step or backbone.cfg.adam_points_per_step
+
+    mask = backbone._lora_mask.to(device)
+    # Indispensable : les appelants a l'inference (arch_inr.py::prep_latent, via
+    # infer_mmfm_unified.py) tournent sous un `torch.no_grad()` englobant.
+    # `requires_grad_(True)` seul ne suffit pas a reactiver la construction du
+    # graphe si le contexte ambiant l'interdit — sans ce bloc, `loss.backward()`
+    # leve "element 0 of tensors does not require grad and does not have a
+    # grad_fn". `fit_new_volume`/`fit_latent` ont le meme besoin (voir leur
+    # propre `with torch.enable_grad():`).
+    with torch.enable_grad():
+        z0 = backbone.siren.init_direct_modulation(device).squeeze(0)
+        base = (z0 * (~mask)).clone().requires_grad_(True)
+        lora = (z0 * mask).clone().requires_grad_(True)
+        opt = torch.optim.Adam([{"params": [base], "lr": lr_base}, {"params": [lora], "lr": lr_lora}])
+
+        values_full = volume.reshape(1, -1, 1)
+        n = coords_full.shape[0]
+        gen = generator if generator is not None else torch.Generator(device=device)
+        if generator is None:
+            gen.manual_seed(1234)
+        for _ in range(num_steps):
+            idx = torch.randint(0, n, (points_per_step,), device=device, generator=gen)
+            c = coords_full[idx].unsqueeze(0)
+            t = values_full[:, idx]
+            z = torch.where(mask, lora, base).unsqueeze(0)
+            pred = backbone.decode(c, z)
+            loss = _weighted_mse(pred, t, backbone.cfg.fg_weight, backbone.cfg.bg_threshold)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+        z_final = torch.where(mask, lora, base).unsqueeze(0)
+    return z_final.detach()
 
 
 @torch.no_grad()
