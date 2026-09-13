@@ -57,6 +57,7 @@ U_PROD = "outputs/mmfm/unet/predictions/task3"
 I_PROD = "outputs/mmfm/inr_std/predictions/task3"   # INR CORRIGEE (audit phase B)
 I_OLD = "outputs/mmfm/inr/predictions/task3"        # INR d'avant l'audit, gardee comme temoin
 I_LORA16 = "outputs/mmfm/inr_direct_lora16/predictions/task3"  # 2026-09-13, modulation directe+LoRA r=16
+I_LORA16_PG = "outputs/mmfm/inr_direct_lora16_pergroup/predictions/task3"  # idem + normalisation par groupe shift/LoRA
 C14 = RESULTS / "comparison_20260814_all_contrasts"
 C07 = RESULTS / "comparison_20260807_1mm"
 AUD = RESULTS / "audit_20260825"
@@ -88,6 +89,14 @@ METHODS: List[Tuple[str, Dict[str, Tuple[str, str]]]] = [
         "T1W": (I_LORA16, "results/mmfm/inr_direct_lora16_task3_20260913/task3_inr_direct_lora16_T1W.csv"),
         "T2W": (I_LORA16, "results/mmfm/inr_direct_lora16_task3_20260913/task3_inr_direct_lora16_T2W.csv"),
         "T2FLAIR": (I_LORA16, "results/mmfm/inr_direct_lora16_task3_20260913/task3_inr_direct_lora16_T2FLAIR.csv"),
+    }),
+    # Meme backbone/cache, SEULE la normalisation d'entree du flow change
+    # (scalaire unique -> vecteur par groupe shift/LoRA) - test de l'hypothese
+    # d'heterogeneite d'echelle, voir results/mmfm/inr_direct_lora16_task3_20260913/manifest.md.
+    ("INR direct LoRA16 pergroup", {
+        "T1W": (I_LORA16_PG, "results/mmfm/inr_direct_lora16_pergroup_task3_20260913/task3_inr_direct_lora16_pergroup_T1W.csv"),
+        "T2W": (I_LORA16_PG, "results/mmfm/inr_direct_lora16_pergroup_task3_20260913/task3_inr_direct_lora16_pergroup_T2W.csv"),
+        "T2FLAIR": (I_LORA16_PG, "results/mmfm/inr_direct_lora16_pergroup_task3_20260913/task3_inr_direct_lora16_pergroup_T2FLAIR.csv"),
     }),
 ]
 

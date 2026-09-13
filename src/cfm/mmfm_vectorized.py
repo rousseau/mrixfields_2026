@@ -122,8 +122,8 @@ class VectorMMFM(nn.Module):
         time_embed_dim: int = 256,
         class_embed_dim: int = 128,
         dropout: float = 0.0,
-        latent_mean: float = 0.0,
-        latent_scale: float = 1.0,
+        latent_mean=0.0,
+        latent_scale=1.0,
         time_scale: float = 1.0,
         time_cond: str = "concat",
     ):
@@ -202,8 +202,17 @@ class VectorMMFM(nn.Module):
         # donc les checkpoints anterieurs se chargent inchanges. Les valeurs
         # viennent de la config et sont consignees dans `arch_meta`.
         # Defauts (0, 1) = strictement sans effet.
-        self.register_buffer("latent_mean", torch.tensor(float(latent_mean)), persistent=False)
-        self.register_buffer("latent_scale", torch.tensor(float(latent_scale)), persistent=False)
+        #
+        # `latent_mean`/`latent_scale` acceptent un scalaire (comportement
+        # historique) OU un vecteur (latent_dim,) — `torch.as_tensor` traite
+        # les deux cas identiquement, et la soustraction/division ci-dessous
+        # broadcast un (latent_dim,) contre (B, latent_dim) sans changement de
+        # code. Motive par une heterogeneite d'echelle par dimension mesuree
+        # x49.9 (min/max) sur le latent INR direct+LoRA — un scalaire unique
+        # y normalise mal un melange shift/LoRA a des echelles tres differentes
+        # (voir results/mmfm/inr_direct_lora16_task3_20260913/manifest.md).
+        self.register_buffer("latent_mean", torch.as_tensor(latent_mean, dtype=torch.float32), persistent=False)
+        self.register_buffer("latent_scale", torch.as_tensor(latent_scale, dtype=torch.float32), persistent=False)
 
     def forward(
         self,

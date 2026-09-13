@@ -25,6 +25,18 @@ REQUIRES_SPATIAL_VAE = False
 DEFAULT_CACHE_ROOT = "outputs/mmfm/latent_cache/vectorized"
 
 
+def _load_latent_norm(m: dict, key: str, default: float):
+    """`model.{key}` scalaire (comportement historique) OU `model.{key}_path`
+    pointant un `.pt` (latent_dim,) — pour un latent hétérogène par groupe de
+    dimensions (ex. shift vs LoRA), voir VectorMMFM.__init__ et
+    results/mmfm/inr_direct_lora16_task3_20260913/manifest.md. Le chemin, s'il
+    est présent, l'emporte sur la valeur scalaire."""
+    path = m.get(f"{key}_path")
+    if path:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    return float(m.get(key, default))
+
+
 def build_vector_mmfm(cfg: dict, latent_dim: int, n_classes: int) -> VectorMMFM:
     m = cfg["model"]
     return VectorMMFM(
@@ -36,8 +48,8 @@ def build_vector_mmfm(cfg: dict, latent_dim: int, n_classes: int) -> VectorMMFM:
         class_embed_dim=int(m.get("class_embed_dim", 128)),
         dropout=float(m.get("dropout", 0.0)),
         # (0, 1) par defaut : sans effet, les checkpoints existants restent valides.
-        latent_mean=float(m.get("latent_mean", 0.0)),
-        latent_scale=float(m.get("latent_scale", 1.0)),
+        latent_mean=_load_latent_norm(m, "latent_mean", 0.0),
+        latent_scale=_load_latent_norm(m, "latent_scale", 1.0),
         # 1.0 par defaut = comportement historique (voir VectorMMFM.__init__).
         time_scale=float(m.get("time_scale", 1.0)),
         # "concat" par defaut = comportement historique, checkpoints valides.

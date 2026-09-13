@@ -63,6 +63,30 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-14 — L'hétérogénéité d'échelle est ÉCARTÉE comme cause du désastre Task 3 de l'INR direct+LoRA16
+
+Suite immédiate de l'entrée précédente. Deux causes plausibles y étaient
+identifiées pour l'effondrement Task 3 : (1) hétérogénéité d'échelle par
+dimension (×49.9), (2) rugosité de l'espace latent. Ce test isole (1) :
+`VectorMMFM`/`arch_vector.py` acceptent désormais un vecteur `(latent_dim,)`
+en plus d'un scalaire pour `latent_mean`/`latent_scale`
+(`model.latent_mean_path`/`latent_scale_path`, rétrocompatible). Vecteur =
+constante par groupe (shift vs LoRA), mesurée sur le MÊME cache — backbone et
+precompute réutilisés tels quels, seul le flow réentraîné (25000 pas, 80 min).
+Manifeste : `results/mmfm/inr_direct_lora16_pergroup_task3_20260913/manifest.md`.
+
+**Résultat : AUCUN changement mesurable.** nRMSE 0.4586 contre 0.4587
+(scalaire), SSIM 0.6906 contre 0.6939, duel paire à paire 33/60 — dans le
+bruit. **L'hétérogénéité d'échelle n'est pas la cause.**
+
+Reste la rugosité de l'espace latent, non testée directement : le diagnostic
+dédié (`diagnose_inr_latent_smoothness.py`) s'est montré anormalement lent
+sur cette architecture (>2h30 sans terminer, probablement le surcoût LoRA par
+appel `decode`) et a été interrompu sans résultat exploitable. Aucune piste
+supplémentaire engagée après ce résultat.
+
+---
+
 ## 2026-09-13 — Suite du 2026-09-10 : extension Adam au precompute lancée, Task 3 NÉGATIF et SÉVÈRE (la traduction s'effondre malgré une représentation meilleure)
 
 Reprise de la pause du 2026-09-10 : extension d'Adam (taux d'apprentissage

@@ -223,10 +223,13 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
         return state_dict
 
     def arch_meta_dict() -> dict:
+        m = cfg.get("model", {})
         return {
             "latent_dim": int(latent_dim),
-            "latent_mean": float(cfg.get("model", {}).get("latent_mean", 0.0)),
-            "latent_scale": float(cfg.get("model", {}).get("latent_scale", 1.0)),
+            # Chemin (normalisation par groupe de dimensions) si present, sinon
+            # le scalaire — voir arch_vector.py::_load_latent_norm.
+            "latent_mean": m.get("latent_mean_path") or float(m.get("latent_mean", 0.0)),
+            "latent_scale": m.get("latent_scale_path") or float(m.get("latent_scale", 1.0)),
             "volume_size": tuple(int(v) for v in volume_size),
             "inr_backbone_checkpoint": str(cfg.get("inr_backbone", {}).get("checkpoint", "")),
             "fit_points": fit_points,

@@ -1,0 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM à latent INR direct+LoRA16 — TEST : normalisation PAR GROUPE (shift vs
+# LoRA) au lieu d'un scalaire unique (2026-09-13).
+#
+# Motivation : inr_direct_lora16.yaml a mesuré Task 3 NÉGATIF et sévère
+# malgré une capacité de représentation excellente (voir
+# results/mmfm/inr_direct_lora16_task3_20260913/manifest.md). Deux causes
+# plausibles non départagées : (1) hétérogénéité d'échelle par dimension
+# (×49.9 mesuré, contre ×2.9 pour l'ancien cache MedVAE) mal servie par un
+# scalaire unique ; (2) rugosité de l'espace latent. Ce fichier teste
+# UNIQUEMENT la cause (1) : `latent_mean_path`/`latent_scale_path` pointent
+# des vecteurs (46640,) valant une constante sur la portion shift (1536 dims)
+# et une autre sur la portion LoRA (45104 dims) — construits par
+# scripts/build_pergroup_norm (mean/std mesurés séparément par groupe sur le
+# cache inr_e124f7c5). Le backbone ET le cache de latents sont RÉUTILISÉS TELS
+# QUELS (aucun re-precompute) — seul le flow est réentraîné.
+#
+# Tout le reste (backbone, cache, `inr_backbone:`, `train:`, `inference:`) est
+# IDENTIQUE à inr_direct_lora16.yaml — seule la normalisation d'entrée du flow
+# change, pour isoler cette seule variable.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_inr
+task_name: mmfm_inr_direct_lora16_pergroup
+
+vae:
+  vae_type: identity
+
+inr_backbone:
+  checkpoint: outputs/mmfm/inr_backbone_direct_lora16/weights/model_final.pth
+  latent_dim: 46640
+  hidden_dim: 256
+  num_hidden_layers: 6
+  omega_0: 30.0
+  omega_hidden: 30.0
+  hyper_hidden_dim: 0
+  lora_rank: 16
+  lora_inner_lr: 1.0e-4
+  inner_lr: 0.01
+  inner_steps_train: 10
+  inner_steps_eval: 20
+  fit_points: 1048576
+  fg_weight: 5.0
+  bg_threshold: -0.9
+  fit_optimizer: adam
+  adam_steps: 300
+  adam_lr_base: 1.0e-2
+  adam_lr_lora: 1.0e-3
+  adam_points_per_step: 262144
+
+model:
+  # Normalisation PAR GROUPE (shift: mean=2.670626e-04 std=4.273351e-02,
+  # LoRA: mean=-7.259900e-06 std=1.410832e-02), construite sur le MEME cache
+  # inr_e124f7c5 que inr_direct_lora16.yaml (mesures brutes identiques,
+  # seulement séparées par groupe au lieu d'agrégées en un scalaire global).
+  latent_mean_path: outputs/mmfm/latent_cache/inr/inr_e124f7c5/latent_mean_pergroup.pt
+  latent_scale_path: outputs/mmfm/latent_cache/inr/inr_e124f7c5/latent_scale_pergroup.pt
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  split: retro_train
+  output_subdir: mmfm/inr_direct_lora16_pergroup
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/inr
+  latent_cache_dir: outputs/mmfm/latent_cache/inr/inr_e124f7c5/retro_train
+  latent_preload_ram: true
+  flip_lr_prob: 0.0
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  batch_size: 1
+  total_iters: 25000
+  num_targets_per_step: 1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  adjacent_only: false
+  identity_prob: 0.1
+  accumulation_steps: 1
+  save_every: 2500
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  compat_orientation: true
+  compat_source_norm: true
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed
