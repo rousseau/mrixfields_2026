@@ -82,8 +82,20 @@ bruit. **L'hétérogénéité d'échelle n'est pas la cause.**
 Reste la rugosité de l'espace latent, non testée directement : le diagnostic
 dédié (`diagnose_inr_latent_smoothness.py`) s'est montré anormalement lent
 sur cette architecture (>2h30 sans terminer, probablement le surcoût LoRA par
-appel `decode`) et a été interrompu sans résultat exploitable. Aucune piste
-supplémentaire engagée après ce résultat.
+appel `decode`) et a été interrompu sans résultat exploitable.
+
+**CLÔTURE (décision utilisateur, 2026-09-14) : piste fermée ici.** Ni la
+rugosité (diagnostic à écrire), ni un rang LoRA plus petit (4 ou 8, nouveau
+cycle complet ~50h) ne seront poursuivis pour l'instant. Bilan de la tentative
+« modulation directe + LoRA rang 16 » sur ses trois volets (2026-09-10,
+2026-09-13, 2026-09-14) : ~70h de calcul GPU sur 4 jours ; un bug de code réel
+trouvé et corrigé (init LoRA morte) et conservé, réutilisable pour toute
+reprise future ; deux hypothèses de cause posées, une écartée proprement
+(échelle), une non tranchée (rugosité) faute d'outil de diagnostic adapté à
+cette échelle ; le score Task 3 reste négatif et sévère dans toutes les
+variantes testées. Rouvrir cette piste supposerait soit un diagnostic de
+rugosité correctement dimensionné, soit un budget de calcul pour un nouveau
+rang.
 
 ---
 
