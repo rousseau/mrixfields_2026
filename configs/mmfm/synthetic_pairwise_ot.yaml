@@ -1,0 +1,75 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# HARNAIS DE VALIDATION — H1 (2026-09-15), marginal_mode: pairwise_ot.
+#
+# Copie de configs/mmfm/synthetic.yaml (le harnais a reponse connue), SEULE
+# clé nouvelle : train.marginal_mode: pairwise_ot + model.time_cond: film
+# (pour tester la config qu'on compte utiliser sur données réelles,
+# configs/mmfm/vectorized_pairwise_cond.yaml). Exerce le VRAI code de
+# `mmfm_core.train()` : couplage OT chaîné réutilisé (build_chained_ot_trajectories),
+# _compute_flow en LOCAL (t_i=0, t_j=1, sans rescale), conditionnement
+# (contraste, champ source, champ cible) via `_flat_triple`.
+#
+# Usage :
+#   PYTHONPATH=src python src/cfm/train_mmfm_unified.py \
+#       --method mmfm3d_synthetic --config configs/mmfm/synthetic_pairwise_ot.yaml --env local
+#   PYTHONPATH=src python scripts/eval_synthetic_pairwise_ot.py \
+#       --config configs/mmfm/synthetic_pairwise_ot.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+task_name: mmfm_synthetic_pairwise_ot
+method: mmfm3d_synthetic
+
+vae:
+  vae_type: identity
+
+synthetic:
+  dim: 64
+  bend: 0.6
+  subject_scale: 1.0
+  noise: 0.05
+  seed: 0
+
+model:
+  time_scale: 1000.0
+  time_cond: film
+  hidden_dim: 512
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  latent_mean: 0.0
+  latent_scale: 1.0
+
+data:
+  modalities: [c0, c1, c2]
+  fields: [f0, f1, f2, f3, f4]
+  output_subdir: mmfm/synthetic_pairwise_ot
+  split: retro_train
+  volume_size: [4, 4, 4]
+  target_spacing: [1.0, 1.0, 1.0]
+  num_workers: 0
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/synthetic_pairwise_ot
+  latent_cache_dir: outputs/mmfm/synthetic_pairwise_ot/generated
+  n_per_class: 256
+  data_seed: 1
+
+train:
+  marginal_mode: pairwise_ot
+  loss: mse
+  total_iters: 4000
+  batch_size: 64
+  num_targets_per_step: 2
+  lr: 1.0e-3
+  warmup_steps: 100
+  sigma: 0.0
+  ot_method: exact
+  identity_prob: 0.1
+  adjacent_only: false
+  accumulation_steps: 1
+  use_amp: false
+  grad_clip: 1.0
+  ema_decay: 0.999
+  save_every: 2000
+  print_every: 200
+  keep_checkpoints: 1

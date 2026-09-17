@@ -63,6 +63,573 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-17 — Confirmation en géométrie `8win` (protocole officiel) : le résultat du fine-tuning LOO tient
+
+**Suite immédiate de l'entrée précédente**, à la demande explicite de
+confirmer sous la géométrie des chiffres officiellement publiés (`8win`, 8
+fenêtres décalées fusionnées par Hann — pas `cc`). Chaîne complète relancée :
+3 replis LOO (mêmes checkpoints : excl0006/checkpoint_1050,
+excl0007/checkpoint_450, excl0009/checkpoint_900) + baseline production
+fraîchement recalculée sur `model_final.pth` — 360 volumes, 5.2h pour la seule
+baseline production (104 s/volume × 180, coût `8win` déjà documenté le
+2026-09-07). Intégrité vérifiée : 0 fichier corrompu sur 360 (leçon du
+2026-09-16 appliquée d'emblée).
+
+| métrique | fine-tuning LOO | production (`8win`, frais) | delta | gagne sur | Wilcoxon p |
+|---|---|---|---|---|---|
+| nRMSE | 0.3320 | 0.3394 | −0.0074 | 32/60 | 0.508 (NS) |
+| **SSIM** | **0.8468** | 0.8313 | **+0.0155** | **39/60** | **0.0031** |
+| **LPIPS** | **0.1945** | 0.2060 | **−0.0116** | **44/60** | **1.2e-05** |
+
+**Le motif tient sous le protocole officiel** : SSIM et LPIPS s'améliorent de
+façon significative (p=0.0031 et p=1.2e-5), nRMSE progresse dans la même
+direction sans atteindre la significativité (32/60, p=0.51) — légèrement plus
+faible qu'en `cc` (34/60, p=0.13) mais qualitativement identique. Aucune des
+trois métriques ne s'inverse de sens entre les deux géométries.
+
+**Hétérogénéité par contraste, notable** :
+
+| contraste | nRMSE fine-tune vs production | verdict |
+|---|---|---|
+| T1W | 0.3508 vs **0.4285** | net gain (le contraste historiquement le plus dur) |
+| T2W | 0.3399 vs **0.2714** | **régression** — production déjà meilleure ici |
+| T2FLAIR | 0.3053 vs 0.3184 | léger gain |
+
+Le gain global en nRMSE est tiré par T1W et partiellement annulé par une
+régression sur T2W — cohérent avec la non-significativité de la moyenne
+agrégée, et avec le constat déjà ancien du projet que les trois contrastes ne
+répondent jamais de façon homogène aux mêmes leviers (voir l'entrée du
+2026-08-14, « T1W n'était pas représentatif »).
+
+**Bilan de la piste `pro_pretrained`** : confirmé sous les deux géométries,
+c'est le premier levier qui améliore SSIM/LPIPS significativement sans
+dégrader le nRMSE (contrairement à H1/H2/MedVAE-LPIPS). Reste non tranché :
+la régression T2W, le choix du point d'arrêt par repli (nRMSE latent, pas
+Task 3), et si un budget de fine-tuning plus long ou une perte de contenu
+(LPIPS/SSIM directe, comme le fait le baseline officiel) améliorerait encore
+la marge — pistes pour une suite, non engagées ici.
+
+---
+
+## 2026-09-16 (soir) — Fine-tuning supervisé LOO sur `pro_train` (`pro_pretrained`) : premier résultat Task 3 positif de l'investigation — significativité en attente
+
+**Motivation.** Suite directe de l'audit de référence du 2026-09-15 et de la
+lecture du code officiel du challenge (`~/Code/MRIxFields2026/Baseline/`) :
+jamais testé, la recette `pro_pretrained` recommandée pour les baselines GAN
+(pré-entraînement non apparié + fine-tuning supervisé sur les 3 sujets
+prospectifs réellement appariés). Voir le plan
+`~/.claude/plans/actuellement-l-tape-de-repr-sentation-radiant-moonbeam.md`.
+
+**Prérequis** : cache `pro_train` corrigé (entrée du jour, ci-dessous).
+
+**Méthode** : nouveau `src/cfm/make_pro_train_loo_indexes.py` (3 index LOO,
+30 entrées chacun) ; 3 configs `configs/mmfm/vectorized_finetune_loo_excl{0006,0007,0009}.yaml`
+(copies de `vectorized_trajectory.yaml`, `train.resume`/`resume_weights_only`
+depuis le checkpoint de production, `total_iters: 1500`, `ema_decay: 0.99`).
+**Zéro nouvelle ligne dans `mmfm_core.py`** : le couplage OT chaîné existant,
+sur `pro_train` (2 sujets par repli, vraie correspondance), retrouve
+directement la VRAIE trajectoire de chaque sujet — déjà validé 180/180.
+**Vérifié avant de lancer** : `lambda_edge_fwd`/`lambda_cycle` sont des
+no-op garantis en `marginal_mode=trajectory` (`t_i=t_j=t_anchor`, rollout sur
+`dt=0`) — retirés des configs, Phase 1 teste donc uniquement l'effet de la
+vraie trajectoire sur la perte de flow matching elle-même.
+
+**Porte rapide avant Task 3** (`src/cfm/diagnose_finetune_checkpoints.py`,
+nRMSE latent DIRECT contre la vraie cible du sujet tenu à l'écart — pas un
+proxy, contrairement au 2026-09-15) :
+
+| repli (sujet exclu) | production | meilleur fine-tuné | itération |
+|---|---|---|---|
+| 0006 | 0.2723 | 0.2653 | 1050 |
+| 0007 | 0.2717 | 0.2552 | 450 |
+| 0009 | 0.2363 | 0.2126 | 900 |
+
+Amélioration dans les 3 replis, non monotone dans le temps (attendu, budget de
+30 volumes) — porte franchie, passage à l'éval Task 3 officielle.
+
+**Éval Task 3 officielle (géométrie `cc`, agrégée sur les 3 replis — chaque
+sujet noté par le modèle qui NE l'a PAS vu)** : nouveaux
+`scripts/run_task3_eval_loo.sh` (inférence, écrit dans un dossier partagé —
+`evaluate.py` exige les 3 sujets prospectifs présents et ne sait pas noter un
+sous-ensemble) et `scripts/eval_task3_loo_aggregate.sh` (évaluation, une fois
+les 3 replis déposés).
+
+**Incident de données rencontré et corrigé** : le tout premier essai
+d'inférence (repli 0006) a été interrompu par une extinction mémoire du
+système (hors de notre contrôle) pendant l'écriture d'un volume ; `--skip_existing`
+n'a pas détecté ce fichier `.nii.gz` tronqué comme invalide au réessai.
+Repéré par le crash de `evaluate.py` (`EOFError` gzip), confirmé par une
+vérification systématique des 180 fichiers (1 seul corrompu), régénéré. Leçon :
+`--skip_existing` vérifie l'existence, pas l'intégrité — à surveiller après
+toute interruption forcée d'un job d'inférence.
+
+| | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| **fine-tuning LOO** (T1W/T2W/T2FLAIR) | 0.3567 / 0.3450 / 0.3096 → **0.3371** | 0.8414 / 0.8237 / 0.8299 → **0.8317** | 0.1883 / 0.1758 / 0.1768 → **0.1803** |
+
+**Comparaison rigoureuse, appariée** : le chiffre `cc` de production archivé
+(0.3581/0.8379, entrée du 2026-09-05) n'est PAS strictement comparable — il
+date de plusieurs semaines et sa provenance exacte (checkpoint, cache) n'est
+pas ré-auditée ici. Baseline `cc` **fraîche**, recalculée aujourd'hui même sur
+`outputs/mmfm/vectorized_trajectory/weights/model_final.pth` (même géométrie,
+même 180 volumes, même `evaluate.py`) :
+`outputs/mmfm/vectorized_trajectory/predictions_cc_baseline_20260916/` — 180
+volumes vérifiés sans corruption. Test apparié (signes + Wilcoxon) sur les 60
+cellules (contraste × paire) communes :
+
+| métrique | fine-tuning LOO | production (frais, `cc`) | delta | gagne sur | Wilcoxon p |
+|---|---|---|---|---|---|
+| nRMSE | 0.3371 | 0.3549 | **−0.0178** (−5.0 %) | 34/60 | 0.133 (NS) |
+| **SSIM** | **0.8317** | 0.8098 | **+0.0218** | **46/60** | **3.5e-06** |
+| **LPIPS** | **0.1803** | 0.1928 | **−0.0126** | **41/60** | **6.4e-05** |
+
+**Verdict : SSIM et LPIPS s'améliorent de façon hautement significative ; le
+nRMSE s'améliore dans la même direction mais n'atteint pas la significativité**
+(34/60, p=0.133 — même schéma qualitatif que H1 le 2026-09-15, mais dans le
+bon sens). **C'est un renversement du motif établi trois fois de suite
+(2026-09-02 LPIPS/MedVAE, 2026-09-05 mécanisme réparé, 2026-09-15 H1/H2)** :
+« toucher le conditionnement/la représentation ne fait jamais progresser le
+nRMSE de façon significative ET dégrade systématiquement SSIM/LPIPS ». Ici,
+nRMSE ne progresse pas significativement (cohérent avec le motif), mais
+SSIM/LPIPS **progressent** au lieu de se dégrader — la première fois dans
+toute cette investigation qu'un levier améliore la qualité perceptuelle sans
+la payer en distorsion.
+
+**Incident de comparaison, corrigé en direct** : la première rédaction de
+cette entrée comparait au chiffre archivé (0.3581/0.8379) sans le recalculer —
+erreur de méthode signalée et réparée avant publication, pas après : toujours
+recalculer la baseline sous EXACTEMENT le même run que la comparaison,
+jamais réutiliser un chiffre historique par confiance.
+
+**Limites, à instruire avant toute conclusion définitive** : (1) fine-tuning
+sur 2 sujets par repli, budget 1500 itérations non poussé jusqu'à un plateau
+identifié — le point d'arrêt optimal par repli reste approximatif (choisi sur
+le nRMSE latent, pas sur le Task 3 lui-même, pour des raisons de coût) ; (2)
+n=3 sujets pour le LOO — la significativité SSIM/LPIPS tient sur 60 cellules
+mais seulement 3 sujets réels, donc 3 modèles fine-tunés indépendants ; (3)
+geometrie `cc`, pas encore confirmé en `8win` (protocole des chiffres
+officiellement publiés).
+
+---
+
+## 2026-09-16 — Cache `pro_train` mal encodé, corrigé ; les chiffres fondateurs (71.7 %, 180/180) tiennent
+
+**Découvert en préparant un fine-tuning supervisé** (recette officielle
+`pro_pretrained` du challenge, voir plus bas) : le cache
+`medvae_finetune_c4d1e200/pro_train/` (utilisé par `diagnose_coupling_real.py`
+et `diagnose_true_displacement.py`) a été écrit par `precompute_mmfm_latents.py`
+(fenêtre glissante, `encode_scheme: medvae_sliding_window`), alors que
+`retro_train` — sous le MÊME identifiant de cache — a été écrit par
+`precompute_unet_latents.py` + conversion (**tuilé**, `encode_scheme: tiled`).
+C'est exactement la collision documentée dans `flat_latent_cache_id`
+(`src/common/dataset.py`) pour `medvae_finetune_1989e9d1`/`ff550d64` — sauf que
+`pro_train` semble être resté sur l'ancien chemin sans jamais être régénéré,
+malgré le correctif du 2026-09-07 qui a ajouté `encode_scheme` à l'index
+(champ *backfillé*, donc déduit, pas re-mesuré — voir son propre avertissement).
+
+**Corrigé** : `precompute_unet_latents.py --split pro_train` (tuilé, 45
+volumes, 3.8 min) + `convert_unet_cache_to_flat.py`, puis copie dans
+`medvae_finetune_c4d1e200/pro_train/` (ancien cache préservé dans
+`pro_train.bak_sliding_window_20260916/`). `index.json` porte désormais
+`encode_scheme: tiled`, cohérent avec `retro_train`.
+
+**Impact sur les chiffres déjà publiés — mesuré, pas supposé** : les deux
+scripts qui lisent `pro_train` ont été relancés sur le cache corrigé.
+
+| mesure | ancien cache (sliding window) | cache corrigé (tuilé) |
+|---|---|---|
+| OT plein, appariement exact | 180/180 (1.000) | **180/180 (1.000), inchangé** |
+| part du VRAI déplacement propre au sujet | 0.7173 | **0.7247** |
+
+**Écart de 0.0074, dans le bruit.** Les deux mesures qui portent tout le
+diagnostic du plateau (couplage parfait quand une correspondance existe ;
+71–72 % du vrai déplacement propre au sujet) sont donc confirmées
+indépendamment du schéma d'encodage — attendu, puisque les deux comparent des
+champs entre eux AU SEIN du même cache, jamais contre `retro_train`. Le défaut
+ne remettait rien en cause de fond, mais aurait contaminé toute comparaison
+future entre `pro_train` et un modèle entraîné sur `retro_train` — exactement
+ce qu'un fine-tuning supervisé sur `pro_train` s'apprête à faire, d'où la
+correction avant de s'en servir.
+
+---
+
+## 2026-09-15 (soir) — Code de référence Genentech/MMFM, NON MODIFIÉ, sur les vrais latents : capture la composante propre au sujet que `mmfm_core.py` rate. Piste code/architecture ROUVERTE.
+
+**Motivation.** Trois audits précédents (2026-09-04, 2026-09-14/15) comparaient à
+des références en **réimplémentant** leurs idées dans `mmfm_core.py` (couplage OT
+chaîné « à la Genentech », FiLM « à la NVIDIA »…). Aucun n'avait fait tourner le
+**code d'un dépôt de référence tel quel**, bout en bout, sur les données réelles du
+projet. Nouveau script : `src/cfm/diagnose_reference_mmfm.py`.
+
+**Méthode.** `external/MMFM` (Genentech, vendorisé, **zéro ligne modifiée**) —
+`MultiMarginalFlowMatcher.sample_location_and_conditional_flow`
+(`multi_marginal_fm.py`) + `VectorFieldModel` (`models.py`) — entraîné sur les
+MÊMES latents réels que la production (`medvae_finetune_c4d1e200/retro_train`),
+via le MÊME couplage OT chaîné que `mmfm_core.py`
+(`build_chained_ot_trajectories`, déjà validé : `diagnose_coupling_real.py`,
+180/180). Seule dépendance manquante installée : `addict` (`pip install --user
+addict`). Boucle d'entraînement copiée de
+`external/MMFM/experiments/synthetic_data/train_mmfm.py:214-238` (MSE, Adam).
+
+**Porte synthétique (harnais à réponse connue, avant tout calcul réel)** :
+8000 itérations, `hidden_dim=128`, `lr=3e-4` → nRMSE **0.0579** (plancher 0.05),
+courbure/vraie **0.92-1.06** (contre 0.02-0.21 à `lr=1e-3`/`hidden_dim=512` — la
+première tentative, mal réglée, ne passait PAS la porte). L'adaptateur est
+correctement câblé : le code de référence résout le problème à réponse connue.
+
+**Entraînement réel** : `hidden_dim=512` (budget comparable au vectorisé de
+production), `lr=3e-4`, `batch_size=32`, `grad_clip=1.0`, 4000 itérations,
+24.6 min (`0.369 s/pas` — le spline scipy non modifié de la référence coûte
+~1.2 s/pas à `batch_size=64` en dimension 129 024, d'où le budget réduit vs. les
+25 000 itérations/2 h07 de production — limite mesurée et assumée, pas cachée).
+Perte stabilisée ~1500-1650 dès ~1500 itérations.
+
+**Résultat — part du déplacement propre au sujet** (même mesure que
+`diagnose_flow_translation.py`, sur le modèle de référence, checkpoints tous les
+500 pas) :
+
+| itération | part propre au sujet |
+|---|---|
+| 500 | 0.6853 |
+| 1000 | 0.6694 |
+| 2000 | 0.7456 |
+| 3000 | 0.5395 |
+| 4000 | 0.6483 |
+| **production (`mmfm_core.py`)** | **0.0348** |
+| **R-best, mécanisme réparé (2026-09-05)** | **0.0825** |
+| **VRAI déplacement** (`diagnose_true_displacement.py`) | **0.7173** |
+
+**Stable dans la bande 0.54-0.75 dès le premier checkpoint (500 pas) et à
+travers les 8 checkpoints** — ce n'est PAS un transitoire comme celui qui avait
+trompé l'analyse du 2026-09-05 (« trois points pris dans un transitoire ne font
+pas une tendance »). `cos(v(t=0),v(t=1))` reste pourtant très proche de 1
+(0.9968-1.000 selon le contraste/checkpoint) : contrairement au mécanisme
+« réparé » de production (`cos = -0.592`), ce n'est donc PAS une dépendance
+temporelle forte qui explique l'écart, mais une dépendance à l'état COURANT `z`
+que l'architecture de référence (MLP simple, concaténation brute
+`[z, classe, t]`, sans FiLM ni `time_scale`) préserve et que `arch_vector.py` ne
+préserve pas.
+
+**Témoin de sanité** (magnitude/dispersion, pas de divergence) : `‖z_pred‖`
+proche de `‖z_réel‖` sur toutes les cellules testées (ex. T1W→7T : 9090.6 contre
+9168.7 ; T2FLAIR→3T : 9585.4 contre 9376.8), rang effectif prédit du même ordre
+que le rang réel (8.6-13.4 contre 13.2-14.1). Le modèle ne diverge pas et ne
+produit pas un nuage dégénéré — la composante propre au sujet mesurée n'est pas
+un artefact d'explosion numérique.
+
+**Ce que ceci établit** : sur des données et un couplage IDENTIQUES à la
+production, un code de référence indépendant et non modifié capture une part du
+déplacement propre au sujet du même ordre que le VRAI déplacement (65 % contre
+71.7 %), là où `mmfm_core.py`/`arch_vector.py` n'en capture que 3.5-8.25 %. **La
+thèse « 0 sujet apparié → composante individuelle inapprenable → limite des
+données irréductible » ne peut donc plus être la cause UNIQUE** : la même
+donnée, le même couplage, permettent visiblement d'apprendre davantage avec une
+architecture différente.
+
+**Ce que ceci n'établit PAS encore** : `own_share` élevé prouve que le flow de
+référence n'est pas une translation pure, PAS qu'il transporte juste (vers la
+bonne cible). Deux réserves explicites : (1) 4000 itérations est nettement moins
+que les 25 000 de production en TERMES ABSOLUS (même si `own_share` est stable
+sur les 4000 disponibles) — un entraînement plus long pourrait en principe
+converger vers le même effondrement que la production a fini par atteindre à
+25 000 itérations, comme celle-ci l'a elle-même fait de façon non monotone
+(5.26 %→1.01 %→1.40 %→8.25 % aux itérations 2500/5000/7500/25000) ; (2) aucun
+score Task 3 (nRMSE/SSIM/LPIPS officiel, image réelle après décodage MedVAE)
+n'a encore été calculé pour ce modèle de référence — c'est la mesure qui
+tranchera réellement, pas ce proxy géométrique.
+
+**Suite immédiate — chiffre Task 3 officiel obtenu, et il RENVERSE la lecture
+optimiste ci-dessus.** Nouveau script `src/cfm/infer_reference_mmfm.py` :
+réutilise `process_volume_unified`/`_make_flow_spec`/`load_vae` de
+`infer_mmfm_unified.py` tels quels (VAE, dénormalisation par champ, garde-fous),
+seul `model`/`adapter` change (`VectorFieldModel` de référence + `LatentVectorizer`,
+la MÊME classe de flatten que `arch_vector.py`). Géométrie `cc` (un seul crop
+centré, pas `8win`) pour le coût — 6.5x plus rapide, biais connu et petit
+(+0.0034 sur la région notée, mesuré le 2026-09-07). Task 3 complet : 3
+contrastes × 20 paires × 3 sujets = 180 volumes, 49.4 min, checkpoint à 4000
+itérations.
+
+| | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| **référence Genentech/MMFM (4000 itér.)** | T1W 0.3922 / T2W 0.3538 / T2FLAIR 0.3697 → **0.3719** | 0.8147 / 0.7724 / 0.7987 → **0.7953** | 0.2064/0.1990/0.2024 → **0.2026** |
+| production `mmfm_core.py` (`vectorized_trajectory`, 25 000 itér., même recette d'inférence, 2026-09-05) | **0.3581** | **0.8379** | — |
+
+**Verdict : NÉGATIF sur le score réel.** La référence, malgré une part du
+déplacement propre au sujet 8 à 18× supérieure à `mmfm_core.py` en espace
+latent (0.65 contre 0.035-0.08), est **légèrement pire en nRMSE** (+0.0138) et
+**nettement pire en SSIM** (−0.0426) que la production. C'est la TROISIÈME
+occurrence documentée dans ce projet du même motif (après le MedVAE perceptuel
+du 2026-09-02 et le mécanisme réparé du 2026-09-05) : **un indicateur interne
+amélioré ne se traduit pas en score amélioré, et peut même coexister avec un
+score dégradé**. `own_share` mesure que le flow n'est pas une pure translation,
+PAS que le déplacement propre au sujet qu'il ajoute est le BON — une variance
+supplémentaire mal dirigée dégrade la SSIM (sensible au bruit structuré) sans
+forcément aggraver le nRMSE global.
+
+**Réserve majeure, non tranchée** : cette comparaison n'est PAS à budget
+d'entraînement égal — 4000 itérations à `lr=3e-4` sans warmup/schedule, contre
+25 000 itérations à `lr=2e-5` avec 2000 pas de warmup pour la production.
+Au rythme mesuré ici (0.369 s/pas à `batch_size=32`), 25 000 itérations de la
+référence prendraient ~2.6 h — un budget du même ordre que celui de la
+production (2 h 07) et donc ATTEIGNABLE. Tant que ce budget n'est pas égalisé,
+la question « l'architecture de référence transporterait-elle correctement si
+elle était entraînée aussi longtemps ? » reste ouverte, et ce résultat négatif
+ne peut pas encore être lu comme une clôture définitive de la piste
+architecture.
+
+**Suite — budget égalisé à 25 000 itérations (153.3 min, comparable aux 2h07 de
+production), pour trancher la réserve ci-dessus.** Perte encore en baisse à la
+fin (~1000, contre ~1500-1650 à 4000 itérations) — le modèle continue
+d'apprendre, ce n'est pas un plateau. `own_share` **ne s'effondre PAS comme
+production l'avait fait de façon non monotone** ; au contraire il MONTE et
+DÉPASSE la vraie valeur :
+
+| itération | part propre au sujet (référence) |
+|---|---|
+| 4 000 | 0.6483 |
+| 5 000 | 0.7338 |
+| 10 000 | 0.8443 |
+| 15 000 | 1.0773 |
+| 20 000 | 1.0935 |
+| 25 000 | 1.0515 |
+| **VRAI déplacement** | **0.7173** |
+
+**Chiffre Task 3 officiel à 25 000 itérations (même protocole `cc`, 180
+volumes, 49.5 min)** :
+
+| | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| référence, 4 000 itér. | 0.3719 | 0.7953 | 0.2026 |
+| **référence, 25 000 itér. (budget égalisé)** | **0.4295** | **0.7339** | **0.2349** |
+| production (même recette d'inférence) | 0.3581 | 0.8379 | — |
+
+**Verdict définitif sur cette piste : le score EMPIRE avec plus
+d'entraînement**, alors même que `own_share` grimpe au-delà de la vraie
+valeur (1.05-1.09 contre 0.7173). La réserve du budget est levée dans le sens
+le PLUS défavorable à l'hypothèse architecture : ce n'est pas que la référence
+avait besoin de plus de temps pour bien transporter — c'est qu'elle
+**SUR-APPREND** les ~100-235 trajectoires par contraste disponibles (couplées
+par OT chaîné, non i.i.d.), au point de produire, sur des sujets tenus à
+l'écart (`Training_prospective`), une variance propre au sujet qui EXCÈDE la
+réalité sans lui correspondre — du bruit dirigé par sujet, pas du signal.
+`own_share` élevé n'a donc jamais mesuré un transport correct, seulement une
+architecture prête à mémoriser plus finement un jeu de couplages OT restreint.
+
+**Ce que l'ensemble de ce diagnostic établit** : deux architectures
+indépendantes (celle du projet et celle de Genentech/MMFM, code non modifié),
+sur les MÊMES données et le MÊME couplage, à budget d'entraînement sous- ET
+sur-alloué, ne font JAMAIS mieux que la production — la référence sous-alloué
+est proche (légèrement pire), sur-alloué elle est nettement pire. Une
+architecture strictement plus expressive et sans le goulot FiLM/`time_scale`
+de `arch_vector.py` ne débloque donc PAS le score ; elle expose au contraire à
+quel point le signal individuel disponible (71.7 % du vrai déplacement, 86.5 %
+orthogonal à la source, 0 sujet apparié sur 1056) ressemble à du bruit du
+point de vue d'un modèle assez flexible pour l'ajuster. **La limite des
+données reste, après cette contre-épreuve à deux architectures et deux
+budgets, l'explication la mieux soutenue par l'ensemble des preuves
+accumulées dans ce projet** — et cette fois avec un témoin d'architecture
+totalement indépendant, testé aux deux extrêmes du budget, pas seulement une
+réimplémentation locale des mêmes idées.
+
+Scripts et artefacts : `src/cfm/diagnose_reference_mmfm.py`,
+`src/cfm/infer_reference_mmfm.py` ; checkpoints dans
+`outputs/mmfm/reference_genentech/real/` (`real_step004000.pth` et
+`real_step025000.pth`, budgets bas/égalisé) ; logs
+`outputs/mmfm/reference_genentech/{real_train,real_train_25k,infer_task3,infer_task3_25k,eval_25k}.log` ;
+prédictions `outputs/mmfm/reference_genentech/predictions{,_25k}/task3/` ; CSV
+d'évaluation officielle `results/mmfm/reference_genentech_task3_20260915/` et
+`results/mmfm/reference_genentech_task3_25k_20260915/`.
+
+---
+
+## 2026-09-15 — BILAN : comparaison NVIDIA/NV-Generate-CTMR, H1 et H2 closes — deux pistes mesurées, ni l'une ni l'autre ne bat la production
+
+**Point de départ.** La couche de représentation (MedVAE) ayant été validée
+comme performante et bien réglée (voir les entrées de représentation
+2026-09-06/07), le soupçon s'est porté sur l'étage de synthèse (flow
+matching, `mmfm`). Une comparaison avec le dépôt NVIDIA/NV-Generate-CTMR
+(rectified flow via MONAI, torchcfm) a identifié deux écarts structurels
+réels avec notre implémentation :
+
+1. **Absence de guidance conditionnelle** (dropout de label à l'entraînement
+   + amplification `scale` à l'inférence) — piste **H2**.
+2. **Conflation temps/sémantique** : `t` porte à la fois l'intégration ODE
+   et l'identité du champ (`_field_to_time`), alors que dans torchcfm et
+   NVIDIA `t` est une interpolation pure, toute sémantique passant par le
+   conditionnement — piste **H1**.
+
+Un troisième écart (loss L1 chez NVIDIA contre notre MSE) n'a pas été
+retenu : déjà tranché par nos propres ablations antérieures.
+
+## Ce que les deux pistes ont donné
+
+| piste | mécanisme testé | nRMSE vs production (R-best, 0.3516) | SSIM | LPIPS | verdict |
+|---|---|---|---|---|---|
+| **H2** — `cond_dropout=0.1` seul (`gs=1.0`) | dropout de conditionnement à l'entraînement | 0.3367, indiscernable (Wilcoxon p=0.84) | **pire** (p=0.0027) | **pire** (p<1e-8) | NÉGATIF |
+| **H2** — `+ guidance_scale=2.0` | amplification à l'inférence, même modèle | 0.3566, **pire que gs=1.0** (p=0.037) | pire | pire | NÉGATIF (la guidance aggrave) |
+| **H1** — `marginal_mode: pairwise_ot` | `t` local + champ en conditionnement | 0.3209, amélioration NON significative (p=0.057) | **pire** (p=0.0002) | **pire** (p<1e-9) | NON ÉTABLI |
+
+Manifestes complets : `results/mmfm/guidance_h2_task3_official_20260914/manifest.md`
+et `results/mmfm/h1_pairwise_cond_task3_official_20260915/manifest.md`.
+
+**Un motif se répète sur les trois lignes** : toucher le conditionnement ou
+la représentation de classe du flow (dropout, guidance, ou champ en
+conditionnement plutôt qu'en temps) ne fait JAMAIS progresser le nRMSE de
+façon statistiquement établie, et dégrade systématiquement et
+significativement SSIM et LPIPS. Ce n'est plus une coïncidence isolée mais
+un troisième et quatrième point du même phénomène déjà noté ailleurs dans ce
+projet (« améliorer un axe peut en dégrader un autre » — voir Volet 2,
+2026-09-08).
+
+**Leçon méthodologique acquise en cours de route (H2)** : un balayage
+exploratoire sur un sous-ensemble réduit (3 paires × 1 sujet) avait suggéré
+un optimum à `guidance_scale≈2.0` — ce signal s'est **inversé** une fois
+mesuré sur les 60 paires officielles. Un sous-ensemble de cette taille ne
+doit plus servir à choisir un hyperparamètre sans validation à l'échelle
+complète.
+
+## Ce que ce bilan établit, et ce qu'il n'établit pas
+
+- **Établi** : ni l'ajout de guidance conditionnelle, ni la correction de la
+  conflation temps/champ, ne suffisent à eux seuls à faire progresser le
+  score de traduction dans les implémentations testées ici. Les deux
+  mécanismes sont mécaniquement sains (validés séparément — H2 sur le
+  harnais réel, H1 sur le harnais synthétique à réponse connue) : l'échec
+  n'est pas un bug d'implémentation, c'est un résultat de mesure.
+- **Non établi** : que la conflation temps/champ ou l'absence de guidance
+  soient sans rapport avec la performance du flow — H1 en particulier montre
+  un signal directionnellement cohérent (nRMSE meilleur sur 60% des paires)
+  qui n'atteint simplement pas la significativité à budget d'entraînement
+  inchangé. Les deux causes avancées (table de classe diluée en H1, absence
+  de contrôle de cohérence perceptuelle en H1 et H2) restent non
+  départagées.
+- **Hors de portée de ce bilan** : le plafond de représentation reste bon
+  (MedVAE validé) ; le goulot documenté ailleurs (`n=3` sujets appariés,
+  écrêtage, plancher protocolaire) demeure la limite structurelle la mieux
+  établie du projet.
+
+## Clôture et suite
+
+**H1 et H2 sont closes.** Le code des deux mécanismes reste dans le dépôt,
+rétrocompatible et documenté, réutilisable pour toute reprise future
+(budget d'itérations plus grand pour H1, régularisation de cohérence
+perceptuelle pour l'un ou l'autre). Aucune reprise n'est engagée sans un
+nouveau feu vert explicite — ni l'une ni l'autre piste n'a produit
+d'argument suffisant pour justifier d'elle-même la dépense de calcul d'un
+second cycle.
+
+---
+
+## 2026-09-15 — H1 : refonte pairwise (`t` local, champ en conditionnement) : NON ÉTABLI
+
+Suite de la comparaison NVIDIA/NV-Generate-CTMR (voir l'entrée H2 ci-dessous) :
+dans torchcfm et NVIDIA, `t` ne porte jamais de sémantique — interpolation
+pure entre 2 points fixes, tout le reste en conditionnement. Notre design
+(`marginal_mode: trajectory`) fait l'inverse : `_field_to_time` encode la
+position du champ DANS `t`, et une spline cubique intègre en continu à
+travers les 5 marginales. Testé : `marginal_mode: pairwise_ot` (nouveau,
+rétrocompatible) — réutilise le MÊME couplage OT chaîné que `trajectory`,
+mais `t` redevient local dans [0,1] entre exactement 2 marginales
+(`_compute_flow(..., 0.0, 1.0, ...)`, sans rescale), et l'identité (champ
+source, champ cible) devient conditionnement via `_flat_triple`
+(num_classes 3×5×5=75, contre 3). Config :
+`configs/mmfm/vectorized_pairwise_cond.yaml`, copie exacte de
+`vectorized_trajectory.yaml` (production/R-best), une seule clé change.
+Manifeste complet :
+`results/mmfm/h1_pairwise_cond_task3_official_20260915/manifest.md`.
+
+**Validé au préalable sur le harnais synthétique à réponse connue**
+(`configs/mmfm/synthetic_pairwise_ot.yaml`, `scripts/eval_synthetic_pairwise_ot.py`) :
+nRMSE 0.053 au bon conditionnement de paire de champs (plancher 0.05) contre
+0.086 à un conditionnement délibérément FAUX (ratio 1.62×) — le mécanisme est
+mécaniquement sain avant tout calcul sur données réelles.
+
+**Évaluation officielle (20 paires × 3 sujets × 3 contrastes, 8win, appariée
+contre R-best, nRMSE référence 0.3516)** :
+
+| métrique | H1 | production | H1 meilleur sur | Wilcoxon p |
+|---|---|---|---|---|
+| nRMSE | 0.3209 | 0.3516 | 36/60 | **0.057 (à la limite, NON significatif)** |
+| SSIM | 0.8272 | 0.8499 | 16/60 | **0.0002 (significativement pire)** |
+| LPIPS | 0.2119 | 0.1880 | 6/60 | **<1e-9 (significativement pire)** |
+
+**Verdict : NON ÉTABLI.** L'amélioration apparente du nRMSE agrégé (−8.7 %)
+ne résiste PAS au test apparié (p=0.057, juste au-dessus du seuil ; par
+contraste, H1 ne gagne que 11-13 paires sur 20 — direction cohérente, effet
+trop faible et diffus pour conclure). SSIM et LPIPS se dégradent
+significativement — même profil que H2 (`cond_dropout`) : un changement du
+conditionnement/de la représentation de classe n'améliore pas clairement le
+nRMSE tout en dégradant nettement le perceptuel. Deux causes non
+départagées : la table de classe 25× plus grande (75 contre 3) pourrait
+diluer l'apprentissage FiLM par entrée à budget d'itérations égal, et le CFM
+par paire indépendante perd la contrainte de cohérence globale qu'imposait
+la spline à travers les 5 marginales.
+
+**Ce résultat ne tranche PAS l'hypothèse H1** (« `t` ne devrait pas porter de
+sémantique ») — il montre seulement que cette implémentation précise (75
+classes, budget d'itérations inchangé, sans régularisation de cohérence
+inter-paires) ne bat pas la production sur l'ensemble des 3 métriques.
+Mécanisme conservé dans le code (rétrocompatible, validé synthétiquement,
+réutilisable). Reprendre supposerait un budget d'itérations plus grand ou une
+régularisation de cohérence, ni l'un ni l'autre testés ici — en attente d'un
+nouveau feu vert explicite.
+
+---
+
+## 2026-09-14/15 — Guidance conditionnelle (style CFG) sur le flow mmfm : NÉGATIF, et le balayage réduit a mal orienté
+
+Suite à l'analyse comparative du repo NVIDIA/NV-Generate-CTMR (rectified flow
+via MONAI) : leur conditionnement utilise un dropout de label à l'entraînement
+(10 %) et une guidance `scale=15` à l'inférence, mécanisme absent de notre
+flow. Testé sur le vectorisé de production (`vectorized_trajectory.yaml`,
+copie exacte + `model.cond_dropout_prob: 0.1`). Code rétrocompatible
+(`cond_dropout_prob=0.0`/`guidance_scale=1.0` = comportement historique
+inchangé). Manifeste complet :
+`results/mmfm/guidance_h2_task3_official_20260914/manifest.md`.
+
+**Balayage exploratoire sur sous-ensemble réduit (3 paires × 1 sujet, NON
+officiel)** : optimum apparent à `guidance_scale≈2.0` (nRMSE −1.4 % vs pas de
+guidance). **Ce signal ne survit PAS à l'échelle officielle.**
+
+**Évaluation officielle (20 paires × 3 sujets × 3 contrastes, 8win, appariée
+contre R-best/production, nRMSE référence 0.3516 — la valeur
+géométrie-vérifiée de `results/mmfm/geometry_20260907/`, pas l'ancien 0.3794
+périmé)** :
+
+| variante | nRMSE moyen | vs production | vs production |
+|---|---|---|---|
+| **production (R-best)** | 0.3516 | — SSIM 0.8499 | — LPIPS 0.1880 |
+| **H2 `gs=1.0`** (dropout seul) | 0.3367 | indiscernable (p=0.84) | SSIM **pire** (p=0.0027), LPIPS **pire** (p<1e-8) |
+| **H2 `gs=2.0`** (dropout + guidance) | 0.3566 | indiscernable (p=0.49) | SSIM **pire** (p=0.0004), LPIPS **pire** (p<1e-10) |
+
+Et surtout : **`gs=2.0` contre `gs=1.0` (même modèle, seule la guidance
+change)** — nRMSE **significativement PIRE** (23/60 paires, Wilcoxon
+p=0.037), SSIM et LPIPS pires aussi (p<1e-6). La guidance n'aide sur AUCUN
+axe une fois mesurée à l'échelle officielle.
+
+**Verdict : NÉGATIF sur toute la ligne, et une leçon méthodologique.** Le
+dropout de conditionnement seul ne touche pas le nRMSE mais dégrade
+significativement SSIM/LPIPS ; ajouter de la guidance dégrade en plus le
+nRMSE lui-même — l'inverse du signal observé sur le sous-ensemble réduit
+(n=3 paires). **Un balayage exploratoire sous-alimenté a activement mal
+orienté le choix d'hyperparamètre** : son optimum apparent s'est inversé en
+dégradation nette une fois mesuré sur les 60 paires officielles. Ne plus
+choisir un hyperparamètre sur un sous-ensemble réduit sans test apparié à
+l'échelle complète avant adoption.
+
+**Clôture de la piste H2.** Mécanisme conservé dans le code (rétrocompatible,
+réutilisable), aucune configuration testée ne bat la production. H1 (refonte
+pairwise, champ en conditionnement plutôt qu'en temps) reste documentée et
+non engagée, en attente d'un feu vert explicite séparé — ce résultat ne se
+prononce pas sur elle.
+
+**Réserves** : un seul entraînement par variante (pas de répétition, variance
+run-to-run non quantifiée) ; entraînement ralenti par partage GPU avec une
+tâche locale indépendante (sans effet attendu sur la qualité, seulement la
+durée) ; guidance implémentée seulement pour l'architecture vectorisée.
+
+---
+
 ## 2026-09-14 — L'hétérogénéité d'échelle est ÉCARTÉE comme cause du désastre Task 3 de l'INR direct+LoRA16
 
 Suite immédiate de l'entrée précédente. Deux causes plausibles y étaient

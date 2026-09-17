@@ -39,9 +39,18 @@ def _load_latent_norm(m: dict, key: str, default: float):
 
 def build_vector_mmfm(cfg: dict, latent_dim: int, n_classes: int) -> VectorMMFM:
     m = cfg["model"]
+    # GUIDANCE CONDITIONNELLE (expérience H2, 2026-09-14). `cond_dropout_prob`
+    # > 0 réserve un id de classe NUL en dernier index (= `n_classes`, avant ce
+    # décalage) : mmfm_core.py::train() y bascule `y_tgt` avec cette
+    # probabilité, et l'inférence peut alors amplifier le conditionnement par
+    # guidance (voir euler_integrate). 0.0 (défaut) laisse la table
+    # d'embedding à sa taille historique — aucun checkpoint existant n'est
+    # affecté.
+    cond_dropout_prob = float(m.get("cond_dropout_prob", 0.0))
+    embed_classes = n_classes + 1 if cond_dropout_prob > 0.0 else n_classes
     return VectorMMFM(
         latent_dim=latent_dim,
-        num_classes=n_classes,
+        num_classes=embed_classes,
         hidden_dim=int(m.get("hidden_dim", 1024)),
         depth=int(m.get("num_blocks", 4)),
         time_embed_dim=int(m.get("time_embed_dim", 256)),

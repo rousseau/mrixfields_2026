@@ -133,6 +133,18 @@ def _unflat_class(flat: int, n_fields: int) -> Tuple[int, int]:
     return flat // n_fields, flat % n_fields
 
 
+def _flat_triple(mod_idx: int, src_field_idx: int, tgt_field_idx: int, n_fields: int) -> int:
+    """Expérience H1 (2026-09-15) : conditionnement (contraste, champ SOURCE,
+    champ CIBLE) encodé comme un seul entier de classe, réutilisant tel quel
+    le mécanisme d'embedding/FiLM existant (voir `_flat_class` pour le
+    précédent (contraste, champ) à 2 facteurs). `t` redevient une
+    interpolation LOCALE pure dans [0,1] entre exactement 2 points — l'identité
+    des champs n'est plus encodée dans `t` (voir `_field_to_time`), elle est
+    conditionnement, comme le contraste. `num_classes` correspondant =
+    `n_modalities * n_fields * n_fields` (voir train()/`_build_model`)."""
+    return (mod_idx * n_fields + src_field_idx) * n_fields + tgt_field_idx
+
+
 def _field_to_time(field_idx: int, n_fields: int) -> float:
     if n_fields <= 1:
         return 0.0
@@ -494,12 +506,28 @@ def euler_integrate(
     device: torch.device,
     use_amp: bool = False,
     amp_dtype: torch.dtype = torch.bfloat16,
+    guidance_scale: float = 1.0,
+    null_y: Optional[Tensor] = None,
 ) -> Tensor:
     """Euler integration of the multi-marginal flow from t_start to t_end,
     conditioned on a FIXED source anchor `z_src` throughout (never updated —
     only the running state `z` is). Identical for both architectures once
     `model_fn` unifies the call convention; supports field ascent
-    (t_end>t_start) and descent (t_end<t_start) alike via a signed dt."""
+    (t_end>t_start) and descent (t_end<t_start) alike via a signed dt.
+
+    GUIDANCE CONDITIONNELLE (style CFG, expérience H2 du 2026-09-14). Défaut
+    `guidance_scale=1.0` : UN SEUL appel réseau par pas, comportement identique
+    au bit près à avant l'ajout de ce paramètre. Toute autre valeur exige
+    `null_y` (l'id de classe « nul » réservé par `cond_dropout_prob`, voir
+    `arch_vector.build_vector_mmfm`) et double le coût réseau par pas :
+    v = v_uncond + guidance_scale * (v_cond - v_uncond). N'a de sens que pour
+    un checkpoint entraîné avec `model.cond_dropout_prob > 0` (sinon l'id nul
+    n'existe pas dans la table d'embedding)."""
+    if guidance_scale != 1.0 and null_y is None:
+        raise ValueError(
+            "guidance_scale != 1.0 requiert null_y (id de classe nul, voir "
+            "model.cond_dropout_prob)."
+        )
     z = z_src.clone().to(device).float()
     z_anchor = z_src.clone().to(device).float()
     dt = (t_end - t_start) / n_steps
@@ -507,7 +535,12 @@ def euler_integrate(
         t_val = t_start + step_i * dt
         t_vec = torch.full((z.shape[0],), t_val, dtype=torch.float32, device=device)
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
-            vt = model_fn(z, z_anchor, t_vec, y)
+            v_cond = model_fn(z, z_anchor, t_vec, y)
+            if guidance_scale != 1.0:
+                v_uncond = model_fn(z, z_anchor, t_vec, null_y)
+                vt = v_uncond + guidance_scale * (v_cond - v_uncond)
+            else:
+                vt = v_cond
         z = z + dt * vt.float()
     return z
 
@@ -646,8 +679,13 @@ def train(
     modalities: List[str] = data_cfg.get("modalities", MODALITIES)
     fields: List[str] = data_cfg.get("fields", DOMAINS)
     n_fields = len(fields)
-    n_classes = len(modalities)  # conditioning class = contrast only; field = time
     n_loader_classes = len(modalities) * n_fields
+
+    # GUIDANCE CONDITIONNELLE (expérience H2, 2026-09-14). 0.0 (défaut) = sans
+    # effet, comportement historique inchangé. `build_vector_mmfm` lit la même
+    # clé pour réserver un id de classe nul (`n_classes`) dans la table
+    # d'embedding — voir arch_vector.py.
+    cond_dropout_prob = float(cfg.get("model", {}).get("cond_dropout_prob", 0.0))
 
     output_dir = Path(data_cfg["output_dir"])
     split = data_cfg.get("split", "retro_train")
@@ -717,11 +755,31 @@ def train(
     #     régime la vitesse optimale ne dépend pas du sujet (mesuré le
     #     2026-09-04 : cos(v(sujet A), v(sujet B)) = 0.99997336 sur le
     #     checkpoint de production).
+    #   "pairwise_ot" (expérience H1, 2026-09-15) : réutilise le MÊME couplage
+    #     OT chaîné que "trajectory" (sujets appariés à travers les champs,
+    #     donc pas de régression vers le bug "aucun couplage" de "pairwise"),
+    #     mais SANS recoudre les marginales dans un temps global : `t` reste
+    #     une interpolation locale pure dans [0,1] entre EXACTEMENT 2 points
+    #     (source, cible) — `_compute_flow(..., 0.0, 1.0, ...)`. L'identité des
+    #     deux champs devient conditionnement (`_flat_triple`, comme le
+    #     contraste), plus jamais encodée dans `t`. Corrige la conflation
+    #     temps/sémantique identifiée par comparaison avec NVIDIA/NV-Generate-CTMR
+    #     et torchcfm (où `t` ne porte jamais de sémantique).
     marginal_mode = str(train_cfg.get("marginal_mode", "trajectory")).lower()
-    if marginal_mode not in ("trajectory", "pairwise"):
+    if marginal_mode not in ("trajectory", "pairwise", "pairwise_ot"):
         raise ValueError(
-            f"train.marginal_mode doit valoir 'trajectory' ou 'pairwise', pas {marginal_mode!r}"
+            "train.marginal_mode doit valoir 'trajectory', 'pairwise' ou "
+            f"'pairwise_ot', pas {marginal_mode!r}"
         )
+
+    # CONDITIONNEMENT DE CLASSE. En "pairwise_ot", l'identité des DEUX champs
+    # (source, cible) rejoint le contraste dans le conditionnement — `t` n'en
+    # porte plus rien (voir _flat_triple). Sinon, comportement historique
+    # inchangé : classe = contraste seul, champ = position sur l'axe du temps.
+    if marginal_mode == "pairwise_ot":
+        n_classes = len(modalities) * n_fields * n_fields
+    else:
+        n_classes = len(modalities)  # conditioning class = contrast only; field = time
 
     # ── FLIP. `FlatLatentCacheDataset.__getitem__` tire son propre flip, et le
     # loop appelait le dataset DEUX fois par pas (source puis cible) : avec
@@ -848,11 +906,14 @@ def train(
               f"num_targets_per_step={num_targets_per_step}")
         print(f"  marginal_mode={marginal_mode} | loss={loss_kind} | "
               f"flip_per_step={flip_per_step} (flip_lr_prob={flip_lr_prob})")
+        print(f"  cond_dropout_prob={cond_dropout_prob}")
 
-    # ── Couplage OT chaîné : une seule fois, avant la boucle.
+    # ── Couplage OT chaîné : une seule fois, avant la boucle. "pairwise_ot"
+    # (H1) réutilise le MÊME couplage que "trajectory" — seule la façon dont
+    # on en tire (t, z_t, u_t) diffère plus loin dans la boucle.
     trajectories: Optional[Dict[int, np.ndarray]] = None
     traj_t_anchor: Dict[int, Tuple[float, ...]] = {}
-    if marginal_mode == "trajectory":
+    if marginal_mode in ("trajectory", "pairwise_ot"):
         if is_main_process():
             print("  Construction des trajectoires par couplage OT chaîné "
                   "(Genentech/MMFM, data.py:123) …", flush=True)
@@ -1055,6 +1116,43 @@ def train(
                 )
                 same = False
                 t_i, t_j = t_anchor[anchor_pos], t_anchor[anchor_pos]
+            elif marginal_mode == "pairwise_ot":
+                # ── H1 : MÊME couplage OT chaîné que "trajectory" (sujets
+                # appariés à travers les champs — voir le bloc "avant la
+                # boucle" ci-dessus), mais on prend deux marginales (fi, fj)
+                # de la trajectoire et on applique un CFM standard à 2 points
+                # ENTRE ELLES, `t` restant local à [0,1] (_compute_flow avec
+                # t_i=0.0, t_j=1.0 : dt=1, donc AUCUN rescale — le retour de
+                # `FM.sample_location_and_conditional_flow` est utilisé tel
+                # quel). L'identité de (fi, fj) devient conditionnement
+                # (`_flat_triple`, voir plus bas), plus jamais portée par `t`.
+                traj = trajectories[contrast]
+                rows = step_rng.integers(0, traj.shape[0], size=batch_size)
+                idx = traj[rows]  # (B, K)
+                Z = torch.stack([
+                    torch.stack([ds[int(j)][0] for j in row]) for row in idx
+                ]).to(device).float()  # (B, K, *rest)
+
+                if flip_per_step and flip_lr_prob > 0.0 and random.random() < flip_lr_prob:
+                    Z = _flip_batch(Z)
+
+                meta = None
+                if not (use_latent_cache and adapter.cache_prebakes_prep):
+                    b, kk = Z.shape[0], Z.shape[1]
+                    prepped, meta = adapter.prep_latent(vae, Z.reshape(b * kk, *Z.shape[2:]))
+                    Z = prepped.reshape(b, kk, *prepped.shape[1:])
+
+                # Position dans l'axe K de la trajectoire (== l'indice de champ
+                # RÉEL dès que tous les champs sont disponibles pour ce
+                # contraste, ce qui est le cas courant ; calculé explicitement
+                # pour rester correct si un contraste a des champs manquants).
+                pos_i = contrast_fields[contrast].index(fi)
+                pos_j = contrast_fields[contrast].index(fj)
+                z_src = Z[:, pos_i]
+                z_tgt = Z[:, pos_j]
+                same = (fi == fj)
+                t_global, z_t, ut_global = _compute_flow(FM, z_src, z_tgt, 0.0, 1.0, same, device)
+                t_i, t_j = 0.0, 1.0
             else:
                 same = (fi == fj)
                 src_flat = _flat_class(contrast, fi, n_fields)
@@ -1093,13 +1191,32 @@ def train(
                 t_j = _field_to_time(fj, n_fields)
                 t_global, z_t, ut_global = _compute_flow(FM, z_src, z_tgt, t_i, t_j, same, device)
 
-            y_tgt = torch.full((z_src.shape[0],), contrast, dtype=torch.long, device=device)
+            # CLASSE DE CONDITIONNEMENT. "pairwise_ot" (H1) : (contraste, champ
+            # source, champ cible) — voir _flat_triple. Sinon (historique) :
+            # contraste seul, le champ est porté par `t`.
+            class_id = (
+                _flat_triple(contrast, fi, fj, n_fields)
+                if marginal_mode == "pairwise_ot" else contrast
+            )
+            y_tgt = torch.full((z_src.shape[0],), class_id, dtype=torch.long, device=device)
+            # GUIDANCE CONDITIONNELLE (H2) : dropout du label VU PAR LA PERTE DE
+            # FLOW SEULE. `y_tgt` (vrai label) reste inchangé pour le
+            # régularisateur de cycle ci-dessous — sa cohérence sujet->sujet
+            # n'a de sens que sur le vrai contraste cible.
+            y_flow = y_tgt
+            if cond_dropout_prob > 0.0:
+                drop_mask = torch.from_numpy(
+                    step_rng.random(y_tgt.shape[0]) < cond_dropout_prob
+                ).to(device)
+                if drop_mask.any():
+                    y_flow = y_tgt.clone()
+                    y_flow[drop_mask] = n_classes  # id nul réservé, voir build_vector_mmfm
             t_vec = t_global.float()
 
             with torch.amp.autocast(
                 "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
             ):
-                v_t = model_fn(z_t, z_src, t_vec, y_tgt)
+                v_t = model_fn(z_t, z_src, t_vec, y_flow)
                 loss = loss_fn(v_t, ut_global) / float(k)
 
             z_src_roundtrip = None
@@ -1195,7 +1312,14 @@ def train(
             print(
                 f"[{step + 1:6d}/{total_iters}] loss={avg_recent:.4f} grad={float(grad_norm):.2f} "
                 f"lr={lr_cur:.2e} contrast={contrast}→fields{transitions} speed={it_s:.2f} it/s "
-                f"eta={eta_s / 3600:.2f}h t={elapsed / 60:.1f}min mem={mem_gb:.1f}GB{extra_log}"
+                f"eta={eta_s / 3600:.2f}h t={elapsed / 60:.1f}min mem={mem_gb:.1f}GB{extra_log}",
+                # Sans flush, stdout redirigé vers un fichier (nohup ... > log) reste
+                # PLEINEMENT bufferisé : ce print peut rester invisible en tail -f
+                # pendant des dizaines de minutes alors que l'entraînement progresse
+                # réellement (train_metrics.jsonl, lui, est déjà flushé à chaque
+                # écriture). Mêmes garanties que les deux flush=True déjà posés plus
+                # haut dans cette fonction (couplage OT).
+                flush=True,
             )
             record = {
                 "iter": step + 1,
@@ -1302,7 +1426,12 @@ def infer(
     modalities: List[str] = data_cfg.get("modalities", MODALITIES)
     fields: List[str] = data_cfg.get("fields", DOMAINS)
     n_fields = len(fields)
-    n_classes = len(modalities)
+    marginal_mode = str(train_cfg.get("marginal_mode", "trajectory")).lower()
+    # H1 (2026-09-15) : voir la même remarque dans train().
+    n_classes = (
+        len(modalities) * n_fields * n_fields
+        if marginal_mode == "pairwise_ot" else len(modalities)
+    )
 
     for name, val, lst in [
         ("source_field", source_field, fields),
@@ -1323,8 +1452,13 @@ def infer(
     contrast = modalities.index(source_modality)
     src_field_idx = fields.index(source_field)
     tgt_field_idx = fields.index(target_field)
-    t_start = _field_to_time(src_field_idx, n_fields)
-    t_end = _field_to_time(tgt_field_idx, n_fields)
+    if marginal_mode == "pairwise_ot":
+        class_id = _flat_triple(contrast, src_field_idx, tgt_field_idx, n_fields)
+        t_start, t_end = 0.0, 1.0
+    else:
+        class_id = contrast
+        t_start = _field_to_time(src_field_idx, n_fields)
+        t_end = _field_to_time(tgt_field_idx, n_fields)
 
     print(
         f"Inférence MMFM ({method}) : {source_modality}@{source_field} → "
@@ -1429,7 +1563,7 @@ def infer(
         z_src, meta = adapter.prep_latent(vae, z_src_enc)
         z_src = z_src.float()
 
-        y = torch.tensor([contrast], dtype=torch.long, device=device)
+        y = torch.tensor([class_id], dtype=torch.long, device=device)
         z_tgt = euler_integrate(
             model_fn, z_src, y, t_start, t_end, n_steps, device, use_amp, amp_dtype,
         )

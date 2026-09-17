@@ -56,6 +56,13 @@ TAG=${3:?tag manquant}
 OUTDIR=${4:-results/mmfm/staircase_20260827}
 FIELD_NORM_STATS=${5:-configs/mmfm/field_norm_stats.json}
 GEOMETRY=${6:-8win}          # 8win (defaut, meilleur sur la region notee) | cc
+GUIDANCE_SCALE=${7:-1.0}     # Guidance conditionnelle (experience H2, 2026-09-14).
+                             # 1.0 (defaut) = desactivee, chemin de predictions
+                             # INCHANGE (retro-compatible avec tout run historique).
+                             # Toute autre valeur ecrit dans un dossier de
+                             # predictions SUFFIXE par le scale, pour ne jamais
+                             # ecraser/reutiliser silencieusement les predictions
+                             # d'un autre scale sous --skip_existing.
 
 case "$GEOMETRY" in
   8win) CROP_FLAG=() ;;
@@ -68,7 +75,12 @@ export PYTHONPATH=src
 
 SUBDIR=$(python -c "import yaml,sys; print(yaml.safe_load(open('$CONFIG'))['data']['output_subdir'])")
 CKPT="outputs/$SUBDIR/weights/model_final.pth"
-PRED="outputs/$SUBDIR/predictions/task3"
+if [ "$GUIDANCE_SCALE" = "1.0" ]; then
+  PRED_ROOT="outputs/$SUBDIR/predictions"
+else
+  PRED_ROOT="outputs/$SUBDIR/predictions_gs${GUIDANCE_SCALE}"
+fi
+PRED="$PRED_ROOT/task3"
 
 [ -f "$CKPT" ] || { echo "checkpoint absent : $CKPT"; exit 1; }
 mkdir -p "$OUTDIR"
@@ -82,15 +94,17 @@ echo "field_norm_stats : $FIELD_NORM_STATS"
 if [ "$GEOMETRY" = "cc" ]; then GEO_DESC="un seul crop centre, comme le cache"
 else GEO_DESC="8 fenetres decalees fusionnees par Hann"; fi
 echo "geometrie        : $GEOMETRY  ($GEO_DESC)"
+echo "guidance_scale   : $GUIDANCE_SCALE  (predictions -> $PRED_ROOT)"
 
 echo "--- inference (3 contrastes, 20 paires, 3 sujets) ---"
 python src/cfm/infer_mmfm_unified.py \
     --config "$CONFIG" --checkpoint "$CKPT" \
-    --output_dir "outputs/$SUBDIR/predictions" \
+    --output_dir "$PRED_ROOT" \
     --split Training_prospective \
     --modalities T1W T2W T2FLAIR \
     --field_norm_stats "$FIELD_NORM_STATS" \
     "${CROP_FLAG[@]}" \
+    --guidance_scale "$GUIDANCE_SCALE" \
     --skip_existing
 
 # ATTENTION : `--skip_existing` ne recalcule rien si les predictions existent deja.

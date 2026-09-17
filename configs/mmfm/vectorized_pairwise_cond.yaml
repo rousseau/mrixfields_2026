@@ -1,0 +1,128 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM vectorisé — H1 (2026-09-15) : `t` redevient une interpolation LOCALE
+# pure entre EXACTEMENT 2 points, l'identité des champs (source, cible) passe
+# en CONDITIONNEMENT plutôt que d'être portée par `t` (voir `_field_to_time`
+# et `_flat_triple` dans mmfm_core.py).
+#
+# ORIGINE. Comparaison avec le repo NVIDIA/NV-Generate-CTMR (rectified flow
+# via MONAI) et torchcfm : dans les deux références, `t` ne porte JAMAIS de
+# sémantique — c'est toujours une interpolation pure entre 2 points fixes
+# (bruit, donnée), toute information supplémentaire (classe, région) passant
+# par un conditionnement séparé. Notre design historique fait l'inverse :
+# `_field_to_time` encode la position du champ DANS `t`, et la trajectoire
+# traverse les 5 marginales en une seule intégration continue
+# (`marginal_mode: trajectory`). C'est la conflation temps/sémantique
+# identifiée comme piste H1 (voir CHANGELOG 2026-09-14, plan
+# ok-donc-si-on-quizzical-sifakis.md).
+#
+# CE QUI CHANGE ICI (une seule clé, `train.marginal_mode: pairwise_ot`) :
+#   - RÉUTILISE le même couplage OT chaîné que "trajectory" (sujets appariés à
+#     travers les 5 champs — donc PAS de régression vers le bug "aucun
+#     couplage" de l'ancien `marginal_mode: pairwise`, lui resté cassé
+#     délibérément pour rejouer l'historique).
+#   - Pour chaque pas, tire `num_targets_per_step` paires (champ source, champ
+#     cible) parmi les 5 marginales couplées (comme l'ancien `pairwise`), mais
+#     applique un CFM standard à 2 points ENTRE ELLES : `t` local dans [0,1],
+#     _compute_flow(..., 0.0, 1.0, ...) — sans rescale, donc AUCUNE contrainte
+#     contradictoire sur `t` (le défaut qui avait fait abandonner `pairwise`).
+#   - Le conditionnement de classe devient (contraste, champ source, champ
+#     cible) — `_flat_triple`, num_classes = 3*5*5 = 75 au lieu de 3.
+#
+# Validé au préalable sur le harnais synthétique à réponse connue
+# (configs/mmfm/synthetic_pairwise_ot.yaml + scripts/eval_synthetic_pairwise_ot.py) :
+# nRMSE 0.053 au bon conditionnement (plancher de bruit 0.05) contre 0.086 à un
+# conditionnement de paire de champs délibérément FAUX (ratio 1.62x) — le
+# réseau utilise bien l'identité de paire, pas seulement `t`.
+#
+# Tout le reste (loss mse, flip_per_step, time_scale/time_cond, latent
+# mean/scale, cache, EMA) est IDENTIQUE à configs/mmfm/vectorized_trajectory.yaml
+# (production/R-best) pour que l'écart ne vienne que de ce changement de design.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_vectorized_pairwise_cond
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint:
+  latent_channels: 1
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  time_scale: 1000.0
+  time_cond: film
+  latent_mean: 19.913378
+  latent_scale: 18.125440
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: retro_train
+  output_subdir: mmfm/vectorized_pairwise_cond
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_c4d1e200/retro_train
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  # ── SEUL CHANGEMENT structurel vs vectorized_trajectory.yaml ──
+  marginal_mode: pairwise_ot
+  loss: mse
+  flip_per_step: true
+  # ──────────────────────────────────────────────────────────────
+  batch_size: 1
+  total_iters: 25000
+  # Redevient significatif en pairwise_ot (contrairement à trajectory) : nombre
+  # de paires (champ src, champ tgt) tirées par pas. 2 = même ordre de coût
+  # qu'un pas trajectory (qui traverse les 5 marginales d'un coup).
+  num_targets_per_step: 2
+  adjacent_only: false
+  identity_prob: 0.1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  accumulation_steps: 1
+  save_every: 2500
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

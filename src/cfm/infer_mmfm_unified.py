@@ -44,7 +44,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from cfm import arch_inr, arch_unet, arch_vector
 from models.tiled_vae import tiled_decode, tiled_encode
-from cfm.mmfm_core import euler_integrate, _infer_latent_shape, _flat_class, _field_to_time
+from cfm.mmfm_core import euler_integrate, _infer_latent_shape, _flat_class, _flat_triple, _field_to_time
 from common.config import load_yaml_with_include, load_env, resolve_paths
 from common.io import DOMAINS, MODALITIES, denormalize_from_01, center_crop_or_pad_np
 from models.vae_loader import load_vae
@@ -114,9 +114,18 @@ def _build_model(cfg: dict, vae, device: torch.device, volume_size: Tuple[int, i
     modalities = data_cfg.get("modalities", MODALITIES)
     fields = data_cfg.get("fields", DOMAINS)
     n_fields = len(fields)
-    # Legacy v1 conditions on (modality, field) jointly (n_classes=15); every
-    # other scheme (v2, unified UNet/vectorized) conditions on modality alone.
-    n_classes = len(modalities) * n_fields if method == "mmfm3d_vectorized_v1" else len(modalities)
+    marginal_mode = str(cfg.get("train", {}).get("marginal_mode", "trajectory")).lower()
+    # Legacy v1 conditions on (modality, field) jointly (n_classes=15). H1
+    # ("pairwise_ot", 2026-09-15) conditions on (modality, champ SOURCE, champ
+    # CIBLE) — voir mmfm_core._flat_triple ; `t` redevient une interpolation
+    # locale pure, il ne porte plus l'identité du champ. Tout le reste
+    # (v2/trajectory, UNet, INR) conditionne sur la modalité seule.
+    if method == "mmfm3d_vectorized_v1":
+        n_classes = len(modalities) * n_fields
+    elif method in ("mmfm3d_vectorized", "mmfm3d") and marginal_mode == "pairwise_ot":
+        n_classes = len(modalities) * n_fields * n_fields
+    else:
+        n_classes = len(modalities)
 
     if method in ("mmfm3d", "mmfm", "mmfm3d_vectorized", "mmfm3d_vectorized_v1", "mmfm3d_vectorized_v2"):
         latent_shape = _infer_latent_shape(vae, volume_size, device)
@@ -163,17 +172,27 @@ def _load_model_weights(model, ckpt: dict, use_ema: bool, adapter):
 
 
 def _make_flow_spec(model_type: str, mod_idx: int, src_field_idx: int,
-                    tgt_field_idx: int, n_fields: int, use_v1: bool = False) -> dict:
+                    tgt_field_idx: int, n_fields: int, use_v1: bool = False,
+                    use_pairwise_ot: bool = False) -> dict:
     """Build the (target class, time interval) flow spec for one translation.
 
     - vectorial v1 (legacy): conditions on the flat (modality, target-field)
       class, integrates over the fixed t in [0,1] (no field-based time axis).
-    - vectorial v2/unified, and unet (multi-marginal): condition on the
-      modality/contrast alone; the field is the time axis (t_start/t_end).
+    - vectorial "pairwise_ot" (H1, 2026-09-15): conditions on the flat
+      (modality, SOURCE field, TARGET field) triple (`_flat_triple`) ; `t` is
+      a pure LOCAL interpolation in [0,1] between exactly these 2 points, it
+      carries no field identity — see mmfm_core.py's `marginal_mode` doc.
+    - vectorial v2/unified ("trajectory"), and unet (multi-marginal): condition
+      on the modality/contrast alone; the field is the time axis (t_start/t_end).
     """
     if model_type == "vectorial" and use_v1:
         return {
             "y": _flat_class(mod_idx, tgt_field_idx, n_fields),
+            "t_start": 0.0, "t_end": 1.0,
+        }
+    if model_type == "vectorial" and use_pairwise_ot:
+        return {
+            "y": _flat_triple(mod_idx, src_field_idx, tgt_field_idx, n_fields),
             "t_start": 0.0, "t_end": 1.0,
         }
     return {
@@ -195,6 +214,8 @@ def _infer_patch_unified(
     amp_dtype: torch.dtype,
     encode_tile=None,
     encode_tile_margin: int = 16,
+    guidance_scale: float = 1.0,
+    null_class_id: Optional[int] = None,
 ) -> np.ndarray:
     """Run VAE encode -> flow -> VAE decode on a single patch. Identical for
     both architectures — the adapter absorbs the flatten/pad and call-
@@ -219,9 +240,15 @@ def _infer_patch_unified(
         z_src, meta = adapter.prep_latent(vae, z_src_enc)
         z_src = z_src.float()
         y = torch.tensor([flow_spec["y"]], dtype=torch.long, device=device)
+        null_y = None
+        if guidance_scale != 1.0:
+            if null_class_id is None:
+                raise ValueError("guidance_scale != 1.0 requiert null_class_id.")
+            null_y = torch.full_like(y, null_class_id)
         z_tgt = euler_integrate(
             model_fn, z_src, y, flow_spec["t_start"], flow_spec["t_end"],
             n_steps, device, use_amp, amp_dtype,
+            guidance_scale=guidance_scale, null_y=null_y,
         )
         z_tgt = adapter.restore_latent(z_tgt, meta)
         if encode_tile is not None:
@@ -266,6 +293,8 @@ def process_volume_unified(
     upsample_order: int = 1,
     encode_tile=None,
     encode_tile_margin: int = 16,
+    guidance_scale: float = 1.0,
+    null_class_id: Optional[int] = None,
 ):
     """Full-resolution prediction, dispatching vectorial or UNet model.
 
@@ -348,6 +377,7 @@ def process_volume_unified(
             crop_tensor, vae, model, adapter,
             flow_spec, n_steps, device, use_amp, amp_dtype,
             encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
+            guidance_scale=guidance_scale, null_class_id=null_class_id,
         )
         # Invert the same crop/pad symmetrically back to the native shape.
         pred_1mm = center_crop_or_pad_np(pred_crop, native_shape)
@@ -366,6 +396,7 @@ def process_volume_unified(
                 patch_tensor, vae, model, adapter,
                 flow_spec, n_steps, device, use_amp, amp_dtype,
                 encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
+                guidance_scale=guidance_scale, null_class_id=null_class_id,
             )
             patch_outputs.append(torch.from_numpy(pred_patch).unsqueeze(0).unsqueeze(0).float())
 
@@ -456,6 +487,7 @@ def infer_single(
     compat_orientation: bool = False,
     compat_source_norm: bool = False,
     upsample_order: int = 1,
+    guidance_scale: float = 1.0,
 ):
     input_path = Path(input_path)
     if not input_path.exists():
@@ -537,6 +569,21 @@ def infer_single(
 
     # Legacy v1 method flag (see _make_flow_spec)
     use_v1 = (cfg.get("method", "mmfm3d") == "mmfm3d_vectorized_v1")
+    # H1 (2026-09-15) : (contraste, champ source, champ cible) en conditionnement,
+    # `t` redevient une interpolation locale pure — voir _make_flow_spec/_flat_triple.
+    use_pairwise_ot = (
+        str(cfg.get("train", {}).get("marginal_mode", "trajectory")).lower() == "pairwise_ot"
+    )
+    # Guidance (H2) : l'id nul n'existe que pour le conditionnement modalité
+    # seule (mod_idx) ou (modalité, champ src, champ tgt) en pairwise_ot, pas
+    # pour le schéma v1 (modalité × champ, un axe temps différent) — voir
+    # build_vector_mmfm.
+    if use_v1:
+        null_class_id = None
+    elif use_pairwise_ot:
+        null_class_id = len(modalities) * n_fields * n_fields
+    else:
+        null_class_id = len(modalities)
 
     print(f"[{mod}] {src} → {tgt_field} | Loading VAE...")
     vae = load_vae(cfg, dev)
@@ -549,7 +596,8 @@ def infer_single(
     loaded_from = _load_model_weights(model, ckpt, use_ema, adapter)
     print(f"  Model loaded ({loaded_from}, iter={ckpt.get('iter', '?')}) from {checkpoint}")
 
-    flow_spec = _make_flow_spec(model_type, mod_idx, src_field_idx, tgt_field_idx, n_fields, use_v1)
+    flow_spec = _make_flow_spec(model_type, mod_idx, src_field_idx, tgt_field_idx, n_fields,
+                                 use_v1, use_pairwise_ot)
 
     t0 = time.time()
     pred_vol, affine, header = process_volume_unified(
@@ -563,6 +611,7 @@ def infer_single(
         upsample_order=upsample_order,
         target_spacing=target_spacing,
         encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
+        guidance_scale=guidance_scale, null_class_id=null_class_id,
     )
 
     if output_path:
@@ -585,6 +634,7 @@ def infer_batch(
     modalities=None,
     pairs_filter=None,
     max_subjects=None,
+    subjects=None,
     recalibration=None,
     env_path=None,
     n_steps: Optional[int] = None,
@@ -597,6 +647,7 @@ def infer_batch(
     compat_orientation: bool = False,
     compat_source_norm: bool = False,
     upsample_order: int = 1,
+    guidance_scale: float = 1.0,
 ):
     field_norm_stats = None
     if field_norm_stats_path:
@@ -638,6 +689,17 @@ def infer_batch(
 
     # Legacy v1 method flag (see _make_flow_spec)
     use_v1 = (cfg.get("method", "mmfm3d") == "mmfm3d_vectorized_v1")
+    # H1 (2026-09-15) : voir la même remarque dans infer_single.
+    use_pairwise_ot = (
+        str(cfg.get("train", {}).get("marginal_mode", "trajectory")).lower() == "pairwise_ot"
+    )
+    # Guidance (H2) : voir la même remarque dans infer_single.
+    if use_v1:
+        null_class_id = None
+    elif use_pairwise_ot:
+        null_class_id = len(all_modalities) * n_fields * n_fields
+    else:
+        null_class_id = len(all_modalities)
 
     modalities = modalities if modalities is not None else all_modalities
 
@@ -668,7 +730,8 @@ def infer_batch(
         mod_idx = all_modalities.index(mod)
         for src, tgt in task_pairs:
             flow_spec = _make_flow_spec(
-                model_type, mod_idx, fields.index(src), fields.index(tgt), n_fields, use_v1
+                model_type, mod_idx, fields.index(src), fields.index(tgt), n_fields,
+                use_v1, use_pairwise_ot,
             )
             pair_out_dir = out_root / "task3" / mod / f"{src}_to_{tgt}"
             pair_out_dir.mkdir(parents=True, exist_ok=True)
@@ -701,6 +764,13 @@ def infer_batch(
                 continue
 
             input_files = sorted(input_dir.glob("*.nii.gz"))
+            if subjects is not None:
+                # Filtre par ID de sujet exact (ex. évaluation LOO : un seul
+                # sujet tenu à l'écart du fine-tuning) — distinct de
+                # `max_subjects`, qui prend les N premiers par ordre
+                # alphabétique plutôt qu'un sujet précis.
+                input_files = [p for p in input_files
+                               if p.name.split("_")[-1].replace(".nii.gz", "") in subjects]
             if max_subjects is not None:
                 # Sous-echantillonnage DETERMINISTE : le meme sous-ensemble a
                 # chaque appel, sinon deux estimations de la recalibration ne portent pas
@@ -730,6 +800,7 @@ def infer_batch(
                     upsample_order=upsample_order,
                     target_spacing=target_spacing,
                     encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
+                    guidance_scale=guidance_scale, null_class_id=null_class_id,
                 )
                 nib.save(nib.Nifti1Image(pred_vol, affine, header), str(out_path))
                 print(f"  {nii_path.name} → {out_path}  ({time.time() - t0:.1f}s)")
@@ -762,6 +833,10 @@ def parse_args():
                         "payer les 143 sujets par paire.")
     p.add_argument("--modalities", nargs="+", default=None)
     p.add_argument("--pairs", default=None, help="Subset of pairs, e.g. '0.1T_to_7T,1.5T_to_3T'")
+    p.add_argument("--subjects", nargs="+", default=None,
+                   help="[batch] Filtre par ID de sujet exact (ex. '0006'), distinct "
+                        "de --max_subjects qui prend les N premiers par ordre alphabétique. "
+                        "Sert à l'évaluation leave-one-out (un seul sujet tenu à l'écart).")
     p.add_argument("--env", default="local")
     p.add_argument("--n_steps", type=int, default=None)
     p.add_argument("--norm_mode", default=None,
@@ -787,6 +862,11 @@ def parse_args():
                    help="Normalise la source par ses propres percentiles, comme le cache "
                         "(defaut : cle inference.compat_source_norm de la config).")
     p.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    p.add_argument("--guidance_scale", type=float, default=1.0,
+                   help="Guidance conditionnelle style CFG (expérience H2, "
+                        "2026-09-14). 1.0 (défaut) = désactivée, comportement "
+                        "inchangé. N'a de sens que pour un checkpoint entraîné "
+                        "avec model.cond_dropout_prob > 0 (voir arch_vector.py).")
     return p.parse_args()
 
 
@@ -914,6 +994,7 @@ def main():
             upsample_order=int(args.upsample_order if args.upsample_order is not None
                                else cfg_infer.get('upsample_order', 1)),
             field_norm_stats_path=args.field_norm_stats,
+            guidance_scale=args.guidance_scale,
         )
     else:
         if not args.output_dir:
@@ -928,7 +1009,7 @@ def main():
         infer_batch(
             cfg_path=args.config, checkpoint=args.checkpoint, output_dir=args.output_dir,
             split=args.split, modalities=args.modalities, pairs_filter=pairs_filter,
-            max_subjects=args.max_subjects,
+            max_subjects=args.max_subjects, subjects=args.subjects,
             # CLI prioritaire sur la config, config prioritaire sur « aucun ».
             recalibration=(
                 json.load(open(args.intensity_recalibration))
@@ -943,6 +1024,7 @@ def main():
             upsample_order=int(args.upsample_order if args.upsample_order is not None
                                else cfg_infer.get('upsample_order', 1)),
             field_norm_stats_path=args.field_norm_stats,
+            guidance_scale=args.guidance_scale,
         )
 
 
