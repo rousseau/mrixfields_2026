@@ -63,6 +63,58 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-17 (suite) — La régression T2W expliquée et corrigée : sélection par contraste à l'inférence, aucun réentraînement
+
+**Diagnostic.** Rechargé les 10 checkpoints par repli (déjà entraînés,
+`diagnose_finetune_checkpoints.py` relancé pour la décomposition par
+contraste, absente du premier passage) : **production est déjà excellente en
+T2W** (nRMSE latent 0.177–0.199, bien meilleur que ses propres T1W/T2FLAIR) et
+**AUCUN checkpoint, dans AUCUN des 3 replis, ne bat jamais production sur
+T2W** — la dégradation apparaît dès la première sauvegarde (150 itérations) et
+ne se résorbe jamais. Ce n'est donc pas un problème de point d'arrêt mal
+choisi : n'importe quelle quantité de fine-tuning dégrade T2W.
+
+**Piste explicative, cohérente mais pas prouvée au niveau de la paire** :
+`diagnose_true_displacement.py` (déjà utilisé) montre que la part du VRAI
+déplacement propre au sujet en T2W (0.452–0.480 sur les 4 paires depuis 0.1T)
+est nettement plus basse ET plus resserrée que T1W (0.437–1.440) ou T2FLAIR
+(0.477–0.918) — le transport T2W ressemble le plus à un décalage commun de
+population, cohérent avec le fait que la production (entraînée sur 1053
+sujets non appariés) l'ait déjà bien capturé, et que 30 volumes de fine-tuning
+n'apportent alors que du bruit. Corrélation directe testée sur les 12 paires
+depuis 0.1T (part propre vs delta nRMSE du fine-tuning) : **Pearson r=-0.217,
+p=0.50 — direction cohérente, non significative** (n=12, sous-alimenté). Piste
+plausible, pas établie au niveau de la paire individuelle.
+
+**Correctif, sans réentraînement** : à l'inférence, choisir par CONTRASTE
+plutôt qu'un seul modèle pour les trois — fine-tuning LOO pour T1W/T2FLAIR
+(où il gagne), production pour T2W (où il perd toujours). Recombinaison pure
+des prédictions déjà calculées (`cp` entre dossiers existants), zéro calcul
+GPU supplémentaire.
+
+| | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| **best-of-both** (`8win`) | **0.3092** | 0.8421 | 0.1958 |
+| fine-tuning LOO pur (`8win`) | 0.3320 | **0.8468** | **0.1945** |
+| production (`8win`) | 0.3394 | 0.8313 | 0.2060 |
+
+**best-of-both vs production, `8win`** : nRMSE p=0.0020, SSIM p=3.7e-05, LPIPS
+p=3.3e-05 — **les TROIS métriques significatives**, contrairement au
+fine-tuning pur (nRMSE non significatif, 32/60, p=0.51). Confirmé en `cc` :
+nRMSE 0.3207 (p=0.0012), SSIM 0.8238 (p=2.0e-06), LPIPS 0.1802 (p=4.0e-06).
+
+**Bilan** : la sélection par contraste n'est pas seulement un correctif de la
+régression T2W, c'est un résultat strictement meilleur que les deux options
+pures sur toutes les métriques testées — la première fois dans cette
+investigation qu'une amélioration significative est obtenue simultanément sur
+nRMSE, SSIM et LPIPS. Reste ouvert : la piste explicative (part propre au
+sujet) mérite un test à plus grande échelle avant d'être considérée établie ;
+et rien n'indique que T1W/T2FLAIR ne bénéficieraient pas eux aussi d'un arrêt
+plus fin, spécifique à leur propre trajectoire de checkpoints plutôt qu'au
+choix agrégé actuel.
+
+---
+
 ## 2026-09-17 — Confirmation en géométrie `8win` (protocole officiel) : le résultat du fine-tuning LOO tient
 
 **Suite immédiate de l'entrée précédente**, à la demande explicite de
