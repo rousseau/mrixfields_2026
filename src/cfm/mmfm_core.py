@@ -64,6 +64,7 @@ from common.io import (
     MODALITIES,
     adjust_affine_for_crop_pad,
     denormalize_from_01,
+    foreground_level,
     load_nifti_volume,
     resample_volume,
 )
@@ -88,7 +89,7 @@ from cfm.edge_loss_3d import Sobel3D, edge_consistency_loss
 class ArchAdapter:
     name: str
     build_model: Callable[[], Any]
-    make_model_fn: Callable[[Any], Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]]
+    make_model_fn: Callable[[Any], Callable[[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]], Tensor]]
     prep_latent: Callable[[Any, Tensor], Tuple[Tensor, Any]]
     restore_latent: Callable[[Tensor, Any], Tensor]
     checkpoint_key_remap: Callable[[dict], dict]
@@ -497,7 +498,7 @@ def _compute_flow_trajectory(
 
 @torch.no_grad()
 def euler_integrate(
-    model_fn: Callable[[Tensor, Tensor, Tensor, Tensor], Tensor],
+    model_fn: Callable[..., Tensor],
     z_src: Tensor,
     y: Tensor,
     t_start: float,
@@ -508,6 +509,7 @@ def euler_integrate(
     amp_dtype: torch.dtype = torch.bfloat16,
     guidance_scale: float = 1.0,
     null_y: Optional[Tensor] = None,
+    level: Optional[Tensor] = None,
 ) -> Tensor:
     """Euler integration of the multi-marginal flow from t_start to t_end,
     conditioned on a FIXED source anchor `z_src` throughout (never updated —
@@ -535,9 +537,9 @@ def euler_integrate(
         t_val = t_start + step_i * dt
         t_vec = torch.full((z.shape[0],), t_val, dtype=torch.float32, device=device)
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
-            v_cond = model_fn(z, z_anchor, t_vec, y)
+            v_cond = model_fn(z, z_anchor, t_vec, y, level=level)
             if guidance_scale != 1.0:
-                v_uncond = model_fn(z, z_anchor, t_vec, null_y)
+                v_uncond = model_fn(z, z_anchor, t_vec, null_y, level=level)
                 vt = v_uncond + guidance_scale * (v_cond - v_uncond)
             else:
                 vt = v_cond
@@ -1097,6 +1099,12 @@ def train(
                 Z = torch.stack([
                     torch.stack([ds[int(j)][0] for j in row]) for row in idx
                 ]).to(device).float()  # (B, K, *rest)
+                # NIVEAU DE LA SOURCE (2026-09-18) : meme construction que `Z`
+                # mais sur le 5e champ du dataset (voir FlatLatentCacheDataset),
+                # pour rester alignee position a position sur l'axe K.
+                Level = torch.stack([
+                    torch.stack([ds[int(j)][-1] for j in row]) for row in idx
+                ]).to(device).float()  # (B, K)
 
                 if flip_per_step and flip_lr_prob > 0.0 and random.random() < flip_lr_prob:
                     # UN SEUL tirage, appliqué aux K marginales : les
@@ -1114,6 +1122,7 @@ def train(
                 t_global, z_t, ut_global, z_src = _compute_flow_trajectory(
                     Z, t_anchor, anchor_pos, sigma, device,
                 )
+                level_src = Level[:, anchor_pos]
                 same = False
                 t_i, t_j = t_anchor[anchor_pos], t_anchor[anchor_pos]
             elif marginal_mode == "pairwise_ot":
@@ -1132,6 +1141,9 @@ def train(
                 Z = torch.stack([
                     torch.stack([ds[int(j)][0] for j in row]) for row in idx
                 ]).to(device).float()  # (B, K, *rest)
+                Level = torch.stack([
+                    torch.stack([ds[int(j)][-1] for j in row]) for row in idx
+                ]).to(device).float()  # (B, K)
 
                 if flip_per_step and flip_lr_prob > 0.0 and random.random() < flip_lr_prob:
                     Z = _flip_batch(Z)
@@ -1150,6 +1162,7 @@ def train(
                 pos_j = contrast_fields[contrast].index(fj)
                 z_src = Z[:, pos_i]
                 z_tgt = Z[:, pos_j]
+                level_src = Level[:, pos_i]
                 same = (fi == fj)
                 t_global, z_t, ut_global = _compute_flow(FM, z_src, z_tgt, 0.0, 1.0, same, device)
                 t_i, t_j = 0.0, 1.0
@@ -1158,7 +1171,9 @@ def train(
                 src_flat = _flat_class(contrast, fi, n_fields)
                 tgt_flat = _flat_class(contrast, fj, n_fields)
 
-                src_item = next(class_loaders[src_flat])[0].to(device)
+                src_batch = next(class_loaders[src_flat])
+                src_item = src_batch[0].to(device)
+                level_src = src_batch[-1].to(device)
                 tgt_item = src_item if same else next(class_loaders[tgt_flat])[0].to(device)
 
                 if flip_per_step and flip_lr_prob > 0.0 and random.random() < flip_lr_prob:
@@ -1216,7 +1231,7 @@ def train(
             with torch.amp.autocast(
                 "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
             ):
-                v_t = model_fn(z_t, z_src, t_vec, y_flow)
+                v_t = model_fn(z_t, z_src, t_vec, y_flow, level=level_src)
                 loss = loss_fn(v_t, ut_global) / float(k)
 
             z_src_roundtrip = None
@@ -1224,6 +1239,7 @@ def train(
             if lambda_cycle_active and not same:
                 z_tgt_hat, z_src_roundtrip = cycle_rollout_vector(
                     model_fn, z_src, y_tgt, t_i, t_j, cycle_n_steps, amp_dtype, use_amp,
+                    level=level_src,
                 )
                 loss_cycle = F.l1_loss(z_src_roundtrip, z_src)
                 loss = loss + cur_lambda_cycle * loss_cycle
@@ -1537,6 +1553,15 @@ def infer(
             fixed_lo=src_fixed_lo,
             fixed_hi=src_fixed_hi,
         )
+        # NIVEAU DE LA SOURCE (2026-09-18) : recalcule sur un chargement NON
+        # normalise (meme resample, memes crop/pad) -- `normalize=True` ci-
+        # dessus a deja detruit ce niveau (voir foreground_level). Toujours
+        # calcule, meme si le checkpoint charge n'a pas level_cond=True : sans
+        # effet dans ce cas (voir VectorMMFM.forward).
+        vol_native, _ = load_nifti_volume(
+            nii_path, target_spacing=target_spacing, volume_size=volume_size, normalize=False,
+        )
+        level_val = foreground_level(vol_native)
 
         img_nib = nib.load(str(nii_path))
         orig_spacing = np.abs(np.diag(img_nib.affine)[:3])
@@ -1564,8 +1589,10 @@ def infer(
         z_src = z_src.float()
 
         y = torch.tensor([class_id], dtype=torch.long, device=device)
+        level_t = torch.tensor([level_val], dtype=torch.float32, device=device)
         z_tgt = euler_integrate(
             model_fn, z_src, y, t_start, t_end, n_steps, device, use_amp, amp_dtype,
+            level=level_t,
         )
         z_tgt = adapter.restore_latent(z_tgt, meta)
 

@@ -194,8 +194,12 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
     def build_model() -> nn.Module:
         return build_vector_mmfm(cfg, latent_dim, n_classes)
 
-    def make_model_fn(raw_model: nn.Module) -> Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]:
-        return lambda z_t, z_src, t, y: raw_model(z_t, z_src, t, y)
+    def make_model_fn(raw_model: nn.Module) -> Callable[..., Tensor]:
+        # `raw_model` est aussi un VectorMMFM (voir build_model ci-dessus) : le
+        # canal `level` (2026-09-18) est donc transmis, meme si aucune config
+        # INR ne met encore `level_cond: true` -- comportement par defaut
+        # inchange (voir VectorMMFM.forward).
+        return lambda z_t, z_src, t, y, level=None: raw_model(z_t, z_src, t, y, level)
 
     def prep_latent(vae, z: Tensor) -> Tuple[Tensor, Any]:
         # `z` here is the identity-VAE "encoded" tensor, i.e. the raw volume

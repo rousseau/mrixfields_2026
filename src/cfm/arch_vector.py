@@ -63,6 +63,13 @@ def build_vector_mmfm(cfg: dict, latent_dim: int, n_classes: int) -> VectorMMFM:
         time_scale=float(m.get("time_scale", 1.0)),
         # "concat" par defaut = comportement historique, checkpoints valides.
         time_cond=str(m.get("time_cond", "concat")),
+        # NIVEAU DE LA SOURCE (2026-09-18). False par defaut = zero parametre
+        # ajoute, checkpoints existants inchanges. Voir VectorMMFM.__init__ et
+        # common.io.foreground_level.
+        level_cond=bool(m.get("level_cond", False)),
+        level_embed_dim=int(m.get("level_embed_dim", 32)),
+        level_mean=float(m.get("level_mean", 0.0)),
+        level_scale=float(m.get("level_scale", 1.0)),
     )
 
 
@@ -86,8 +93,11 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
     def build_model() -> nn.Module:
         return build_vector_mmfm(cfg, latent_dim, n_classes)
 
-    def make_model_fn(raw_model: nn.Module) -> Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]:
-        return lambda z_t, z_src, t, y: raw_model(z_t, z_src, t, y)
+    def make_model_fn(raw_model: nn.Module) -> Callable[..., Tensor]:
+        # `level=None` (defaut) : VectorMMFM.forward exige un tenseur si
+        # level_cond=True (voir mmfm_vectorized.py) -- l'appelant (mmfm_core.py)
+        # doit alors toujours le fournir. Sans level_cond, argument ignore.
+        return lambda z_t, z_src, t, y, level=None: raw_model(z_t, z_src, t, y, level)
 
     def prep_latent(vae, z: Tensor) -> Tuple[Tensor, Any]:
         # Phase F precedent (train_mmfm_3d.py): vae.to_vector() is the

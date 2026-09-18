@@ -46,7 +46,7 @@ from cfm import arch_inr, arch_unet, arch_vector
 from models.tiled_vae import tiled_decode, tiled_encode
 from cfm.mmfm_core import euler_integrate, _infer_latent_shape, _flat_class, _flat_triple, _field_to_time
 from common.config import load_yaml_with_include, load_env, resolve_paths
-from common.io import DOMAINS, MODALITIES, denormalize_from_01, center_crop_or_pad_np
+from common.io import DOMAINS, MODALITIES, denormalize_from_01, center_crop_or_pad_np, foreground_level
 from models.vae_loader import load_vae
 
 # Import process_volume from batch script (re-use full-res logic)
@@ -216,6 +216,7 @@ def _infer_patch_unified(
     encode_tile_margin: int = 16,
     guidance_scale: float = 1.0,
     null_class_id: Optional[int] = None,
+    level: Optional[float] = None,
 ) -> np.ndarray:
     """Run VAE encode -> flow -> VAE decode on a single patch. Identical for
     both architectures — the adapter absorbs the flatten/pad and call-
@@ -226,7 +227,11 @@ def _infer_patch_unified(
     au goulot, OOM dès 192x224x192). Doit reprendre EXACTEMENT les valeurs
     `data.encode_tile`/`encode_tile_margin` utilisées au precompute, sinon les
     latents d'inférence ne seraient pas dans la même distribution que ceux du
-    cache d'entraînement."""
+    cache d'entraînement.
+
+    `level` (niveau de la source, 2026-09-18) : toujours transmis à
+    `euler_integrate`, même quand le checkpoint chargé n'a pas
+    `level_cond=True` — sans effet dans ce cas (voir VectorMMFM.forward)."""
     model_fn = adapter.make_model_fn(model)
     with torch.no_grad(), torch.amp.autocast(
         "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
@@ -245,10 +250,11 @@ def _infer_patch_unified(
             if null_class_id is None:
                 raise ValueError("guidance_scale != 1.0 requiert null_class_id.")
             null_y = torch.full_like(y, null_class_id)
+        level_t = None if level is None else torch.tensor([level], dtype=torch.float32, device=device)
         z_tgt = euler_integrate(
             model_fn, z_src, y, flow_spec["t_start"], flow_spec["t_end"],
             n_steps, device, use_amp, amp_dtype,
-            guidance_scale=guidance_scale, null_y=null_y,
+            guidance_scale=guidance_scale, null_y=null_y, level=level_t,
         )
         z_tgt = adapter.restore_latent(z_tgt, meta)
         if encode_tile is not None:
@@ -309,6 +315,11 @@ def process_volume_unified(
 
     img_src_1mm = nib_proc.resample_to_output(img_src, voxel_sizes=target_spacing, order=1)
     vol_1mm = img_src_1mm.get_fdata(dtype=np.float32)
+    # NIVEAU DE LA SOURCE (2026-09-18) : sur `vol_1mm`, avant TOUTE normalisation
+    # ci-dessous — exactement ce que `foreground_level`/le témoin `srclevel`
+    # mesurent. Toujours calculé, même si le checkpoint n'a pas level_cond=True
+    # (voir _infer_patch_unified : sans effet dans ce cas).
+    level_val = foreground_level(vol_1mm)
 
     if norm_mode == "field_fixed":
         # Fixed per-(modality, source field) percentile bounds from
@@ -378,6 +389,7 @@ def process_volume_unified(
             flow_spec, n_steps, device, use_amp, amp_dtype,
             encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
             guidance_scale=guidance_scale, null_class_id=null_class_id,
+            level=level_val,
         )
         # Invert the same crop/pad symmetrically back to the native shape.
         pred_1mm = center_crop_or_pad_np(pred_crop, native_shape)
@@ -397,6 +409,7 @@ def process_volume_unified(
                 flow_spec, n_steps, device, use_amp, amp_dtype,
                 encode_tile=encode_tile, encode_tile_margin=encode_tile_margin,
                 guidance_scale=guidance_scale, null_class_id=null_class_id,
+                level=level_val,
             )
             patch_outputs.append(torch.from_numpy(pred_patch).unsqueeze(0).unsqueeze(0).float())
 

@@ -1,0 +1,120 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM vectorisé — CONDITIONNEMENT PAR LE NIVEAU DE LA SOURCE (2026-09-18).
+#
+# Copie EXACTE de vectorized_trajectory.yaml (production/R-best). Seules 4 clés
+# ajoutées, toutes dans `model:` — rien d'autre ne change, cache/couplage/loss/
+# flip/hyperparamètres identiques, pour que tout écart avec la production ne
+# puisse venir que de ce seul conditionnement (voir feedback_fair_comparison).
+#
+# MOTIVATION (voir CHANGELOG.md, 2026-09-04, « le témoin qui manquait » et
+# 2026-09-18). Un témoin trivial — recopier la source, rééchelonnée par UN
+# scalaire lu depuis le NIVEAU OBSERVÉ dans la source — bat les trois
+# architectures entraînées (nRMSE 0.2561 contre 0.3479 pour la meilleure,
+# l'INR) : corr(niveau du foreground de la source, gain oracle requis) = -0.76
+# à -0.88 selon le contraste. La cause : `normalize_volume` divise chaque
+# volume par son propre p99.5 avant que le réseau ne le voie — il n'a jamais
+# accès à ce nombre. Ce fichier le lui redonne, par le MÊME mécanisme FiLM déjà
+# mesuré comme facteur dominant pour le temps (time_cond: film) : le niveau
+# rejoint simplement le vecteur `cond` partagé, embeddé par un `nn.Linear(1,
+# level_embed_dim)` appris.
+#
+# PRÉREQUIS : le cache doit porter le champ `level` par échantillon (voir
+# src/cfm/augment_cache_index_with_src_level.py — déjà appliqué au cache
+# c4d1e200 le 2026-09-18, in-place, sauvegarde dans index.json.bak, aucun
+# fichier .pt de latent modifié, cache_id inchangé).
+#
+# level_mean/level_scale : moyenne/écart-type de `level` mesurés sur les 1939
+# échantillons du cache c4d1e200/retro_train (même convention que
+# latent_mean/latent_scale ci-dessous, mesurés sur ce même cache) :
+#   0.1T=0.4895  1.5T=0.3669  3T=0.3253  5T=0.2959  7T=0.2073 (moyennes/champ)
+# — décroissant avec le champ, cohérent avec la note de normalize_volume_fixed
+# (« 5T/7T n'occupent qu'une fraction de [0,1] »).
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_vectorized_trajectory_srclevel
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint:
+  latent_channels: 1
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  time_scale: 1000.0
+  time_cond: film
+  latent_mean: 19.913378
+  latent_scale: 18.125440
+  # ── Seul ajout par rapport à vectorized_trajectory.yaml ──
+  level_cond: true
+  level_embed_dim: 32
+  level_mean: 0.333942
+  level_scale: 0.109826
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: retro_train
+  output_subdir: mmfm/vectorized_trajectory_srclevel
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_c4d1e200/retro_train
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  marginal_mode: trajectory
+  loss: mse
+  flip_per_step: true
+  batch_size: 1
+  total_iters: 25000
+  num_targets_per_step: 1
+  adjacent_only: false
+  identity_prob: 0.1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  accumulation_steps: 1
+  save_every: 2500
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

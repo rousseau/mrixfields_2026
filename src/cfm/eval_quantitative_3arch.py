@@ -62,7 +62,7 @@ from skimage.metrics import structural_similarity
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from common.config import load_env
-from common.io import Z_CLIP_RANGE, apply_z_clip
+from common.io import Z_CLIP_RANGE, apply_z_clip, foreground_level
 from cfm.eval_qualitative_3arch import (
     METHODS, brain_bbox, gt_path, hf_ratio, load_metrics, load_vol, pred_path,
     spectrum_of_volume,
@@ -258,10 +258,13 @@ def _fg_level(vol: np.ndarray) -> float:
     du 2026-09-04 : corr(niveau du foreground de la source, gain oracle requis)
     = -0.76 / -0.70 / -0.88 selon le contraste. Le gain a appliquer est donc
     largement lisible dans la source elle-meme.
+
+    Formule partagee avec `common.io.foreground_level` (utilisee pour le
+    conditionnement `model.level_cond` du flow, voir mmfm_vectorized.py) :
+    seule la restriction a `_region` (le pave note) differe, propre a ce
+    module d'evaluation.
     """
-    v = _region(vol).astype(np.float64)
-    m = v > FG_THRESHOLD
-    return float(v[m].mean()) if m.any() else 0.0
+    return foreground_level(_region(vol), threshold=FG_THRESHOLD)
 
 
 def mode_scaled_identity(args) -> None:

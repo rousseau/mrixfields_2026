@@ -174,6 +174,26 @@ def denormalize_from_01(vol01: np.ndarray, lo: float, hi: float) -> np.ndarray:
     return (vol01 * (hi - lo) + lo).astype(np.float32)
 
 
+def foreground_level(vol: np.ndarray, threshold: float = 0.02) -> float:
+    """Niveau d'intensité moyen du foreground, sur les données NATIVES
+    (avant `normalize_volume`/`normalize_volume_fixed`, déjà dans [0, 1]).
+
+    C'est l'information que `normalize_volume` DÉTRUIT : elle divise chaque
+    volume par son propre p99.5, donc le réseau ne voit jamais ce nombre. Mesure
+    du 2026-09-04 (`eval_quantitative_3arch.py::_fg_level`, même formule, sur la
+    région évaluée) : corr(niveau du foreground de la source, gain oracle
+    requis) = -0.76 / -0.70 / -0.88 selon le contraste — le gain à appliquer
+    est largement lisible dans la source elle-même. Utilisée à la fois par le
+    témoin `srclevel` (mesure) et par `model.level_cond` (conditionnement du
+    flow, voir `cfm/mmfm_vectorized.py`) — même formule dans les deux cas,
+    pour ne pas conditionner le modèle sur une variante non testée de ce qui
+    a été mesuré.
+    """
+    v = vol.astype(np.float64)
+    m = v > threshold
+    return float(v[m].mean()) if m.any() else 0.0
+
+
 def resample_volume(
     vol: np.ndarray,
     original_spacing,

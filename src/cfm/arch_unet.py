@@ -182,8 +182,13 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
     # results/mmfm/audit_20260827_refcompare/manifest.md.
     time_scale = float(cfg["model"].get("time_scale", 1.0))
 
-    def make_model_fn(raw_model: nn.Module) -> Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]:
-        def _fn(z_t: Tensor, z_src: Tensor, t: Tensor, y: Tensor) -> Tensor:
+    def make_model_fn(raw_model: nn.Module) -> Callable[..., Tensor]:
+        # `level` (niveau de la source, 2026-09-18) : ignore ici -- l'UNet
+        # MONAI n'a pas de canal de conditionnement scalaire additionnel, seul
+        # le vectorise le consomme (voir arch_vector.py::build_vector_mmfm).
+        # Le parametre existe pour que le call site partage de mmfm_core.py
+        # (identique pour les 3 architectures) reste inchange.
+        def _fn(z_t: Tensor, z_src: Tensor, t: Tensor, y: Tensor, level: Tensor | None = None) -> Tensor:
             z_in = torch.cat([z_t, z_src], dim=1)
             return raw_model(x=z_in, timesteps=t * time_scale, class_labels=y)
         return _fn

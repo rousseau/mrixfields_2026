@@ -126,6 +126,10 @@ class VectorMMFM(nn.Module):
         latent_scale=1.0,
         time_scale: float = 1.0,
         time_cond: str = "concat",
+        level_cond: bool = False,
+        level_embed_dim: int = 32,
+        level_mean: float = 0.0,
+        level_scale: float = 1.0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -168,7 +172,16 @@ class VectorMMFM(nn.Module):
         if time_cond not in ("concat", "film"):
             raise ValueError(f"time_cond doit valoir 'concat' ou 'film', pas {time_cond!r}")
         self.time_cond = time_cond
-        cond_dim = time_embed_dim + class_embed_dim
+
+        # NIVEAU DE LA SOURCE (experience 2026-09-18, voir CHANGELOG.md « le
+        # temoin qui manquait »). Rejoint SIMPLEMENT le vecteur `cond` partage
+        # avec le temps et la classe -- il suit alors le meme routage que
+        # `time_cond` (concat a l'entree, ou FiLM par bloc) : aucun mecanisme
+        # separe, aucune combinaison invalide possible. `level_cond=False`
+        # (defaut) = zero parametre ajoute, comportement historique inchange.
+        self.level_cond = bool(level_cond)
+        self.level_embed_dim = int(level_embed_dim) if self.level_cond else 0
+        cond_dim = time_embed_dim + class_embed_dim + self.level_embed_dim
 
         input_dim = 2 * latent_dim + (cond_dim if time_cond == "concat" else 0)
         self.class_embed = nn.Embedding(num_classes, class_embed_dim)
@@ -213,6 +226,14 @@ class VectorMMFM(nn.Module):
         # (voir results/mmfm/inr_direct_lora16_task3_20260913/manifest.md).
         self.register_buffer("latent_mean", torch.as_tensor(latent_mean, dtype=torch.float32), persistent=False)
         self.register_buffer("latent_scale", torch.as_tensor(latent_scale, dtype=torch.float32), persistent=False)
+        # Meme convention que latent_mean/scale : tampon NON PERSISTANT, calcule
+        # hors ligne sur le cache (moyenne/ecart-type de `level` sur les
+        # echantillons d'entrainement) et fourni par la config -- pas appris.
+        # (0, 1) par defaut = sans effet.
+        self.register_buffer("level_mean", torch.as_tensor(level_mean, dtype=torch.float32), persistent=False)
+        self.register_buffer("level_scale", torch.as_tensor(level_scale, dtype=torch.float32), persistent=False)
+        if self.level_cond:
+            self.level_embed = nn.Linear(1, self.level_embed_dim)
 
     def forward(
         self,
@@ -220,12 +241,22 @@ class VectorMMFM(nn.Module):
         z_src_vec: torch.Tensor,
         timesteps: torch.Tensor,
         class_labels: torch.Tensor,
+        level: torch.Tensor | None = None,
     ) -> torch.Tensor:
         time_feat = sinusoidal_time_embedding(timesteps * self.time_scale, self.time_embed_dim)
         class_feat = self.class_embed(class_labels)
         z_t_n = (z_t_vec - self.latent_mean) / self.latent_scale
         z_src_n = (z_src_vec - self.latent_mean) / self.latent_scale
-        cond = torch.cat([time_feat, class_feat], dim=1)
+        cond_parts = [time_feat, class_feat]
+        if self.level_cond:
+            if level is None:
+                raise ValueError(
+                    "level_cond=True exige un tenseur `level` (niveau de la "
+                    "source, voir common.io.foreground_level) — None recu."
+                )
+            level_n = ((level.float().view(-1, 1) - self.level_mean) / self.level_scale)
+            cond_parts.append(self.level_embed(level_n))
+        cond = torch.cat(cond_parts, dim=1)
         if self.time_cond == "concat":
             h = torch.cat([z_t_n, z_src_n, cond], dim=1)
             cond = None
@@ -249,6 +280,7 @@ def cycle_rollout_vector(
     n_steps: int,
     amp_dtype: torch.dtype,
     use_amp: bool,
+    level: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Differentiable forward-then-backward Euler round trip in vector latent
     space: src(t_i) -> ~tgt(t_j) -> ~src(t_i).
@@ -284,7 +316,7 @@ def cycle_rollout_vector(
         t_val = t_i + step_i * dt_fwd
         t_vec = torch.full((z.shape[0],), t_val, dtype=torch.float32, device=device)
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
-            v = raw_mmfm(z, z_src_vec, t_vec, y_tgt)
+            v = raw_mmfm(z, z_src_vec, t_vec, y_tgt, level=level)
         z = z + dt_fwd * v.float()
     z_tgt_hat = z
 
@@ -294,7 +326,7 @@ def cycle_rollout_vector(
         t_val = t_j + step_i * dt_bwd
         t_vec = torch.full((z.shape[0],), t_val, dtype=torch.float32, device=device)
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")):
-            v = raw_mmfm(z, z_src_vec, t_vec, y_tgt)
+            v = raw_mmfm(z, z_src_vec, t_vec, y_tgt, level=level)
         z = z + dt_bwd * v.float()
     z_src_roundtrip = z
 

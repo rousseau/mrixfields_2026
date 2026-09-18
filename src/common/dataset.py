@@ -579,7 +579,17 @@ class FlatLatentCacheDataset(Dataset):
     l'emploi direct par VectorMMFM — aucun encode/resample/crop restant dans
     la boucle d'entraînement.
 
-    Retourne (latent_vec, mod_idx, field_idx, class_idx).
+    Retourne (latent_vec, mod_idx, field_idx, class_idx, level).
+
+    `level` = niveau d'intensité observé du volume SOURCE (voir
+    `common.io.foreground_level`), lu depuis `index.json` si le cache a été
+    enrichi par `augment_cache_index_with_src_level.py` — 0.0 sinon (cache non
+    enrichi, comportement sans effet pour tout code qui ignore ce 5e champ).
+    Ce n'est PAS une propriété du volume renvoyé par cet appel-ci en
+    particulier ; c'est une métadonnée par échantillon, présente que
+    l'échantillon serve de source ou de cible dans un pas d'entraînement donné
+    — l'appelant décide laquelle des deux occurrences utiliser (voir
+    `mmfm_core.py`, où seul le niveau du côté SOURCE est propagé au modèle).
 
     Augmentation par flip : le vecteur étant un latent SPATIAL aplati, le flip
     ne peut se faire qu'en le remettant en forme, d'où `latent_shape`. Il est
@@ -670,4 +680,5 @@ class FlatLatentCacheDataset(Dataset):
             torch.tensor(s["mod_idx"], dtype=torch.long),
             torch.tensor(s["field_idx"], dtype=torch.long),
             torch.tensor(s["class_idx"], dtype=torch.long),
+            torch.tensor(s.get("level", 0.0), dtype=torch.float32),
         )

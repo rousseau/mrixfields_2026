@@ -63,6 +63,56 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-18 (soir) — Conditionnement du flow par le niveau de la source (`level_cond`) : signal appris, score inchangé
+
+**Verdict : NÉGATIF.** Détail : `results/mmfm/vectorized_trajectory_srclevel_task3_20260918/manifest.md`.
+
+Suite du fil ouvert plus haut (« le témoin qui manquait », 2026-09-04/05) :
+`normalize_volume` détruit le niveau d'intensité observé de la source avant
+que le flow ne le voie — un témoin trivial qui le lit directement bat les
+trois architectures (nRMSE 0.2561 contre 0.3549 pour la production). Le
+niveau est réinjecté par le même mécanisme FiLM déjà validé pour le temps
+(`nn.Linear(1,32)` rejoignant le vecteur `cond` partagé), sur un cache
+enrichi in-place (1939 échantillons, `cache_id` inchangé) et un entraînement
+identique à la production sur tout le reste (25 000 itérations, même
+couplage OT, même loss).
+
+| protocole officiel `cc`, 60 cellules | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| **avec `level_cond`** | 0.3547 | 0.8101 | 0.1928 |
+| production (identique sinon) | 0.3549 | 0.8098 | 0.1928 |
+| témoin `scaled_identity` | 0.2561 | 0.8707 | — |
+
+Comparaison appariée : nRMSE 30/60 victoires (p=1.00), SSIM 28/60 (p=0.699),
+LPIPS 31/60 (p=0.897) — **un pile ou face**, aucune métrique distinguable de
+la production.
+
+**Diagnostic qui va au-delà du chiffre nul** : contrairement au bug
+« aveugle au temps » (cos(v(t=0),v(t=1))=1.000000 avant correctif), le réseau
+n'ignore PAS ce signal. `cond_proj.weight` route `level_feat` avec une
+magnitude du même ordre que le temps (0.0016-0.0018 contre 0.0031-0.0033), et
+faire varier `level` de 0.10 à 0.49 à tout le reste fixé change le champ de
+vitesse prédit de façon non triviale (cos = 0.949-0.9999, diff. relative de
+norme 1.7-31.7 % sur 8 tirages). **Le signal est appris et utilisé — l'utiliser
+ne referme simplement pas l'écart avec le témoin.** Troisième confirmation
+indépendante, après le MedVAE perceptuel (2026-09-02, gain de représentation
+absorbé) et l'audit du mécanisme (2026-09-04, mécanisme réparé, score
+inchangé), que ce pipeline n'additionne pas les gains de ses composants — voir
+la section « Plafond, mesuré et géométrique » et `project-plateau-huit-leviers`.
+
+**Bug d'implémentation trouvé et corrigé en cours de route** : le pipeline
+d'inférence Task 3 (`infer_mmfm_unified.py::process_volume_unified` /
+`_infer_patch_unified`) est un chemin SÉPARÉ de `mmfm_core.py::infer()` — le
+premier run a crashé (`ValueError: level_cond=True exige level`) parce que
+seul le second avait été mis à jour. Corrigé (niveau calculé sur le volume
+rééchantillonné non normalisé, avant `field_fixed`, transmis à
+`euler_integrate`), vérifié sur un cas réel avant de relancer les 180 volumes.
+
+**Non payé** : confirmation `8win` (~5h) — sans objet, Δ≈0 sous `cc` ne
+laisse rien à confirmer.
+
+---
+
 ## 2026-09-18 — Sélection du checkpoint par (repli × contraste) plutôt que par repli seul : gain marginal, non confirmé en `8win`
 
 **Question posée** : le choix d'UN checkpoint par repli (sur le nRMSE latent
@@ -2857,15 +2907,15 @@ une lacune que ce journal existe pour ne plus reproduire.
 
 | # | sujet | coût estimé |
 |---|---|---|
-| 1 | `test_inr_backbone_smoke.py` : seuil `nrmse_fg < 0.6` qui accepte le cassé, à 2 mm | 1 h |
+| 1 | ~~`test_inr_backbone_smoke.py` : seuil `nrmse_fg < 0.6` qui accepte le cassé, à 2 mm~~ **CORRIGÉ ET MESURÉ (2026-09-04)** — seuil désormais relatif (bat la moyenne leave-one-out), contrôle négatif prouvé | — |
 | 2 | Aucun test qui compare la loss finale à « prédire zéro » — trois lignes, aurait tout arrêté | 15 min |
 | 3 | Régénérer le cache INR sous le prétraitement corrigé | ~6 h GPU |
 | 4 | ~~Constante de recalibration d'intensité par paire~~ **FERMÉE, NÉGATIVE (2026-08-30)** — la voie sans appariement a été instruite : gagne sur 1 architecture sur 3, deux explications réfutées, cause = variance inter-sujets de 35 % contre une constante par classe. Non réparable par un meilleur estimateur | — |
-| 5 | Adoption du MedVAE perceptuel : régénérer les caches + réentraîner les deux flows | >1 jour |
-| 6 | Géométrie du latent INR (25 % de structure commune contre 91 %) : canoniser l'ajustement | ~6 h |
-| 7 | Loss L1 au lieu de L2 : écart à la dérivation du flow matching, effet mesuré nul sur les symptômes, à corriger par correction | 15 min + réentraînement |
+| 5 | ~~Adoption du MedVAE perceptuel : régénérer les caches + réentraîner les deux flows~~ **FAITE, NÉGATIVE (2026-09-02)** — cache régénéré, flow réentraîné, score inchangé (structurel 0.2147 contre 0.2143, p=0.33) : le gain de représentation est absorbé par le flow | — |
+| 6 | ~~Géométrie du latent INR (25 % de structure commune contre 91 %) : canoniser l'ajustement~~ **DIAGNOSTIC RENVERSÉ (2026-09-07) puis FERMÉ (2026-09-14)** — ce n'est pas la géométrie mais le budget (facteur 252) ; correctif LoRA rang 16 tenté et clos négatif | — |
+| 7 | Loss L1 au lieu de L2 : **mesuré le 2026-09-06, `l1` gagne sur nRMSE ET SSIM contre `mse`** (avec les 4 correctifs) — décision explicite de NE PAS adopter en production, pour ne pas introduire une deuxième inconnue sur des valeurs déjà validées (`vectorized_trajectory.yaml` garde `loss: mse`) | 15 min + réentraînement |
 | 8 | ~~Échelle du temps~~ **FAIT** (`model.time_scale`, défaut 1.0) — mesuré SANS effet seul | — |
-| 8b | **Conditionnement par modulation (`time_cond: film`) — le facteur dominant.** Fait pour le vectorisé/INR ; reste à porter sur l'UNet (MONAI le fait déjà nativement) | fait + réentraînements |
-| 9 | Standardisation du latent pour le vectorisé et l'UNet (`latent_scale` n'existe que dans `inr.yaml` ; latent σ=21.98 contre temps σ=0.027) | 10 min + réentraînement |
-| 10 | Guidance sans classifieur : absente chez nous, présente dans les deux références | ~2 h + réentraînement |
-| 11 | Interpolant cubique sur trajectoire couplée par chaînage OT (méthode réelle du papier MMFM) au lieu de droites par paire | ~1 jour |
+| 8b | **Conditionnement par modulation (`time_cond: film`) — le facteur dominant.** Fait pour le vectorisé/INR ; pour l'UNet, `unet_ts_adj.yaml` argumente que MONAI le fait déjà nativement (AdaGN) et prépare l'expérience, mais aucun run réel n'est retrouvé dans ce journal — gatée "après R-best", jamais relancée | fait + réentraînements |
+| 9 | Standardisation du latent : **fait pour le vectorisé** (`latent_mean`/`latent_scale` dans `vectorized_trajectory.yaml`, 2026-09-04) ; toujours absent des configs `unet*.yaml` | 10 min + réentraînement |
+| 10 | ~~Guidance sans classifieur : absente chez nous, présente dans les deux références~~ **IMPLÉMENTÉE ET TESTÉE, NÉGATIVE (2026-09-14/15)** — `cond_dropout` + `guidance_scale` sur 60 paires officielles : aggrave SSIM/LPIPS | — |
+| 11 | ~~Interpolant cubique sur trajectoire couplée par chaînage OT (méthode réelle du papier MMFM) au lieu de droites par paire~~ **IMPLÉMENTÉ ET MESURÉ, NÉGATIF NET (2026-09-04/05)** — gain nRMSE sous le plancher de bruit (−0.0031), SSIM −0.0281 | — |
