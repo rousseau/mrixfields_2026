@@ -63,7 +63,45 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
-## 2026-09-17 (suite) — La régression T2W expliquée et corrigée : sélection par contraste à l'inférence, aucun réentraînement
+## 2026-09-18 — Sélection du checkpoint par (repli × contraste) plutôt que par repli seul : gain marginal, non confirmé en `8win`
+
+**Question posée** : le choix d'UN checkpoint par repli (sur le nRMSE latent
+MOYENNÉ sur les 3 contrastes, cf. entrées précédentes) est-il optimal pour
+T1W et T2FLAIR séparément, maintenant que T2W est de toute façon écarté au
+profit de la production ? Réponse via les mêmes JSON de diagnostic
+(`diagnose_finetune_checkpoints.py`, relancé), décomposés par contraste :
+
+| repli | T1W retenu (agrégé) | T1W meilleur propre | T2FLAIR retenu (agrégé) | T2FLAIR meilleur propre |
+|---|---|---|---|---|
+| 0006 | iter 1050 : 0.2145 | iter 750 : **0.2021** | iter 1050 : 0.2122 | iter 1500 : **0.2046** |
+| 0007 | iter 450 : 0.2062 | iter 450 (déjà optimal) | iter 450 : 0.3367 | iter 1500 : **0.2692** |
+| 0009 | iter 900 : 0.2493 | iter 900 (déjà optimal) | iter 900 : 0.1945 | iter 900 (déjà optimal) |
+
+Écart notable sur le repli 0007/T2FLAIR (0.0675 de nRMSE latent) — le choix
+agrégé y est franchement sous-optimal.
+
+**Recombinaison testée (`cc`, sans réentraînement)** : pour chaque (repli,
+contraste), utiliser le checkpoint propre à ce contraste au lieu du
+checkpoint agrégé du repli ; T2W toujours depuis la production (entrée
+précédente).
+
+| | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| **sélection par (repli × contraste)** | **0.3090** | **0.8251** | 0.1804 |
+| best-of-both (sélection par repli seul) | 0.3207 | 0.8238 | 0.1802 |
+| production | 0.3549 | 0.8098 | 0.1928 |
+
+**Vs best-of-both (repli seul)** : nRMSE 23/60, p=0.068 (à la limite) ; SSIM
+25/60, p=0.036 (marginal) ; LPIPS 20/60, p=0.72 (aucun effet). **Vs
+production** : les trois toujours significatifs, et le p de nRMSE se resserre
+nettement (9.7e-05 contre 0.0012 pour la sélection par repli seul).
+
+**Verdict : gain réel mais modeste**, essentiellement tiré par le repli
+0007/T2FLAIR ; pas assez net pour justifier, à lui seul, le coût d'une
+confirmation `8win` (~5h de calcul) — **décision explicite de ne pas payer
+cette confirmation et de clore ce fil ici**, `cc` seulement. Le chiffre
+`best-of-both` par repli (entrée du 2026-09-17) reste la version confirmée
+sous les deux géométries et donc la référence à citer.
 
 **Diagnostic.** Rechargé les 10 checkpoints par repli (déjà entraînés,
 `diagnose_finetune_checkpoints.py` relancé pour la décomposition par
