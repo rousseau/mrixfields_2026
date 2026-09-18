@@ -63,6 +63,50 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-18 (nuit) — Décomposition de l'erreur restante : `level_cond` neutre sur la calibration, T2W est structurel, une piste de recalibration oubliée
+
+**Verdict : deux découvertes, un rappel.** Détail : section « Suite — décomposition
+de l'erreur restante » de `results/mmfm/vectorized_trajectory_srclevel_task3_20260918/manifest.md`.
+
+Suite immédiate de l'entrée ci-dessous : au lieu de retenter un levier, décomposition
+(`eval_quantitative_3arch.py --mode calibration`, sur les prédictions déjà écrites,
+production `cc` et `level_cond`, 3 sujets × 20 paires) de brut → correction
+"réalisable" (côté source seul) → oracle d'échelle.
+
+| | brut | oracle d'échelle | % d'énergie retirée |
+|---|---|---|---|
+| T1W | 0.4578 → 0.4569 | 0.2535 → 0.2537 | **76.0 %** |
+| T2W | 0.3043 → 0.3047 | 0.2663 → 0.2676 | **25.0 %** |
+| T2FLAIR | 0.3627 → 0.3619 | 0.2176 → 0.2157 | **68.1 %** |
+
+**1. `level_cond` ne change presque rien à la calibration finale** : les
+facteurs d'échelle oracle par champ cible sont quasi identiques avant/après
+(ex. T1W→7T : 0.78 les deux fois). Le réseau route le signal (mesuré dans
+l'entrée précédente) sans que la sortie décodée n'en bouge la calibration
+globale — cohérent avec le score de bout en bout inchangé.
+
+**2. T2W est structurellement différent de T1W/T2FLAIR** : seulement 25 % de
+son erreur est retirable par une correction d'échelle globale, contre 68-76 %
+pour les deux autres — son facteur oracle par champ reste proche de 1
+(0.92-1.23) là où T1W/T2FLAIR vont de 0.76 à 1.8. **Tout futur progrès
+structurel a plus de chances d'être visible sur T2W** ; sur T1W/T2FLAIR il
+serait noyé sous 68-76 % de bruit d'échelle.
+
+**3. Rappel confirmé** : la correction "réalisable" (`subject_scale`, sans
+oracle) est activement NUISIBLE sur les trois contrastes (-62 %, -36 %, -97 %
+d'énergie *ajoutée*) — la voie sans appariement reste fermée (item de dette
+#4, 2026-08-30).
+
+**Piste ouverte retrouvée, jamais réadoptée** : `estimate_intensity_recalibration.py`
+(constante PAR PAIRE, pas par sujet, estimée sans appariement sur 143 sujets
+d'entraînement par classe) donne un gain SIGNIFICATIF et propre au vectorisé
+— **0.3737 → 0.3525, p=0.014, 40/60** (entrée du 2026-08-30) — retiré de la
+config de production uniquement parce qu'il dégrade l'UNet (+0.0654) et
+l'INR (+0.0941), pour garder un réglage commun aux trois architectures. Cette
+contrainde ne s'applique plus si l'effort se concentre sur le vectorisé seul.
+
+---
+
 ## 2026-09-18 (soir) — Conditionnement du flow par le niveau de la source (`level_cond`) : signal appris, score inchangé
 
 **Verdict : NÉGATIF.** Détail : `results/mmfm/vectorized_trajectory_srclevel_task3_20260918/manifest.md`.

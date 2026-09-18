@@ -82,6 +82,52 @@ représentation, 0 % au score) et l'audit du 2026-09-04
 **Troisième confirmation indépendante que ce pipeline n'additionne pas les
 gains de ses composants** — voir [[project-plateau-huit-leviers]].
 
+## Suite — décomposition de l'erreur restante (2026-09-18, soir)
+
+Piste « comprendre pourquoi les gains n'itèrent pas » : décomposition
+`eval_quantitative_3arch.py --mode calibration` (brut → correction réalisable
+côté source → oracle d'échelle), rejouée sur les prédictions déjà écrites,
+production (`cc`) ET `level_cond`, mêmes 3 sujets, mêmes 20 paires.
+
+| | brut | réalisable (subject_scale) | oracle d'échelle | % d'énergie retirée (oracle) |
+|---|---|---|---|---|
+| T1W (prod / srclevel) | 0.4578 / 0.4569 | 0.5648 / 0.5635 (**pire**) | 0.2535 / 0.2537 | 76.0 % / 76.0 % |
+| T2W (prod / srclevel) | 0.3043 / 0.3047 | 0.3435 / 0.3433 (**pire**) | 0.2663 / 0.2676 | 25.0 % / 24.3 % |
+| T2FLAIR (prod / srclevel) | 0.3627 / 0.3619 | 0.4845 / 0.4841 (**pire**) | 0.2176 / 0.2157 | 68.1 % / 68.8 % |
+
+**Deux découvertes, indépendantes du chiffre nul de `level_cond` ci-dessus :**
+
+1. **`level_cond` ne change quasiment RIEN au profil de calibration** — les
+   facteurs d'échelle oracle par champ cible (`a_or`) sont quasi identiques
+   avant/après (ex. T1W→7T : 0.78 vs 0.78 ; T1W→3T : 1.80 vs 1.79). Le réseau
+   a beau router le signal (mesuré plus haut), la sortie décodée finale n'en
+   change presque pas la calibration globale.
+
+2. **T2W est structurellement différent de T1W/T2FLAIR** — seulement 25 %
+   de son erreur est retirable par une correction d'échelle globale, contre
+   68-76 % pour les deux autres contrastes. Le facteur oracle par champ y
+   reste proche de 1 (0.92-1.23) là où T1W/T2FLAIR vont de 0.76 à 1.8. **Toute
+   poursuite de gain structurel (par opposition à un gain d'échelle) a plus de
+   chances d'être mesurable sur T2W** : sur T1W/T2FLAIR, un progrès structurel
+   serait noyé sous 68-76 % de bruit d'échelle non lié à l'architecture.
+
+3. **La correction "réalisable" (`subject_scale`, information disponible
+   côté source seule, sans oracle) est activement NUISIBLE sur les trois
+   contrastes** (-62 %, -36 %, -97 % d'énergie *ajoutée*, pas retirée) — la
+   confirmation la plus nette à ce jour que ce n'est pas un problème
+   d'estimateur : voir [[project-plateau-huit-leviers]] (item de dette #4,
+   fermé négatif le 2026-08-30 pour la même raison).
+
+**Piste ouverte, non explorée dans cette session** : `estimate_intensity_recalibration.py`
+(constante par PAIRE, pas par sujet, estimée sans appariement sur les 143
+sujets d'entraînement par classe) donne un gain SIGNIFICATIF et propre au
+vectorisé — `0.3737 → 0.3525`, p=0.014, 40/60 — retiré de la config de
+production uniquement parce qu'il dégrade l'UNet et l'INR (`+0.0654`,
+`+0.0941`) et que la comparaison à 3 architectures exigeait un réglage
+commun. **Ce réglage n'a jamais été réadopté pour le vectorisé seul** — voir
+`results/mmfm/recalib_20260829/manifest.md` §8 et l'entrée CHANGELOG.md du
+2026-08-30.
+
 ## Réserves
 
 - `cc` uniquement (pas de confirmation `8win`, ~5h de calcul non payées —
