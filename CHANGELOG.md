@@ -63,6 +63,41 @@ incommensurables, voir l'entrée du 2026-09-04.)*
 
 ---
 
+## 2026-09-18 (nuit, suite) — Recalibration d'intensité réessayée sur le checkpoint actuel : NÉGATIF, plus net qu'avant
+
+**Verdict : dégradation significative, pas juste "sans effet".** Détail :
+section « Suite — recalibration d'intensité... » de
+`results/mmfm/vectorized_trajectory_srclevel_task3_20260918/manifest.md`.
+
+Suite directe de la piste retrouvée ci-dessous (recalibration par paire de
+champs, gain de −0.0212 sur l'ancien `vec_rbest`, jamais réadoptée). Réessayée
+proprement sur le checkpoint de production ACTUEL (post-audit du 2026-09-04) :
+table réestimée sur ce checkpoint (4 sujets `retro_train`/classe, 240
+volumes), appliquée aux prédictions d'évaluation déjà écrites.
+
+| protocole officiel `cc`, 60 cellules | nRMSE | SSIM |
+|---|---|---|
+| recalibré | 0.3893 | 0.8061 |
+| production | 0.3549 | 0.8098 |
+| Δ | **+0.0344** (p=0.014 Wilcoxon) | **-0.0038** (p=0.007) |
+
+**Cause identifiée** : les facteurs de la nouvelle table sont tous proches de
+1 (1.02-1.11 — ce checkpoint est déjà mieux calibré que l'ancien `vec_rbest`,
+qui allait de 0.74 à 1.56). Comparés à l'oracle par cellule (calculé dans
+l'entrée précédente), **6 des 15 cellules (contraste × champ cible) vont dans
+le sens OPPOSÉ à l'oracle** — 3 sur 5 pour T2W, qui est aussi le contraste le
+plus dégradé (+0.0676).
+
+**Ce que ça ajoute à la clôture du 2026-08-30** : pas seulement "le remède est
+insuffisant" mais "sa DIRECTION n'est plus stable d'un checkpoint à
+l'autre" — un correctif de mécanisme a suffisamment déplacé le biais résiduel
+pour qu'une table réestimée proprement pointe à l'envers de ce que les 3
+sujets d'évaluation demandent sur près de la moitié des cellules. Piste
+refermée plus fermement : aucun biais de classe stable à corriger sans
+appariement, sur aucun checkpoint testé à ce jour.
+
+---
+
 ## 2026-09-18 (nuit) — Décomposition de l'erreur restante : `level_cond` neutre sur la calibration, T2W est structurel, une piste de recalibration oubliée
 
 **Verdict : deux découvertes, un rappel.** Détail : section « Suite — décomposition
@@ -2954,7 +2989,7 @@ une lacune que ce journal existe pour ne plus reproduire.
 | 1 | ~~`test_inr_backbone_smoke.py` : seuil `nrmse_fg < 0.6` qui accepte le cassé, à 2 mm~~ **CORRIGÉ ET MESURÉ (2026-09-04)** — seuil désormais relatif (bat la moyenne leave-one-out), contrôle négatif prouvé | — |
 | 2 | Aucun test qui compare la loss finale à « prédire zéro » — trois lignes, aurait tout arrêté | 15 min |
 | 3 | Régénérer le cache INR sous le prétraitement corrigé | ~6 h GPU |
-| 4 | ~~Constante de recalibration d'intensité par paire~~ **FERMÉE, NÉGATIVE (2026-08-30)** — la voie sans appariement a été instruite : gagne sur 1 architecture sur 3, deux explications réfutées, cause = variance inter-sujets de 35 % contre une constante par classe. Non réparable par un meilleur estimateur | — |
+| 4 | ~~Constante de recalibration d'intensité par paire~~ **FERMÉE, NÉGATIVE (2026-08-30, RECONFIRMÉE 2026-09-18)** — voie sans appariement instruite deux fois sur deux checkpoints différents : gagnait sur le vectorisé en 2026-08-30 (−0.0212) mais dégrade significativement (+0.0344) le checkpoint actuel, post-audit — la direction même de la correction n'est pas stable d'un checkpoint à l'autre. Non réparable par un meilleur estimateur | — |
 | 5 | ~~Adoption du MedVAE perceptuel : régénérer les caches + réentraîner les deux flows~~ **FAITE, NÉGATIVE (2026-09-02)** — cache régénéré, flow réentraîné, score inchangé (structurel 0.2147 contre 0.2143, p=0.33) : le gain de représentation est absorbé par le flow | — |
 | 6 | ~~Géométrie du latent INR (25 % de structure commune contre 91 %) : canoniser l'ajustement~~ **DIAGNOSTIC RENVERSÉ (2026-09-07) puis FERMÉ (2026-09-14)** — ce n'est pas la géométrie mais le budget (facteur 252) ; correctif LoRA rang 16 tenté et clos négatif | — |
 | 7 | Loss L1 au lieu de L2 : **mesuré le 2026-09-06, `l1` gagne sur nRMSE ET SSIM contre `mse`** (avec les 4 correctifs) — décision explicite de NE PAS adopter en production, pour ne pas introduire une deuxième inconnue sur des valeurs déjà validées (`vectorized_trajectory.yaml` garde `loss: mse`) | 15 min + réentraînement |

@@ -128,6 +128,54 @@ commun. **Ce réglage n'a jamais été réadopté pour le vectorisé seul** — 
 `results/mmfm/recalib_20260829/manifest.md` §8 et l'entrée CHANGELOG.md du
 2026-08-30.
 
+## Suite — recalibration d'intensité par paire de champs, réessayée sur le checkpoint actuel (2026-09-18, nuit)
+
+**Verdict : NÉGATIF, plus net que « sans effet » — dégradation significative.**
+Le gain historique (0.3737 → 0.3525, p=0.014, entrée du 2026-08-30) avait été
+mesuré sur l'ancien checkpoint `vec_rbest` (antérieur aux correctifs de
+l'audit du 2026-09-04) et retiré de la config de production pour une raison
+de COHÉRENCE inter-architectures, pas d'échec sur le vectorisé. Réessayé ici
+sur le checkpoint de production ACTUEL (`vectorized_trajectory`, post-audit).
+
+**Méthode** : régénéré une table de recalibration propre à ce checkpoint
+(`estimate_intensity_recalibration.py`, 4 sujets `retro_train` par classe,
+240 volumes, `configs/mmfm/intensity_recalibration_vectorized_trajectory_20260918.json`),
+appliquée aux prédictions d'évaluation déjà écrites
+(`apply_intensity_recalibration.py`, CPU, aucune inférence), réévaluée avec
+le protocole officiel.
+
+| protocole officiel `cc`, 60 cellules | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| **recalibré** | 0.3893 | 0.8061 | 0.1937 |
+| production (identique sinon) | 0.3549 | 0.8098 | 0.1928 |
+| Δ | **+0.0344** | **-0.0038** | +0.0008 |
+
+Comparaison appariée : nRMSE 22/60 (p=0.052 signes, **p=0.014 Wilcoxon**),
+SSIM 20/60 (p=0.014, p=0.007) — les deux significativement **pires**.
+Par contraste (nRMSE) : T1W +0.0351 (7/20), **T2W +0.0676 (7/20, le plus
+touché)**, T2FLAIR +0.0005 (8/20, quasi neutre).
+
+**Cause identifiée, pas un bug d'implémentation** : les facteurs de la table
+(1.02-1.11, tous proches de 1 — ce checkpoint est déjà mieux calibré que
+l'ancien `vec_rbest`, qui allait de 0.74 à 1.56) sont comparés au facteur
+ORACLE mesuré par cellule dans la section précédente (`a_or`, avec les
+volumes de vérité des 3 sujets d'évaluation). Sur les 15 cellules
+(3 contrastes × 5 champs cible), **6 vont dans le sens OPPOSÉ à l'oracle** —
+concentrées sur T2W (3/5 : 0.1T, 1.5T, 3T) et sur les champs à plus forte
+correction oracle en T1W (5T, 7T). C'est exactement là que les dégâts sont
+les plus lourds.
+
+**Ce que ça ajoute à la conclusion du 2026-08-30** (« variance inter-sujets
+35 % contre une constante par classe, non réparable par un meilleur
+estimateur ») : ce n'est plus seulement que le remède est insuffisant, c'est
+que **sa direction même n'est plus stable d'un checkpoint à l'autre**. Un
+correctif de mécanisme (l'audit du 2026-09-04) a suffisamment changé le biais
+résiduel du modèle pour qu'une table de recalibration, réestimée proprement
+sur CE checkpoint, pointe à l'envers de ce que les 3 sujets d'évaluation
+demandent sur près de la moitié des cellules. **Piste refermée, plus
+fermement qu'avant** : pas de biais de classe stable à corriger sans
+appariement, sur aucun checkpoint testé à ce jour.
+
 ## Réserves
 
 - `cc` uniquement (pas de confirmation `8win`, ~5h de calcul non payées —
