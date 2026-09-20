@@ -55,6 +55,15 @@ LPIPS pas significatif mais dans le mauvais sens (+0.0038, p=0.15, à
 surveiller). **Gain net et propre, sans le compromis T1W. Nouvelle
 référence pour le fine-tuning LOO**, remplace le best-of-both par repli.
 
+**Recherche d'un compromis T1W intermédiaire (2026-09-20) : NÉGATIF.**
+Hypothèse : le compromis nRMSE/SSIM-LPIPS de T1W pourrait s'atténuer à un
+point plus tôt (testé : iter 3250-3500 au lieu de 3750-4750). Résultat : vs
+T1W original, nRMSE toujours pas significatif (p=0.33) et SSIM/LPIPS toujours
+significativement pires (p=0.0023/0.0017) ; vs T1W étendu, indiscernable sur
+les 3 métriques. **Pas de zone intermédiaire exploitable** — le compromis
+apparaît déjà pleinement avant iter 3250 et ne se dose pas en reculant.
+Confirme le choix de garder T1W à son checkpoint original dans la référence.
+
 ---
 
 ## État de référence au 2026-08-26

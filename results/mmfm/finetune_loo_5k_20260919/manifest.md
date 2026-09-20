@@ -116,6 +116,31 @@ p=0.67), LPIPS +0.0038 (pas significatif, p=0.15, mais dans le mauvais sens —
 SSIM/LPIPS.** Meilleur candidat de référence à ce jour pour le fine-tuning
 LOO — remplace le best-of-both par repli.
 
+## Suite — recherche d'un compromis T1W intermédiaire (2026-09-20) : NÉGATIF
+
+Hypothèse testée : le compromis nRMSE/SSIM-LPIPS observé sur T1W à iter
+4750/4750/3750 pourrait s'atténuer à un point plus tôt dans la trajectoire du
+run à 5000 itérations, sans perdre tout le gain de nRMSE. Candidats testés :
+excl0006 iter 3500, excl0007 iter 3500, excl0009 iter 3250 (T1W seul, 8win,
+60 volumes).
+
+| | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| candidat intermédiaire | 0.3203 | 0.8424 | 0.2173 |
+| T1W original (best-of-both, 1500 iters) | 0.3508 | 0.8562 | 0.2015 |
+| T1W étendu (4750/4750/3750, testé précédemment) | 0.3186 | 0.8450 | 0.2144 |
+
+vs original : nRMSE **pas significatif** (p=0.330, seulement 11/20) ; SSIM et
+LPIPS significativement **pires** (p=0.0023 et p=0.0017). vs étendu :
+statistiquement indiscernable sur les trois métriques (p≥0.08).
+
+**Verdict : pas de zone intermédiaire exploitable.** Le compromis
+SSIM/LPIPS apparaît déjà pleinement avant l'itération 3250-3500 et ne
+s'atténue pas en reculant dans cette plage ; contrairement à l'hypothèse, ce
+n'est pas un curseur continu qu'on peut doser. Confirme que garder T1W à son
+checkpoint ORIGINAL (1500 itérations) — la combinaison "mixte" déjà
+adoptée comme référence — reste le bon choix.
+
 ## Réserves
 
 - La tendance LPIPS légèrement défavorable sur T2FLAIR (+0.0038, NS à n=20)

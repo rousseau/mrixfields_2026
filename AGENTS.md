@@ -259,6 +259,14 @@ p = 0.38 — ne pas écrire « la meilleure » sans la métrique). Le meilleur c
 flow** est R-best (`configs/mmfm/vectorized_rbest.yaml`, nRMSE **0.3737**), non basé en canonique
 parce que son gain est sous la résolution statistique (n = 3). L'historique complet, les planchers
 connus et les délibérations sont dans **`CHANGELOG.md`** (source de vérité).
+
+> **Ce tableau date de l'unification des trois architectures et n'est PAS la référence
+> actuelle** — il reste tel quel comme repère historique. Depuis, le protocole a changé
+> (audit du 2026-09-04, correctifs de mécanisme, géométrie `cc`/`8win`) et le vectorisé a été
+> fine-tuné en LOO sur les 3 sujets appariés (`pro_train`, recette officielle `pro_pretrained`
+> du challenge). **Référence actuelle (2026-09-20, `8win`) : nRMSE 0.2962** (combinaison T1W
+> best-of-both original + T2FLAIR fine-tuné étendu + T2W production) — voir CHANGELOG.md,
+> entrée du 2026-09-19/20, pour le détail et les réserves.
 ---
 
 ### Évaluation unifiée
@@ -292,19 +300,24 @@ Les figures sont sauvegardées dans `results/{stargan,cfm,mmfm}/visuals/<methode
 
 ### Évaluation quantitative
 
-Un tableau de métriques est maintenu dans `results/evaluation_table.csv` et **enrichi progressivement** au fil des expériences. Ce fichier est versionné dans git.
+> **`results/evaluation_table.csv` n'existe plus et n'est plus maintenu** (retiré lors de
+> l'unification MMFM, commit `223e5f4`). Le tableau ci-dessous est un instantané figé de
+> l'unification des trois architectures, PAS la référence actuelle. **`CHANGELOG.md` est
+> l'unique source de vérité pour les métriques** depuis — chaque expérience y entre avec son
+> chiffre, y compris les résultats négatifs (voir `feedback-changelog` dans la mémoire du
+> projet). Référence actuelle (2026-09-20, `8win`) : **nRMSE 0.2962** — fine-tuning LOO
+> (T1W best-of-both original + T2FLAIR étendu + T2W production), entrée du 2026-09-19/20.
 
 | Méthode | nRMSE ↓ (moy.) | SSIM ↑ | LPIPS ↓ | Résultat |
 |---------|---------|--------|---------|-------|
-| **INR** (Task 3, 3 contrastes, 1 mm) | **0.3749** | 0.8631 | 0.1557 | ✅ référence |
-| **Vectorisé** (Task 3, 3 contrastes, 1 mm) | 0.3794 | **0.8975** | **0.0941** | ✅ référence |
-| **UNet** (Task 3, 3 contrastes, 1 mm) | 0.4033 | 0.8949 | 0.0953 | ✅ référence |
+| **INR** (Task 3, 3 contrastes, 1 mm) | **0.3749** | 0.8631 | 0.1557 | instantané 2026-08 |
+| **Vectorisé** (Task 3, 3 contrastes, 1 mm) | 0.3794 | **0.8975** | **0.0941** | instantané 2026-08 |
+| **UNet** (Task 3, 3 contrastes, 1 mm) | 0.4033 | 0.8949 | 0.0953 | instantané 2026-08 |
 | *R-best (géométrie de flow, vectorisé)* | *0.3737* | — | — | non canonique (gain < bruit) |
 
 > **Note** : les métriques Dice/Volume (Task 1/2) et les variantes « star-gan/aek-l/vqvae »
 > sont hors périmètre de l'état de référence courant — voir `CHANGELOG.md` et
-> `results/mmfm/comparison_20260814_all_contrasts/` pour l'historique complet des 11 entrées de
-> ce tableau (lequel est la source de vérité).
+> `results/mmfm/comparison_20260814_all_contrasts/` pour l'historique complet.
 
 **Métriques** (identiques à celles du challenge) :
 - `nRMSE` — normalized Root Mean Square Error
@@ -423,8 +436,8 @@ mrixfields_2026/
 │   ├── qc/                             #   Figures QC visuelles (PNG)
 │   ├── cfm/                            #   Figures CFM (PNG)
 │   ├── benchmark_comparison/           #   Benchmark VAE — 9 CSV (3 mod × 3 champs)
-│   ├── stats/                          #   Statistiques dataset — 5 CSV
-│   └── evaluation_table.csv            #   Tableau de métriques cumulatif ← À MAINTENIR
+│   └── stats/                          #   Statistiques dataset — 5 CSV
+│                                        #   (evaluation_table.csv retiré — voir CHANGELOG.md)
 │
 ├── docs/                               # ─── DOCUMENTATION ───
 │   ├── BENCHMARK_IMPLEMENTATION.md
@@ -494,10 +507,11 @@ mrixfields_2026/
 | 2 | MedVAE fine-tuné | ✅ (abandonné, voir `vectorized.yaml:34`) | `outputs/medvae/runs/medvae_finetune_all/weights/model_best.pth` |
 | 2 | AEKL / VQ-VAE / RHVAE / Pythae | ✅ Smoke/legacy | voir `results/benchmark_vae/` |
 | 3 | OT-CFM 3D + VAE | ⚫ jalons historiques | `cfm3d_T1W_*/weights/` |
-| 4 | **MMFM vectorisé (MedVAE gelé)** | ✅ **référence 0.3794 nRMSE** | `outputs/mmfm/vectorized/weights/model_final.pth` |
-| 4 | **MMFM UNet (MedVAE gelé)** | ✅ **référence 0.4033 nRMSE** | `outputs/mmfm/unet/weights/model_final.pth` |
-| 4 | **MMFM INR (backbone SIREN)** | ✅ **référence 0.3749 nRMSE** | `outputs/mmfm/inr_std/weights/model_final.pth` |
-| 4 | R-best (vectorisé, temps/FiLM corrigés) | ✅ meilleur géométrie 0.3737 | `outputs/mmfm/vec_rbest/weights/model_final.pth` |
+| 4 | MMFM vectorisé (MedVAE gelé) | ⚫ instantané 2026-08, 0.3794 nRMSE | `outputs/mmfm/vectorized/weights/model_final.pth` |
+| 4 | MMFM UNet (MedVAE gelé) | ⚫ instantané 2026-08, 0.4033 nRMSE | `outputs/mmfm/unet/weights/model_final.pth` |
+| 4 | MMFM INR (backbone SIREN) | ⚫ instantané 2026-08, 0.3749 nRMSE | `outputs/mmfm/inr_std/weights/model_final.pth` |
+| 4 | R-best (vectorisé, temps/FiLM corrigés) | ⚫ jalon dépassé, 0.3737 | `outputs/mmfm/vec_rbest/weights/model_final.pth` |
+| 4 | **Fine-tuning LOO (T1W best-of-both + T2FLAIR étendu + T2W prod)** | ✅ **référence actuelle, 0.2962 nRMSE (`8win`)** | voir CHANGELOG.md, 2026-09-19/20 |
 | — | Script évaluation unifié | ✅ Terminé | `src/evaluation/evaluate.py` (5 méthodes) |
 | — | Journal des expériences (source de vérité) | ✅ À MAINTENIR | `CHANGELOG.md` |
 | — | Paper | ⬜ Vide | `paper/` |
@@ -521,6 +535,8 @@ Les **3 sujets prospectifs d'entraînement** (acquis avec les 5 champs magnétiq
 
 - **`outputs/`** et **`logs/`** sont exclus de Git (`.gitignore`) — poids et prédictions non versionnés
 - **`results/`** est versionné — CSV légers et figures de QC
-- **`results/evaluation_table.csv`** doit être mis à jour à chaque nouvelle expérience
+- **`CHANGELOG.md`** doit être mis à jour à chaque nouvelle expérience (résultats négatifs
+  compris) — `results/evaluation_table.csv` n'existe plus, voir la note de la section
+  « Évaluation quantitative »
 - L'environnement conda est **`mrixfields2026`** (distinct de `mf` utilisé précédemment)
 - Ne pas modifier `~/Code/MRIxFields2026/` (code officiel challenge)
