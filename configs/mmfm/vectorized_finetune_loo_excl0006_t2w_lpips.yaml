@@ -1,0 +1,120 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FINE-TUNING LOO + PERTE DE CONTENU LPIPS(2.5D) — piste T2W (2026-09-20).
+#
+# Motivation : sur ce repli comme sur les deux autres, AUCUN fine-tuning MSE
+# latent (budget 1500 ni 5000 itérations) n'a jamais battu la production sur
+# T2W (voir CHANGELOG, entrées du 2026-09-17/19). Piste explicative : le vrai
+# déplacement propre au sujet y est le plus faible des 3 contrastes, donc 30
+# exemples de supervision latente n'y ajoutent que du bruit. Cette config
+# change la RECETE, pas la durée : une perte de contenu (LPIPS 2.5D) sur le
+# volume décodé, en plus du MSE latent -- plus proche de ce que fait le
+# baseline GAN officiel du challenge, qui supervise dans l'espace image.
+#
+# Copie de vectorized_finetune_loo_excl0006.yaml (recette pro_pretrained,
+# budget original 1500 itérations). SEUL ajout, `train.lambda_lpips` (+ ses
+# 4 clés associées) : voir mmfm_core.py::train pour le mécanisme -- une
+# SECONDE position de la trajectoire déjà chargée sert de vraie cible
+# (disponible uniquement parce qu'on fine-tune sur pro_train, sujets
+# appariés), intégrée réellement (dt != 0, contrairement à la supervision
+# spline de ce mode) puis décodée et comparée par LPIPS. N'exige PAS de
+# changer marginal_mode ni le conditionnement de classe (contrairement à
+# pairwise_ot) : compatible avec la reprise des poids de production.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_finetune_loo_excl0006_t2w_lpips
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint:
+  latent_channels: 1
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  time_scale: 1000.0
+  time_cond: film
+  latent_mean: 19.913378
+  latent_scale: 18.125440
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: pro_train_loo_excl0006
+  output_subdir: mmfm/finetune_loo_excl0006_t2w_lpips
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_c4d1e200/pro_train_loo_excl0006
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  marginal_mode: trajectory
+  loss: mse
+  flip_per_step: true
+  batch_size: 1
+  resume: outputs/mmfm/vectorized_trajectory/weights/model_final.pth
+  resume_weights_only: true
+  total_iters: 1500
+  num_targets_per_step: 1
+  adjacent_only: false
+  identity_prob: 0.1
+  warmup_steps: 50
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  accumulation_steps: 1
+  save_every: 150
+  keep_checkpoints: 0
+  print_every: 25
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.99
+  # ── Seul ajout par rapport à vectorized_finetune_loo_excl0006.yaml ──
+  # lambda_lpips=1.0 : poids de départ, non calibré contre le MSE latent
+  # (échelles différentes) -- à ajuster si la loss totale explose ou si le
+  # terme lpips domine dans les logs (`train_metrics.jsonl` / stdout).
+  lambda_lpips: 1.0
+  # lpips_every=25 (pas 10) : mesuré ~35s/pas LPIPS (décodage tuilé x2 +
+  # LPIPS 2.5D + intégration réelle) sur ce smoke test -- 25 donne 60
+  # déclenchements sur 1500 itérations (~1h30 GPU pour les 3 replis) au lieu
+  # de 150 (~4h30), pour une première expérience à l'issue incertaine.
+  lpips_every: 25
+  lpips_batch_subset: 1
+  lpips_n_steps: 4
+  lpips_slice_stride: 4
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

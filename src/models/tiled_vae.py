@@ -35,7 +35,7 @@ from typing import Tuple
 
 import torch
 
-__all__ = ["tiled_encode", "tiled_decode", "DOWNSAMPLE"]
+__all__ = ["tiled_encode", "tiled_decode", "tiled_decode_grad", "DOWNSAMPLE"]
 
 DOWNSAMPLE = 4  # medvae_4_1_3d : /4 par dimension
 
@@ -191,6 +191,57 @@ def tiled_decode(
     lt = tuple(t // DOWNSAMPLE for t in tile)
     lm = margin // DOWNSAMPLE
     out = torch.zeros(1, 1, H, W, D, device=device, dtype=torch.float32)
+
+    for i in _tile_starts(h, lt[0]):
+        for j in _tile_starts(w, lt[1]):
+            for k in _tile_starts(d, lt[2]):
+                i0, i1, oi = _expand(i, lt[0], lm, h)
+                j0, j1, oj = _expand(j, lt[1], lm, w)
+                k0, k1, ok = _expand(k, lt[2], lm, d)
+
+                sub = z[:, :, i0:i1, j0:j1, k0:k1]
+                with torch.amp.autocast("cuda", dtype=amp_dtype,
+                                        enabled=(use_amp and device.type == "cuda")):
+                    rec = vae.decode(sub)
+                if isinstance(rec, (tuple, list)):
+                    rec = rec[0]
+                rec = rec.float()
+
+                pi, pj, pk = oi * DOWNSAMPLE, oj * DOWNSAMPLE, ok * DOWNSAMPLE
+                ph, pw, pd = tile
+                core = rec[:, :, pi:pi + ph, pj:pj + pw, pk:pk + pd]
+                out[:, :, i * DOWNSAMPLE:i * DOWNSAMPLE + ph,
+                       j * DOWNSAMPLE:j * DOWNSAMPLE + pw,
+                       k * DOWNSAMPLE:k * DOWNSAMPLE + pd] = core
+    return out
+
+
+def tiled_decode_grad(
+    vae,
+    z: torch.Tensor,
+    tile: Tuple[int, int, int] = (96, 112, 96),
+    margin: int = 16,
+    use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Identique à `tiled_decode`, SANS `@torch.no_grad()` : le gradient doit
+    remonter jusqu'au flow à travers le décodage (perte auxiliaire de contenu,
+    voir `mmfm_core.py::train`, `train.lambda_lpips`). Fonction séparée plutôt
+    que de retirer le décorateur de `tiled_decode` : tous les autres appelants
+    (precompute, inférence) comptent sur le `no_grad` pour la mémoire et n'ont
+    pas besoin de graphe. Les tuiles de sortie sont DISJOINTES (aucun
+    recouvrement pondéré) : l'affectation par tranche construit un graphe
+    d'autograd correct sans opération in-place ambiguë.
+    """
+    if margin % DOWNSAMPLE != 0:
+        raise ValueError(f"margin={margin} doit être un multiple de {DOWNSAMPLE}")
+    _check_downsample(vae)
+    device = z.device
+    _, _, h, w, d = z.shape
+    H, W, D = h * DOWNSAMPLE, w * DOWNSAMPLE, d * DOWNSAMPLE
+    lt = tuple(t // DOWNSAMPLE for t in tile)
+    lm = margin // DOWNSAMPLE
+    out = z.new_zeros(1, 1, H, W, D)
 
     for i in _tile_starts(h, lt[0]):
         for j in _tile_starts(w, lt[1]):

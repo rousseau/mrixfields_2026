@@ -12,6 +12,50 @@ expérience non écrite ici est réputée ne pas avoir eu lieu.
 
 ---
 
+## 2026-09-20/21 — Fine-tuning LOO T2W avec perte de contenu LPIPS(2.5D) : PISTE FERMÉE, NÉGATIVE
+
+**Verdict : négatif, sans ambiguïté.** Détail :
+`results/mmfm/finetune_loo_t2w_lpips_20260920/manifest.md`.
+
+Hypothèse : sur les 3 replis, aucun fine-tuning MSE latent n'a jamais battu
+la production sur T2W — peut-être la RECETTE (MSE latent seul) est en cause,
+pas les données. Ajouté une perte auxiliaire de contenu (LPIPS 2.5D sur le
+volume décodé, intégration réelle du flow vers une seconde position de la
+trajectoire déjà chargée, cible = vrai latent du sujet appairé) à
+`mmfm_core.py::train`, compatible avec `marginal_mode: trajectory` (pas de
+changement de conditionnement, donc compatible avec la reprise des poids de
+production — contrairement à `pairwise_ot`, écarté après analyse pour cette
+raison).
+
+**Bug trouvé et corrigé avant tout run réel** : le premier smoke test a fait
+OOM (`vae.decode()` direct sur un volume 192×224×192 entier). Corrigé avec
+`tiled_decode_grad` (nouvelle fonction différentiable dans
+`models/tiled_vae.py` — `tiled_decode` existant est décoré `@torch.no_grad()`,
+inutilisable pour rétropropager à travers la prédiction).
+
+**Résultat (nRMSE latent T2W contre la vraie cible du sujet exclu)** :
+
+| repli | production (repère) | meilleur checkpoint fine-tuné |
+|---|---|---|
+| 0006 | **0.1991** | 0.3086 |
+| 0007 | **0.1910** | 0.2371 |
+| 0009 | **0.1768** | 0.1890 |
+
+**Sur les 3 replis, aucun checkpoint ne bat jamais la production** — la
+dégradation apparaît dès la première sauvegarde et s'aggrave avec
+l'entraînement sur 2 des 3 replis avant de se stabiliser. Écart trop large et
+sans ambiguïté pour justifier de payer l'évaluation Task 3 complète.
+
+**Conclusion** : changer la recette ne corrige pas T2W — renforce
+l'hypothèse que le problème est la quantité/nature de l'information
+disponible pour ce contraste (déplacement propre au sujet le plus faible des
+3), pas le choix de la perte. La production reste le choix pour T2W dans
+toute combinaison future. Le mécanisme lui-même (perte LPIPS auxiliaire en
+mode trajectory, décodage tuilé différentiable) est validé et réutilisable
+pour d'autres expériences.
+
+---
+
 ## 2026-09-19/20 — Fine-tuning LOO, budget étendu (5000 itérations) : gain nRMSE réel, mais compromis SSIM/LPIPS sur T1W en `8win`
 
 **Verdict : MIXTE, pas une nouvelle référence.** Détail :

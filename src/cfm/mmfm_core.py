@@ -68,7 +68,7 @@ from common.io import (
     load_nifti_volume,
     resample_volume,
 )
-from models.tiled_vae import tiled_encode
+from models.tiled_vae import tiled_encode, tiled_decode, tiled_decode_grad
 from models.vae_loader import load_vae
 
 from torchcfm.conditional_flow_matching import (
@@ -78,6 +78,8 @@ from torchcfm.conditional_flow_matching import (
 
 from cfm.mmfm_vectorized import cycle_rollout_vector
 from cfm.edge_loss_3d import Sobel3D, edge_consistency_loss
+from vae3d.medvae_perceptual_loss import lpips_2p5d
+from medvae.utils.vae.loss_components import LPIPS
 
 
 # ===========================================================================
@@ -821,6 +823,42 @@ def train(
             "marginales). Les mettre à 0.0, ou repasser en marginal_mode='pairwise'."
         )
 
+    # PERTE AUXILIAIRE DE CONTENU (2026-09-20, fine-tuning LOO supervisé
+    # T2W). Contrairement à cycle/edge ci-dessus, celle-ci EST définie en
+    # `marginal_mode='trajectory'` : plutôt que de réutiliser (t_i, t_j) de la
+    # supervision spline (égaux dans ce mode), elle tire une SECONDE position
+    # de la trajectoire déjà chargée (`Z`, toutes les marginales), intègre
+    # réellement le flow entre l'ancre et cette position, décode la prédiction
+    # ET le vrai latent cible (déjà en cache — supervision disponible
+    # uniquement en fine-tuning sur pro_train, pas sur les données non
+    # appariées de retro_train), et compare par LPIPS(2.5D). Coût dominé par
+    # deux décodages VAE ; gaté par `lpips_every`/`lpips_batch_subset` comme
+    # le régularisateur edge. Défaut 0.0 = sans effet, aucun coût, aucun
+    # checkpoint existant affecté.
+    lambda_lpips = float(train_cfg.get("lambda_lpips", 0.0))
+    lambda_lpips_final = float(train_cfg.get("lambda_lpips_final", lambda_lpips))
+    lpips_every = int(train_cfg.get("lpips_every", 10))
+    lpips_batch_subset = int(train_cfg.get("lpips_batch_subset", 1))
+    lpips_n_steps = int(train_cfg.get("lpips_n_steps", 4))
+    lpips_slice_stride = int(train_cfg.get("lpips_slice_stride", 4))
+
+    lambda_lpips_active = lambda_lpips > 0.0 or lambda_lpips_final > 0.0
+    if lambda_lpips_active and marginal_mode != "trajectory":
+        raise ValueError(
+            "lambda_lpips n'est implémenté qu'en marginal_mode='trajectory' "
+            "(il lit `Z`, la trajectoire complète déjà chargée, pour trouver "
+            "une seconde position sans code de couplage supplémentaire)."
+        )
+    if lambda_lpips_active and raw_tile is None:
+        # Décodage direct (non tuilé) d'un volume 192x224x192 entier : OOM
+        # mesuré au premier essai (2026-09-20). Le tuilage est déjà requis
+        # pour l'encodage à cette résolution (voir models/tiled_vae.py) ;
+        # lambda_lpips décode aussi, donc la même contrainte s'applique.
+        raise ValueError(
+            "lambda_lpips exige data.encode_tile (décodage par tuiles, sinon "
+            "OOM sur un volume 1mm entier)."
+        )
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_distributed = world_size > 1
@@ -964,6 +1002,12 @@ def train(
 
     sobel3d = Sobel3D().to(device) if (lambda_edge_active or lambda_edge_fwd_active) else None
 
+    lpips_module = None
+    if lambda_lpips_active:
+        lpips_module = LPIPS().eval().to(device)
+        for p in lpips_module.parameters():
+            p.requires_grad = False
+
     model = adapter.build_model().to(device)
     if is_distributed:
         model = DDP(model, device_ids=[local_rank])
@@ -1037,6 +1081,7 @@ def train(
     recent_cycle_losses: List[float] = []
     recent_edge_losses: List[float] = []
     recent_edge_fwd_losses: List[float] = []
+    recent_lpips_losses: List[float] = []
     model.train()
     grad_norm = 0.0  # persists across accumulation micro-steps for logging
 
@@ -1082,10 +1127,12 @@ def train(
         step_cycle_losses: List[float] = []
         step_edge_losses: List[float] = []
         step_edge_fwd_losses: List[float] = []
+        step_lpips_losses: List[float] = []
 
         cur_lambda_cycle = _lerp_lambda(lambda_cycle, lambda_cycle_final, step, total_iters)
         cur_lambda_edge = _lerp_lambda(lambda_edge, lambda_edge_final, step, total_iters)
         cur_lambda_edge_fwd = _lerp_lambda(lambda_edge_fwd, lambda_edge_fwd_final, step, total_iters)
+        cur_lambda_lpips = _lerp_lambda(lambda_lpips, lambda_lpips_final, step, total_iters)
 
         for (fi, fj) in transitions:
             if marginal_mode == "trajectory":
@@ -1268,6 +1315,49 @@ def train(
                     loss = loss + cur_lambda_edge_fwd * loss_edge_fwd
                     step_edge_fwd_losses.append(float(loss_edge_fwd.item()))
 
+            if lambda_lpips_active and (step % lpips_every == 0) and Z.shape[1] > 1:
+                # PERTE DE CONTENU (voir la note de config plus haut) : une
+                # SECONDE position de la trajectoire, différente de l'ancre,
+                # sert de vraie cible supervisée -- disponible ici seulement
+                # parce que ce fine-tuning tourne sur pro_train (sujets
+                # appariés), jamais sur retro_train.
+                n_sub = min(lpips_batch_subset, z_src.shape[0])
+                k_total = Z.shape[1]
+                offset = int(step_rng.integers(1, k_total))
+                tgt_pos = (anchor_pos + offset) % k_total
+                z_true_tgt = Z[:n_sub, tgt_pos]
+                z_pred_tgt, _ = cycle_rollout_vector(
+                    model_fn, z_src[:n_sub], y_tgt[:n_sub],
+                    t_anchor[anchor_pos], t_anchor[tgt_pos], lpips_n_steps,
+                    amp_dtype, use_amp, level=level_src[:n_sub],
+                )
+                # Décodage PAR TUILES (obligatoire au-delà de 2mm, voir
+                # models/tiled_vae.py) : un décodage direct d'un volume
+                # 192x224x192 entier a fait OOM au premier essai (mesuré,
+                # 2026-09-20). `tiled_decode_grad` pour la prédiction (le
+                # gradient doit remonter jusqu'au flow) ; `tiled_decode`
+                # (no_grad) pour la vraie cible, qui n'en a pas besoin.
+                lat_pred = adapter.restore_latent(z_pred_tgt, meta)
+                lat_true = adapter.restore_latent(z_true_tgt, meta)
+                dec_pred_tgt = torch.cat([
+                    tiled_decode_grad(vae, lat_pred[i:i + 1], tile=encode_tile,
+                                       margin=encode_tile_margin, use_amp=use_amp,
+                                       amp_dtype=amp_dtype)
+                    for i in range(lat_pred.shape[0])
+                ])
+                dec_true_tgt = torch.cat([
+                    tiled_decode(vae, lat_true[i:i + 1], tile=encode_tile,
+                                 margin=encode_tile_margin, use_amp=use_amp,
+                                 amp_dtype=amp_dtype)
+                    for i in range(lat_true.shape[0])
+                ])
+                loss_lpips = lpips_2p5d(
+                    lpips_module, dec_pred_tgt.float(), dec_true_tgt.float(),
+                    slice_stride=lpips_slice_stride,
+                )
+                loss = loss + cur_lambda_lpips * loss_lpips
+                step_lpips_losses.append(float(loss_lpips.item()))
+
             if use_scaler:
                 scaler.scale(loss / accumulation_steps).backward()
             else:
@@ -1303,6 +1393,10 @@ def train(
             recent_edge_fwd_losses.append(float(np.mean(step_edge_fwd_losses)))
             if len(recent_edge_fwd_losses) > print_every:
                 recent_edge_fwd_losses.pop(0)
+        if step_lpips_losses:
+            recent_lpips_losses.append(float(np.mean(step_lpips_losses)))
+            if len(recent_lpips_losses) > print_every:
+                recent_lpips_losses.pop(0)
 
         if is_main_process() and (step + 1) % print_every == 0:
             avg_recent = float(np.mean(recent_losses))
@@ -1325,6 +1419,9 @@ def train(
             if lambda_edge_fwd_active:
                 avg_edge_fwd = float(np.mean(recent_edge_fwd_losses)) if recent_edge_fwd_losses else float("nan")
                 extra_log += f" edge_fwd={avg_edge_fwd:.4f}(λ={cur_lambda_edge_fwd:.2f})"
+            if lambda_lpips_active:
+                avg_lpips = float(np.mean(recent_lpips_losses)) if recent_lpips_losses else float("nan")
+                extra_log += f" lpips={avg_lpips:.4f}(λ={cur_lambda_lpips:.2f})"
             print(
                 f"[{step + 1:6d}/{total_iters}] loss={avg_recent:.4f} grad={float(grad_norm):.2f} "
                 f"lr={lr_cur:.2e} contrast={contrast}→fields{transitions} speed={it_s:.2f} it/s "

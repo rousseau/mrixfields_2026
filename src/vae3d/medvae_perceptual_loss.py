@@ -50,7 +50,7 @@ from medvae.utils.vae.loss_components import (
     weights_init,
 )
 
-__all__ = ["LPIPSWithDiscriminator3D"]
+__all__ = ["LPIPSWithDiscriminator3D", "lpips_2p5d"]
 
 
 def _volume_to_slices(x: torch.Tensor, dim: int, stride: int = 1) -> torch.Tensor:
@@ -64,6 +64,34 @@ def _volume_to_slices(x: torch.Tensor, dim: int, stride: int = 1) -> torch.Tenso
         x = x.index_select(dim, idx)
     x = x.movedim(dim, 1)                       # (B, S, C, A, B)
     return x.reshape(x.shape[0] * x.shape[1], *x.shape[2:])
+
+
+def lpips_2p5d(
+    lpips_module: nn.Module,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    slice_stride: int = 1,
+    slice_chunk: int = 256,
+) -> torch.Tensor:
+    """LPIPS moyennée sur les coupes des 3 axes entre deux volumes (B,C,D,H,W).
+
+    Même découpage 2.5D que `LPIPSWithDiscriminator3D._perceptual_3d`, exposé
+    ici en fonction indépendante pour les usages qui n'ont pas besoin de tout
+    l'appareil KL/discriminateur — ex. perte auxiliaire de flow matching (voir
+    `mmfm_core.py::train`, `train.lambda_lpips`) : comparer un volume PRÉDIT
+    (décodé après intégration du flow) au volume VRAI (décodé depuis son
+    latent en cache), sans reconstruction de VAE à optimiser ici.
+    """
+    total = a.new_zeros(())
+    count = 0
+    for dim in (2, 3, 4):
+        sa = _volume_to_slices(a, dim, slice_stride)
+        sb = _volume_to_slices(b, dim, slice_stride)
+        for i in range(0, sa.shape[0], slice_chunk):
+            v = lpips_module(sa[i : i + slice_chunk], sb[i : i + slice_chunk])
+            total = total + v.sum()
+            count += v.shape[0]
+    return total / max(count, 1)
 
 
 class LPIPSWithDiscriminator3D(nn.Module):
