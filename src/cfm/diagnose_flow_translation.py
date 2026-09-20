@@ -88,7 +88,7 @@ def main() -> None:
         for i in range(0, z_src.shape[0], a.chunk):
             zc = z_src[i:i + a.chunk].to(dev)
             y = torch.full((zc.shape[0],), mi, dtype=torch.long, device=dev)
-            outs.append(euler_integrate(lambda z, zs, t, yy: model(z, zs, t, yy),
+            outs.append(euler_integrate(lambda z, zs, t, yy, level=None: model(z, zs, t, yy, level),
                                         zc, y, t0, t1, a.n_steps, dev,
                                         use_amp=use_amp).cpu())
         return torch.cat(outs)

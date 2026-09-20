@@ -166,7 +166,8 @@ def make_model_fn(model: VectorFieldModel):
     `synthetic_marginals.evaluate`. `z_src` est ignore : la reference ne
     conditionne pas sur un point d'ancrage separe, seulement sur (z, t, classe)."""
 
-    def model_fn(z: torch.Tensor, z_src: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def model_fn(z: torch.Tensor, z_src: torch.Tensor, t: torch.Tensor, y: torch.Tensor,
+                 level: torch.Tensor | None = None) -> torch.Tensor:
         cond = (y.float() + 1.0).unsqueeze(1)
         xin = torch.cat([z, cond, t.reshape(-1, 1)], dim=1)
         return model(xin)

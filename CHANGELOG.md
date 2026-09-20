@@ -12,6 +12,51 @@ expérience non écrite ici est réputée ne pas avoir eu lieu.
 
 ---
 
+## 2026-09-19/20 — Fine-tuning LOO, budget étendu (5000 itérations) : gain nRMSE réel, mais compromis SSIM/LPIPS sur T1W en `8win`
+
+**Verdict : MIXTE, pas une nouvelle référence.** Détail :
+`results/mmfm/finetune_loo_5k_20260919/manifest.md`.
+
+Suite du fil `pro_pretrained` : le point d'arrêt à 1500 itérations était choisi
+sur un proxy (nRMSE latent agrégé), jamais sur le score Task 3 par contraste.
+Rallongé à 5000 itérations pour les 3 replis, checkpoint choisi PAR (repli,
+contraste) sur le proxy latent (T2W inchangé, toujours production).
+
+| | `cc` | `8win` (officielle) |
+|---|---|---|
+| ΔnRMSE vs best-of-both | **-0.0305** (p=0.0034) | **-0.0237** (p=0.0161 Wilcoxon, NS aux signes) |
+| ΔSSIM | -0.0020 (NS) | **-0.0035 (p=0.029, PIRE)** |
+| ΔLPIPS | +0.0024 (NS) | **+0.0055 (p=0.0015, PIRE)** |
+
+**Le signal encourageant en `cc` ne tient pas en `8win`** : SSIM et LPIPS
+deviennent significativement pires, alors qu'ils étaient neutres en `cc`.
+Décomposition par contraste (`8win`) : **T2FLAIR est un gain propre** sur les
+trois métriques (nRMSE -0.039, SSIM/LPIPS neutres) ; **T1W est un compromis**
+(nRMSE -0.032, mais SSIM -0.0112 et LPIPS +0.0129, tous deux significatifs) —
+probable sur-apprentissage sur les 2 sujets d'entraînement au-delà d'un
+certain budget pour ce contraste, invisible en `cc` et au proxy latent.
+
+**Décision** : ne pas remplacer la référence best-of-both par cette variante
+« 5k partout ».
+
+**Combinaison "mixte" testée dans la foulée (2026-09-20), sans coût GPU
+supplémentaire** (recombinaison de prédictions déjà écrites) : T1W original
+du best-of-both (1500 itérations) + T2FLAIR étendu (gain propre ci-dessus) +
+T2W production.
+
+| `8win`, 60 cellules | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| **mixte** | **0.2962** | 0.8424 | 0.1971 |
+| best-of-both (référence) | 0.3092 | 0.8421 | 0.1958 |
+
+Seul T2FLAIR diffère (T1W/T2W identiques, 40/60 cellules égales) : isolé sur
+ses 20 cellules, nRMSE **-0.0390 (Wilcoxon p=0.0107)**, SSIM neutre (p=0.67),
+LPIPS pas significatif mais dans le mauvais sens (+0.0038, p=0.15, à
+surveiller). **Gain net et propre, sans le compromis T1W. Nouvelle
+référence pour le fine-tuning LOO**, remplace le best-of-both par repli.
+
+---
+
 ## État de référence au 2026-08-26
 
 Task 3, 20 paires × 3 sujets, évaluateur officiel, 1 mm, prédictions écrites à

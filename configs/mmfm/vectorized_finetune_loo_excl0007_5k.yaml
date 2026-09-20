@@ -1,0 +1,144 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FINE-TUNING SUPERVISÉ LOO sur `pro_train` (recette officielle `pro_pretrained`
+# du challenge, jamais reproduite sur MMFM avant le 2026-09-16 — voir CHANGELOG).
+#
+# Repli : SUJET 0007 EXCLU (tenu à l'écart pour l'évaluation). Fine-tuning sur
+# les sujets 0007/0009 uniquement, via `pro_train_loo_excl0007` (30 entrées,
+# 2 sujets x 5 champs x 3 contrastes — voir make_pro_train_loo_indexes.py).
+#
+# Copie de `vectorized_trajectory.yaml` (convention du projet). Seules clés
+# changées, toutes dans `data:`/`train:` :
+#
+#   data.split / data.latent_cache_dir -> le cache LOO de ce repli. Le couplage
+#     OT chaîné de mmfm_core.py (build_chained_ot_trajectories, INCHANGÉ, zéro
+#     code nouveau) retrouve alors la VRAIE trajectoire de chaque sujet plutôt
+#     qu'une approximation cross-sujet -- déjà validé à 100 % (180/180,
+#     diagnose_coupling_real.py) sur ce cache exact.
+#   data.output_subdir -> dossier dédié à ce repli.
+#   train.resume / resume_weights_only -> repart du checkpoint de PRODUCTION
+#     (poids + EMA chargés, optimiseur/scheduler repartent à zéro -- voir
+#     mmfm_core.py:999-1020).
+#   train.total_iters/warmup_steps/save_every -> budget de fine-tuning MODESTE
+#     et surveillé (10 checkpoints), pas un ré-entraînement complet.
+#   train.ema_decay -> abaissé (0.9999 par défaut ne bougerait quasiment pas en
+#     1500 pas : 0.9999^1500 ~ 0.86, contre 0.99^1500 ~ 3e-7).
+#   lambda_edge_fwd (régulateur de contours déjà implémenté, jamais activé)
+#     N'EST PAS activé ici : vérifié avant de lancer que mmfm_core.py fixe
+#     t_i=t_j en marginal_mode=trajectory (anchor unique), donc le rollout
+#     cycle/edge intègre sur dt=0 et vaut 0 EXACTEMENT quel que soit son poids
+#     -- ce régularisateur ne s'applique qu'aux modes pairwise/pairwise_ot.
+#     Phase 1 teste donc seulement l'effet de la VRAIE trajectoire (via le
+#     couplage OT chaîné, déjà validé 180/180) sur la perte de flow matching.
+#
+# `train.lr`, `model.*` (time_scale/time_cond/latent_mean/latent_scale),
+# `train.marginal_mode/loss/flip_per_step` : INCHANGÉS (valeurs de production
+# déjà validées -- ne pas introduire une deuxième inconnue en même temps que
+# le changement de données).
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# EXTENSION DU BUDGET (2026-09-19), suite de ce fine-tuning (2026-09-16/17).
+# Copie de vectorized_finetune_loo_excl0007.yaml. Seuls changent :
+#   train.total_iters   1500 -> 5000  (le point d'arrêt à 1500 était choisi sur
+#     un PROXY -- le nRMSE latent agrégé sur les 3 contrastes -- jamais sur le
+#     score Task 3 réel ni par contraste ; T1W/T2FLAIR pourraient avoir encore
+#     de la marge, T2W est de toute façon écarté au profit de la production à
+#     l'inférence -- voir CHANGELOG 2026-09-17, sélection par contraste).
+#   train.save_every     150 -> 250  (20 checkpoints intermédiaires au lieu de
+#     10, même densité relative au nouveau budget).
+# Sortie dans un dossier DÉDIÉ (_5k) pour ne pas écraser les checkpoints du
+# run à 1500 itérations, qui restent la référence confirmée cc+8win.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_finetune_loo_excl0007_5k
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint:
+  latent_channels: 1
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  time_scale: 1000.0
+  time_cond: film
+  latent_mean: 19.913378
+  latent_scale: 18.125440
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: pro_train_loo_excl0007
+  output_subdir: mmfm/finetune_loo_excl0007_5k
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_c4d1e200/pro_train_loo_excl0007
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  marginal_mode: trajectory
+  loss: mse
+  flip_per_step: true
+  batch_size: 1
+  # Repart du checkpoint de production, poids + EMA (voir mmfm_core.py:999-1020).
+  resume: outputs/mmfm/vectorized_trajectory/weights/model_final.pth
+  resume_weights_only: true
+  total_iters: 5000
+  num_targets_per_step: 1
+  adjacent_only: false
+  identity_prob: 0.1
+  warmup_steps: 50
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  accumulation_steps: 1
+  save_every: 250
+  keep_checkpoints: 0
+  print_every: 25
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.99
+  # lambda_edge_fwd RETIRÉ (vérifié avant de lancer, pas après) : en
+  # marginal_mode=trajectory, mmfm_core.py fixe t_i=t_j=t_anchor[anchor_pos]
+  # (ligne ~1114-1115) -- cycle_rollout_vector intègre alors sur dt=0, donc
+  # z_tgt_hat=z_src et loss_cycle/loss_edge_fwd valent 0 EXACTEMENT quel que
+  # soit le poids. Ce régularisateur ne s'applique qu'aux modes pairwise/
+  # pairwise_ot (fi != fj réels), pas à trajectory. Phase 1 s'appuie donc
+  # uniquement sur la perte de flow matching -- déjà supervisée par une VRAIE
+  # trajectoire ici, ce qui est le changement qu'on teste.
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

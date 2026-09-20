@@ -55,12 +55,17 @@ def main() -> None:
     ap.add_argument("--src-field", default="0.1T")
     ap.add_argument("--n-steps", type=int, default=20)
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--config", default=None,
+                     help="chemin de config a diagnostiquer (defaut : "
+                          "configs/mmfm/vectorized_finetune_loo_excl<excl>.yaml, "
+                          "comportement historique) -- pour diagnostiquer une "
+                          "variante (ex. budget etendu _5k) sans dupliquer ce script")
     a = ap.parse_args()
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     subj_latents = load_subject_latents(a.excl)
 
-    cfg_path = f"configs/mmfm/vectorized_finetune_loo_excl{a.excl}.yaml"
+    cfg_path = a.config or f"configs/mmfm/vectorized_finetune_loo_excl{a.excl}.yaml"
     cfg = yaml.safe_load(open(cfg_path))
     use_amp = bool(cfg["train"].get("use_amp", True))
 
@@ -98,7 +103,7 @@ def main() -> None:
                 t_tgt = _field_to_time(FIELDS.index(f), len(FIELDS))
                 with torch.no_grad():
                     z_pred = euler_integrate(
-                        lambda z, zs, t, yy: model(z, zs, t, yy),
+                        lambda z, zs, t, yy, level=None: model(z, zs, t, yy, level),
                         z_src, y, t_src, t_tgt, a.n_steps, dev, use_amp=use_amp,
                     ).cpu()
                 z_true = subj_latents[mod][f]

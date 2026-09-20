@@ -116,8 +116,8 @@ def main() -> None:
     idx = json.load(open(Path(CACHE) / "index.json"))["samples"]
     use_amp = bool(cfg["train"].get("use_amp", True))
 
-    def model_fn(z, zs, t, y):
-        return model(z, zs, t, y)
+    def model_fn(z, zs, t, y, level=None):
+        return model(z, zs, t, y, level)
 
     def integrate(z_src: torch.Tensor, mi: int, t0: float, t1: float) -> torch.Tensor:
         outs = []

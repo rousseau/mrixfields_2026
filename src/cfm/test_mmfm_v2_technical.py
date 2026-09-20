@@ -47,7 +47,7 @@ def test_euler_v2_logic():
     y = torch.tensor([0])
     n_steps = 10
     device = torch.device("cpu")
-    model_fn = lambda z_t, z_src, t, y: model(z_t, z_src, t, y)
+    model_fn = lambda z_t, z_src, t, y, level=None: model(z_t, z_src, t, y, level)
 
     # Case 1: identity transition (0.1T -> 0.1T) — t_start == t_end.
     n_fields = 5
