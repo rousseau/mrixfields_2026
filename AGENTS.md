@@ -264,9 +264,9 @@ connus et les délibérations sont dans **`CHANGELOG.md`** (source de vérité).
 > actuelle** — il reste tel quel comme repère historique. Depuis, le protocole a changé
 > (audit du 2026-09-04, correctifs de mécanisme, géométrie `cc`/`8win`) et le vectorisé a été
 > fine-tuné en LOO sur les 3 sujets appariés (`pro_train`, recette officielle `pro_pretrained`
-> du challenge). **Référence actuelle (2026-09-20, `8win`) : nRMSE 0.2962** (combinaison T1W
-> best-of-both original + T2FLAIR fine-tuné étendu + T2W production) — voir CHANGELOG.md,
-> entrée du 2026-09-19/20, pour le détail et les réserves.
+> du challenge). **Référence actuelle (2026-09-21, `8win`) : nRMSE 0.2843** (combinaison T1W
+> budget étendu + perte de contenu LPIPS + T2FLAIR fine-tuné étendu + T2W production) — voir
+> CHANGELOG.md, entrée du 2026-09-21, pour le détail et les réserves.
 ---
 
 ### Évaluation unifiée
@@ -305,8 +305,8 @@ Les figures sont sauvegardées dans `results/{stargan,cfm,mmfm}/visuals/<methode
 > l'unification des trois architectures, PAS la référence actuelle. **`CHANGELOG.md` est
 > l'unique source de vérité pour les métriques** depuis — chaque expérience y entre avec son
 > chiffre, y compris les résultats négatifs (voir `feedback-changelog` dans la mémoire du
-> projet). Référence actuelle (2026-09-20, `8win`) : **nRMSE 0.2962** — fine-tuning LOO
-> (T1W best-of-both original + T2FLAIR étendu + T2W production), entrée du 2026-09-19/20.
+> projet). Référence actuelle (2026-09-21, `8win`) : **nRMSE 0.2843** — fine-tuning LOO
+> (T1W budget étendu + LPIPS + T2FLAIR étendu + T2W production), entrée du 2026-09-21.
 
 | Méthode | nRMSE ↓ (moy.) | SSIM ↑ | LPIPS ↓ | Résultat |
 |---------|---------|--------|---------|-------|
@@ -511,7 +511,7 @@ mrixfields_2026/
 | 4 | MMFM UNet (MedVAE gelé) | ⚫ instantané 2026-08, 0.4033 nRMSE | `outputs/mmfm/unet/weights/model_final.pth` |
 | 4 | MMFM INR (backbone SIREN) | ⚫ instantané 2026-08, 0.3749 nRMSE | `outputs/mmfm/inr_std/weights/model_final.pth` |
 | 4 | R-best (vectorisé, temps/FiLM corrigés) | ⚫ jalon dépassé, 0.3737 | `outputs/mmfm/vec_rbest/weights/model_final.pth` |
-| 4 | **Fine-tuning LOO (T1W best-of-both + T2FLAIR étendu + T2W prod)** | ✅ **référence actuelle, 0.2962 nRMSE (`8win`)** | voir CHANGELOG.md, 2026-09-19/20 |
+| 4 | **Fine-tuning LOO (T1W étendu+LPIPS + T2FLAIR étendu + T2W prod)** | ✅ **référence actuelle, 0.2843 nRMSE (`8win`)** | voir CHANGELOG.md, 2026-09-21 |
 | — | Script évaluation unifié | ✅ Terminé | `src/evaluation/evaluate.py` (5 méthodes) |
 | — | Journal des expériences (source de vérité) | ✅ À MAINTENIR | `CHANGELOG.md` |
 | — | Paper | ⬜ Vide | `paper/` |

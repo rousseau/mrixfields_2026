@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FINE-TUNING LOO, BUDGET ÉTENDU + PERTE DE CONTENU LPIPS(2.5D) (2026-09-21).
+#
+# Motivation : le budget étendu MSE-seul (5000 itérations, entrées du
+# 2026-09-19/20) améliore le nRMSE de T1W mais dégrade significativement SSIM
+# et LPIPS en `8win` (compromis distorsion/perception, confirmé ne pas être
+# un curseur dosable entre 3250 et 4750 itérations). Hypothèse testée ici :
+# la perte de contenu LPIPS auxiliaire (déjà codée et validée sur T2W, voir
+# `vectorized_finetune_loo_excl0009_t2w_lpips.yaml` -- négative là, mais pour
+# une raison différente : signal individuel insuffisant, pas un problème de
+# recette) pourrait retenir la dérive perceptuelle que le MSE seul laisse
+# filer à budget étendu, en pénalisant directement l'image décodée pendant
+# l'entraînement plutôt que de compter sur le MSE latent pour la préserver
+# implicitement.
+#
+# Copie de vectorized_finetune_loo_excl0009_5k.yaml (budget étendu MSE, celui
+# qui a révélé le compromis T1W). Seul ajout : `train.lambda_lpips` (+ ses 4
+# clés associées), identique au mécanisme de la config T2W. `total_iters:
+# 3750` (pas 5000) : c'est le point où le compromis MSE-seul était déjà
+# pleinement formé sur ce repli -- inutile de payer jusqu'à 5000 pour le
+# retrouver, la question est SI la perte LPIPS l'empêche d'apparaître, pas de
+# retrouver exactement le même budget.
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_finetune_loo_excl0009_long_lpips
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint:
+  latent_channels: 1
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  time_scale: 1000.0
+  time_cond: film
+  latent_mean: 19.913378
+  latent_scale: 18.125440
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: pro_train_loo_excl0009
+  output_subdir: mmfm/finetune_loo_excl0009_long_lpips
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_c4d1e200/pro_train_loo_excl0009
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  marginal_mode: trajectory
+  loss: mse
+  flip_per_step: true
+  batch_size: 1
+  resume: outputs/mmfm/vectorized_trajectory/weights/model_final.pth
+  resume_weights_only: true
+  total_iters: 3750
+  num_targets_per_step: 1
+  adjacent_only: false
+  identity_prob: 0.1
+  warmup_steps: 50
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  accumulation_steps: 1
+  save_every: 250
+  keep_checkpoints: 0
+  print_every: 50
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.99
+  # ── Seul ajout par rapport à vectorized_finetune_loo_excl0009_5k.yaml ──
+  lambda_lpips: 1.0
+  # lpips_every=40 (pas 25) : budget 2.5x plus long (3750 contre 1500), donc
+  # même densité de déclenchements à coût comparable (~94 déclenchements sur
+  # 3750 itérations, ~55 min/repli, ~2h45 pour les 3 replis).
+  lpips_every: 40
+  lpips_batch_subset: 1
+  lpips_n_steps: 4
+  lpips_slice_stride: 4
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

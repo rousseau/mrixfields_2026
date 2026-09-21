@@ -12,6 +12,50 @@ expérience non écrite ici est réputée ne pas avoir eu lieu.
 
 ---
 
+## 2026-09-21 — Fine-tuning LOO T1W, budget étendu + perte de contenu LPIPS(2.5D) : NOUVELLE RÉFÉRENCE
+
+**Verdict : POSITIF.** Détail :
+`results/mmfm/finetune_loo_long_lpips_20260921/manifest.md`.
+
+Le budget étendu MSE-seul (5000 itérations) améliore T1W en nRMSE mais
+dégrade significativement SSIM/LPIPS en `8win` (entrée du 2026-09-19/20).
+Réessayé avec la perte de contenu LPIPS auxiliaire (même mécanisme que T2W
+ci-dessous, négatif là pour une raison différente) sur 3750 itérations :
+
+| T1W isolé, `8win` | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| T1W long+LPIPS (nouveau) | 0.3152 | 0.8543 | 0.2075 |
+| T1W original (best-of-both) | 0.3508 | 0.8562 | 0.2015 |
+| *repère : T1W étendu MSE-seul (compromis)* | *0.3186* | *0.8450* | *0.2144* |
+
+**La perte LPIPS réduit la dégradation SSIM d'un facteur ~6 (-0.0019 contre
+-0.0112) et LPIPS d'un facteur ~2 (+0.0060 contre +0.0129), tout en gardant
+un gain nRMSE significatif sur les deux tests (p=0.041 signes, p=0.005
+Wilcoxon)** — contrairement à la variante MSE-seule, où seul Wilcoxon était
+significatif.
+
+**Risque identifié et évité** : sur le repli 0009, ce même run dégrade
+fortement T2FLAIR aux itérations profondes (compromis croisé entre
+contrastes). Gardé T2FLAIR et T2W sur leurs runs établis séparément — pas de
+conflit, chaque repli est un modèle indépendant par run.
+
+**Combinaison complète (T1W long+LPIPS + T2FLAIR étendu + T2W production),
+`8win`, 60 cellules** :
+
+| | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| **nouvelle référence** | **0.2843** | 0.8418 | 0.1991 |
+| référence précédente | 0.2962 | 0.8424 | 0.1971 |
+| Δ | **-0.0119** (p=0.041 signes, **p=0.006 Wilcoxon**) | -0.0006 (NS) | +0.0020 (NS) |
+
+**Nouvelle référence pour ce fil**, remplace la précédente. Contrairement à
+T2W, T1W répond positivement à la perte de contenu — cohérent avec le fait
+que T1W a le plus de vrai déplacement propre au sujet des 3 contrastes,
+donc le plus à gagner d'un budget plus long, à condition que la perte ne le
+pousse pas vers un optimum flatté.
+
+---
+
 ## 2026-09-20/21 — Fine-tuning LOO T2W avec perte de contenu LPIPS(2.5D) : PISTE FERMÉE, NÉGATIVE
 
 **Verdict : négatif, sans ambiguïté.** Détail :
@@ -98,6 +142,10 @@ ses 20 cellules, nRMSE **-0.0390 (Wilcoxon p=0.0107)**, SSIM neutre (p=0.67),
 LPIPS pas significatif mais dans le mauvais sens (+0.0038, p=0.15, à
 surveiller). **Gain net et propre, sans le compromis T1W. Nouvelle
 référence pour le fine-tuning LOO**, remplace le best-of-both par repli.
+
+> **SUPERSÉDÉE le 2026-09-21** : le T1W de cette référence (checkpoint
+> original, 1500 itérations) est remplacé par un T1W long+LPIPS —
+> nRMSE 0.2843 contre 0.2962 ici. Voir l'entrée du 2026-09-21.
 
 **Recherche d'un compromis T1W intermédiaire (2026-09-20) : NÉGATIF.**
 Hypothèse : le compromis nRMSE/SSIM-LPIPS de T1W pourrait s'atténuer à un
