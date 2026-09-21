@@ -1,6 +1,6 @@
-"""Courbure et sensibilite au temps d'un checkpoint, sur latents REELS.
+"""Courbure et sensibilite au temps ET au sujet d'un checkpoint, sur latents REELS.
 
-Les deux quantites qui ont revele le defaut du 2026-08-27, et qui se mesurent en
+Les trois quantites qui ont revele le defaut du 2026-08-27, et qui se mesurent en
 deux minutes -- contre ~6 h d'inference pour un score Task 3. A lancer AVANT
 d'engager une evaluation complete : si cos(v(0),v(1)) vaut encore 1.000000, le
 modele est aveugle au temps et le score ne fera que confirmer la production.
@@ -8,9 +8,18 @@ modele est aveugle au temps et le score ne fera que confirmer la production.
 C'est ce qui a permis de conclure sur R1 (time_scale seul) sans attendre son
 evaluation : cos = 1.000000 inchange, courbure 0.003-0.054 de celle exigee.
 
+cos(v(sujet A), v(sujet B)) (2026-09-21) : meme principe applique a z_src plutot
+qu'au temps -- reutilise les N sujets deja charges pour `bend`, a t et classe
+fixes, aucun chargement supplementaire. Sert a calibrer l'ampleur d'effet AVANT
+d'ecrire un nouveau mecanisme de conditionnement par z_src (voir train.src_cond,
+non encore implemente a cette date) : mesure sur le checkpoint de production
+reel, jamais reproduite depuis le correctif latent_mean/latent_scale du
+2026-09-04 (qui avait mesure cos(sujet A, sujet B) = 0.99997336 AVANT ce
+correctif -- voir CHANGELOG.md et project_audit_20260904_flow_constant.md).
+
 Usage :
     PYTHONPATH=src python src/cfm/measure_flow_geometry.py \
-        --config configs/mmfm/vectorized_rbest.yaml --tag R-best
+        --config configs/mmfm/vectorized_trajectory.yaml --tag production
 """
 import torch, json, sys, yaml, random, argparse
 sys.path.insert(0, "src")
@@ -36,6 +45,16 @@ for mi,mod in enumerate(["T1W","T2W","T2FLAIR"]):
     with torch.no_grad():
         v0=m(z0,z0,torch.zeros(N,device=dev),y).float(); v1=m(z0,z0,torch.ones(N,device=dev),y).float()
     c=torch.nn.functional.cosine_similarity(v0,v1,dim=1).mean().item()
+    # cos(v(sujet A), v(sujet B)) : memes N sujets, t et classe fixes (t=0.5,
+    # arbitraire), z_src = z_t = son propre latent pour chaque sujet -- v depend
+    # alors UNIQUEMENT du sujet, pas du temps (deja mesure ci-dessus).
+    with torch.no_grad():
+        vs=m(z0,z0,torch.full((N,),0.5,device=dev),y).float()
+    pairs=[(i,j) for i in range(N) for j in range(i+1,N)]
+    cs=torch.nn.functional.cosine_similarity(
+        torch.stack([vs[i] for i,j in pairs]), torch.stack([vs[j] for i,j in pairs]), dim=1,
+    )
+    csub=cs.mean().item()
     z=z0.clone(); ns=100; dt=1.0/ns; sn={0:z0.clone()}
     with torch.no_grad():
         for i in range(ns):
@@ -46,5 +65,6 @@ for mi,mod in enumerate(["T1W","T2W","T2FLAIR"]):
     tr=torch.stack([sn[k] for k in range(5)],1).cpu()
     md=torch.tensor([bend(tr[b]) for b in range(N)]).mean(0)
     real=torch.stack([load(mod,f,24,seed=1).mean(0) for f in FIELDS]); rd=bend(real)
-    print(f"  {mod:8s} cos(v(0),v(1))={c:.6f} | courbure {md[0]:.3f} {md[1]:.3f} {md[2]:.3f}"
+    print(f"  {mod:8s} cos(v(0),v(1))={c:.6f} | cos(sujetA,sujetB)={csub:.6f}"
+          f" | courbure {md[0]:.3f} {md[1]:.3f} {md[2]:.3f}"
           f" | donnees {rd[0]:.3f} {rd[1]:.3f} {rd[2]:.3f} | fraction {md[1]/rd[1]:.3f}")

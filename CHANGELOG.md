@@ -12,6 +12,82 @@ expérience non écrite ici est réputée ne pas avoir eu lieu.
 
 ---
 
+## 2026-09-21 (soir) — Réinjection FiLM de z_src à chaque bloc résiduel (`src_cond`) : PISTE FERMÉE, NÉGATIVE
+
+**Verdict final : NÉGATIF.** Diagnostic prolongé jusqu'à 5000 itérations
+(voir SUITE plus bas) — arrêté avant l'entraînement complet (25 000
+itérations), le signal s'étant clarifié dans le mauvais sens. Pas de
+manifeste dédié (clos au stade diagnostic, coût du signal négatif limité à
+~35 min GPU).
+
+Motivation : `z_src` (le latent complet de la source) n'est concaténé qu'UNE
+SEULE FOIS à l'entrée du réseau, jamais réinjecté à travers les blocs
+résiduels — contrairement au temps/classe/niveau, qui peuvent moduler CHAQUE
+bloc par FiLM (mécanisme déjà mesuré comme dominant pour le temps).
+Asymétrie de conception jamais testée. Inspiration externe : le papier/code
+NVIDIA MAISI-v2 (arXiv:2508.05772) ne fait PAS de conditionnement par image
+source (c'est un modèle de génération, pas de traduction — vérifié dans le
+code, `docs/inference.md` : *"No mask or source-image conditioning"*), mais
+son mécanisme ControlNet réinjecte son conditionnement de façon additive à
+CHAQUE échelle du réseau plutôt qu'une fois à l'entrée — même principe,
+mécanisme différent.
+
+**Implémentation** : nouveau paramètre `src_cond` (+ `src_embed_dim`),
+`mmfm_vectorized.py`/`arch_vector.py`, sur le même patron que `level_cond`
+(défaut `False` = zéro paramètre ajouté, zéro-init garanti par test
+unitaire — `test_mmfm_flow_behaviour.py::test_src_cond_zero_init`). Encodeur
+dédié `z_src → src_encoder → src_feat`, projection FiLM SÉPARÉE de
+`cond_proj` (pas fusionnée dans le vecteur `cond` partagé) pour ne pas
+mélanger l'attribution du gradient temps/classe et celle de `z_src`.
+
+**Mesure de calibration (2026-09-21), jamais refaite depuis le correctif
+`latent_mean`/`latent_scale`** : `cos(sujetA,sujetB)` sur la production
+actuelle = 0.86-0.97 selon le contraste — déjà loin de 0.99997336 (aveugle,
+avant les correctifs de l'audit du 2026-09-04). L'effet à attendre de
+`src_cond` est donc probablement modeste.
+
+**Diagnostic à 1500 itérations (6 % du budget complet), témoin vs
+`src_cond`** :
+- Poids `src_cond_proj` écartés de zéro (magnitude ~0.0003, contre
+  ~0.0012-0.0025 pour `cond_proj` temps/classe déjà entraîné) — le mécanisme
+  reçoit un vrai gradient.
+- `cos(sujetA,sujetB)` : **T1W** va dans le sens attendu (0.994→0.979, plus
+  sensible) ; **T2W** (0.9985→0.9991) et **T2FLAIR** (0.9905→0.9957) vont
+  dans le sens INVERSE (moins sensibles).
+
+**Signal mixte, probablement du bruit précoce** (6 % du budget, poids encore
+loin de leur magnitude d'équilibre). Le critère du plan (« sensibilité
+accrue ET poids non nuls ») n'est que partiellement rempli — décision de
+prolonger le diagnostic à moindre coût plutôt que de trancher.
+
+**SUITE — diagnostic prolongé à 5000 itérations (20 % du budget), même jour.**
+Poids `src_cond_proj` ont DOUBLÉ (~0.0003 → ~0.0007, contre ~0.0018-0.0021
+pour `cond_proj` temps/classe à ce même budget) — le mécanisme continue
+d'apprendre activement, ce n'est pas un gradient mort. Mais le signe s'est
+inversé et clarifié, dans le MAUVAIS sens sur les 3 contrastes :
+
+| | témoin | `src_cond` | Δ |
+|---|---|---|---|
+| T1W | 0.9925 | 0.9985 | +0.0060 (moins sensible) |
+| T2W | 0.9970 | 0.9987 | +0.0017 (moins sensible) |
+| T2FLAIR | 0.9928 | 0.9935 | +0.0007 (moins sensible) |
+
+T1W, seul contraste favorable à 1500 itérations, s'est retourné. **Le
+critère du plan n'est plus rempli** : le mécanisme apprend, mais pas dans la
+direction espérée — plus de budget d'entraînement ne referme pas l'écart,
+il le creuse. Décision, conforme à la discipline « mesurer la porte avant de
+payer l'expérience » : ne pas lancer les 25 000 itérations complètes. Piste
+fermée au stade diagnostic.
+
+**Ce qui reste de cette expérience** : le mécanisme (`src_cond`,
+`mmfm_vectorized.py`/`arch_vector.py`, garantie zéro-init testée) est du
+code propre et réutilisable, même si cette hypothèse précise (réinjection
+profonde de z_src) ne paie pas. S'ajoute à la liste déjà longue de leviers
+appris-mais-sans-effet-favorable sur ce pipeline (`level_cond`,
+recalibration, MedVAE perceptuel) — voir `project-plateau-huit-leviers`.
+
+---
+
 ## 2026-09-21 — Fine-tuning LOO T1W, budget étendu + perte de contenu LPIPS(2.5D) : NOUVELLE RÉFÉRENCE
 
 **Verdict : POSITIF.** Détail :

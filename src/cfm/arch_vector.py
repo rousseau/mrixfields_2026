@@ -70,6 +70,11 @@ def build_vector_mmfm(cfg: dict, latent_dim: int, n_classes: int) -> VectorMMFM:
         level_embed_dim=int(m.get("level_embed_dim", 32)),
         level_mean=float(m.get("level_mean", 0.0)),
         level_scale=float(m.get("level_scale", 1.0)),
+        # REINJECTION DE z_src PAR BLOC (2026-09-21). False par defaut = zero
+        # parametre ajoute, checkpoints existants inchanges. Voir
+        # VectorMMFM.__init__ et CHANGELOG.md, 2026-09-21.
+        src_cond=bool(m.get("src_cond", False)),
+        src_embed_dim=int(m.get("src_embed_dim", 256)),
     )
 
 

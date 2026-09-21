@@ -1,0 +1,119 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MMFM vectorisé — RÉINJECTION FiLM DE z_src À CHAQUE BLOC (2026-09-21).
+#
+# Copie EXACTE de vectorized_trajectory.yaml (production). Seules 2 clés
+# ajoutées, dans `model:` — rien d'autre ne change.
+#
+# MOTIVATION. z_src (le latent complet de la source) n'est concaténé qu'UNE
+# SEULE FOIS à l'entrée du réseau (voir VectorMMFM.forward), jamais réinjecté
+# à travers les blocs résiduels — contrairement au temps/classe/(niveau), qui
+# peuvent moduler CHAQUE bloc par FiLM (`time_cond: film`, déjà mesuré comme
+# facteur dominant pour le temps). C'est une asymétrie de conception jamais
+# testée, pas un choix déjà rejeté.
+#
+# NUANCE : l'argument qui justifiait FiLM pour le temps était la DILUTION PAR
+# TAILLE (256 canaux de temps contre 258 048 de latent, ratio ~1:1000). z_src
+# n'a PAS ce problème (concaténé 1:1 avec z_t). L'hypothèse testée ici est la
+# PROFONDEUR de réinjection, pas la dilution — mesurée le 2026-09-21 sur la
+# production actuelle : cos(sujet A, sujet B) = 0.86-0.97 selon le contraste
+# (T1W/T2W/T2FLAIR), donc DÉJÀ loin d'être aveugle (contre 0.99997336 avant
+# les correctifs de l'audit du 2026-09-04) — l'effet à attendre de ce
+# mécanisme est donc probablement modeste, pas spectaculaire.
+#
+# Inspiration externe (voir CHANGELOG.md, 2026-09-21) : le ControlNet de
+# NVIDIA MAISI-v2 (arXiv:2508.05772) réinjecte son conditionnement de façon
+# additive à CHAQUE échelle du réseau plutôt qu'une fois à l'entrée — même
+# principe, mécanisme différent (FiLM par bloc ici, convolutions zéro-init
+# additives là-bas ; leur cas d'usage — génération, pas traduction — n'est de
+# toute façon pas directement transposable).
+#
+# `src_cond: true` + `src_embed_dim: 256` : défaut `src_cond=False` = zéro
+# paramètre ajouté, checkpoints existants inchangés (vérifié par test unitaire,
+# voir test_mmfm_flow_behaviour.py::test_src_cond_zero_init).
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_vectorized_trajectory_srccond
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint:
+  latent_channels: 1
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  time_scale: 1000.0
+  time_cond: film
+  latent_mean: 19.913378
+  latent_scale: 18.125440
+  # ── Seul ajout par rapport à vectorized_trajectory.yaml ──
+  src_cond: true
+  src_embed_dim: 256
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: retro_train
+  output_subdir: mmfm/vectorized_trajectory_srccond
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_c4d1e200/retro_train
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  marginal_mode: trajectory
+  loss: mse
+  flip_per_step: true
+  batch_size: 1
+  total_iters: 25000
+  num_targets_per_step: 1
+  adjacent_only: false
+  identity_prob: 0.1
+  warmup_steps: 2000
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  accumulation_steps: 1
+  save_every: 2500
+  keep_checkpoints: 2
+  print_every: 100
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

@@ -70,7 +70,7 @@ class ResidualMLPBlock(nn.Module):
     """Simple residual MLP block used by the vector field model."""
 
     def __init__(self, hidden_dim: int, dropout: float = 0.0,
-                 cond_dim: int = 0):
+                 cond_dim: int = 0, src_cond_dim: int = 0):
         super().__init__()
         inner_dim = hidden_dim * 4
         self.norm = nn.LayerNorm(hidden_dim)
@@ -86,13 +86,30 @@ class ResidualMLPBlock(nn.Module):
             # perturbe pas l'initialisation du reste du reseau.
             nn.init.zeros_(self.cond_proj.weight)
             nn.init.zeros_(self.cond_proj.bias)
+        # REINJECTION DE z_src (experience 2026-09-21, voir VectorMMFM pour le
+        # contexte complet). Projection SEPAREE de `cond_proj` (et non fusionnee
+        # dans le meme vecteur `cond`) pour ne jamais melanger, dans une seule
+        # matrice apprise, le gradient du temps/classe/niveau et celui de z_src
+        # -- l'attribution resterait ambigue au diagnostic sinon. Meme garantie
+        # zero-init que cond_proj : src_cond_dim=0 (defaut) -> bit a bit le
+        # comportement historique, aucun parametre cree.
+        self.src_cond_proj = nn.Linear(src_cond_dim, 2 * hidden_dim) if src_cond_dim > 0 else None
+        if self.src_cond_proj is not None:
+            nn.init.zeros_(self.src_cond_proj.weight)
+            nn.init.zeros_(self.src_cond_proj.bias)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None,
+                src_cond: torch.Tensor | None = None) -> torch.Tensor:
         residual = x
         x = self.norm(x)
         if self.cond_proj is not None and cond is not None:
             scale, shift = self.cond_proj(cond).chunk(2, dim=-1)
             x = x * (1.0 + scale) + shift
+        if self.src_cond_proj is not None and src_cond is not None:
+            # Appliquee APRES la modulation temps/classe/niveau (ordre fixe,
+            # documente ici pour rester comparable d'une ablation a l'autre).
+            scale2, shift2 = self.src_cond_proj(src_cond).chunk(2, dim=-1)
+            x = x * (1.0 + scale2) + shift2
         x = F.silu(self.fc1(x))
         x = self.dropout(x)
         x = self.fc2(x)
@@ -130,6 +147,8 @@ class VectorMMFM(nn.Module):
         level_embed_dim: int = 32,
         level_mean: float = 0.0,
         level_scale: float = 1.0,
+        src_cond: bool = False,
+        src_embed_dim: int = 256,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -183,6 +202,26 @@ class VectorMMFM(nn.Module):
         self.level_embed_dim = int(level_embed_dim) if self.level_cond else 0
         cond_dim = time_embed_dim + class_embed_dim + self.level_embed_dim
 
+        # REINJECTION DE z_src A CHAQUE BLOC (experience 2026-09-21). z_src est
+        # DEJA concatene a l'entree ci-dessous (input_dim = 2*latent_dim, ...),
+        # dans TOUS les cas -- contrairement au temps/classe/niveau, il n'a
+        # jamais eu droit a une modulation FiLM par bloc. L'argument qui
+        # justifiait FiLM pour le temps etait la DILUTION PAR TAILLE (256
+        # canaux de temps contre 258 048 de latent, ratio ~1:1000) : z_src n'a
+        # PAS ce probleme, il est concatene 1:1 avec z_t. L'hypothese testee
+        # ici n'est donc PAS la dilution mais la PROFONDEUR de reinjection --
+        # une seule fois a l'entree contre a chaque bloc. Un seul mode actif
+        # (FiLM) : un "concat" supplementaire d'un z_src reduit serait
+        # redondant avec la concatenation deja presente. `src_cond=False`
+        # (defaut) = zero parametre ajoute, comportement historique inchange ;
+        # `src_cond=True` non entraine = sortie identique (zero-init, voir
+        # ResidualMLPBlock). Voir CHANGELOG.md, 2026-09-21, pour le contexte
+        # complet (comparaison au ControlNet de NVIDIA MAISI-v2, qui reinjecte
+        # son conditionnement de facon additive a chaque echelle plutot qu'une
+        # fois a l'entree).
+        self.src_cond = bool(src_cond)
+        self.src_embed_dim = int(src_embed_dim) if self.src_cond else 0
+
         input_dim = 2 * latent_dim + (cond_dim if time_cond == "concat" else 0)
         self.class_embed = nn.Embedding(num_classes, class_embed_dim)
         self.input_proj = nn.Sequential(
@@ -194,9 +233,16 @@ class VectorMMFM(nn.Module):
             ResidualMLPBlock(
                 hidden_dim, dropout=dropout,
                 cond_dim=(cond_dim if time_cond == "film" else 0),
+                src_cond_dim=self.src_embed_dim,
             )
             for _ in range(depth)
         ])
+        if self.src_cond:
+            self.src_encoder = nn.Sequential(
+                nn.Linear(latent_dim, self.src_embed_dim),
+                nn.SiLU(),
+                nn.LayerNorm(self.src_embed_dim),
+            )
         self.output_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, latent_dim),
@@ -262,9 +308,10 @@ class VectorMMFM(nn.Module):
             cond = None
         else:
             h = torch.cat([z_t_n, z_src_n], dim=1)
+        src_feat = self.src_encoder(z_src_n) if self.src_cond else None
         h = self.input_proj(h)
         for block in self.blocks:
-            h = block(h, cond)
+            h = block(h, cond, src_feat)
         # La vitesse est une difference de latents divisee par dt : elle porte
         # l'echelle du latent, pas son decalage. On remultiplie donc par `scale`
         # SANS rajouter `mean`.

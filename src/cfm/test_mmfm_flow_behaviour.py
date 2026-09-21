@@ -333,6 +333,46 @@ def test_no_zero_gradient(metrics_path: str) -> int:
     )
 
 
+def test_src_cond_zero_init(cfg: dict, latent_dim: int) -> None:
+    """`src_cond=True` non entraine doit produire une sortie IDENTIQUE a
+    `src_cond=False` (garantie zero-init, voir ResidualMLPBlock.src_cond_proj).
+
+    Ajoute le 2026-09-21 (reinjection de z_src par bloc, voir CHANGELOG.md).
+    Meme discipline que les tests de time_cond ci-dessus : si un jour cette
+    garantie casse (ex. init changee par erreur), ce test doit echouer.
+    """
+    cfg_off = {**cfg, "model": dict(cfg["model"])}
+    cfg_off["model"]["src_cond"] = False
+    cfg_on = {**cfg, "model": dict(cfg["model"])}
+    cfg_on["model"]["src_cond"] = True
+    cfg_on["model"]["src_embed_dim"] = 24
+
+    torch.manual_seed(0)
+    m_off = _build(cfg_off, latent_dim).eval()
+    torch.manual_seed(0)
+    m_on = _build(cfg_on, latent_dim).eval()
+    # copie les poids partages (tout sauf src_encoder/blocks.*.src_cond_proj)
+    # de m_off vers m_on pour comparer a poids par ailleurs identiques.
+    sd_on = m_on.state_dict()
+    sd_on.update(m_off.state_dict())
+    m_on.load_state_dict(sd_on)
+
+    B = 4
+    z_t = torch.randn(B, latent_dim)
+    z_src = torch.randn(B, latent_dim)
+    t = torch.rand(B)
+    y = torch.randint(0, 3, (B,))
+    with torch.no_grad():
+        o_off = m_off(z_t, z_src, t, y)
+        o_on = m_on(z_t, z_src, t, y)
+    if not torch.equal(o_off, o_on):
+        raise Failure(
+            "src_cond=True non entraine (zero-init) doit etre BIT A BIT "
+            "identique a src_cond=False, a poids partages egaux. Ecart max : "
+            f"{(o_off - o_on).abs().max().item():.3e}"
+        )
+
+
 # ---------------------------------------------------------------------------
 
 def _build(cfg: dict, latent_dim: int, time_scale_override: float | None = None):
@@ -372,6 +412,7 @@ def run(cfg_path: str, checkpoint: str | None, metrics: str | None) -> int:
     else:
         check("sensibilite au temps (init)", lambda: round(test_time_sensitivity(model, latent_dim), 6))
     check("la trajectoire peut se courber", lambda: [round(x, 4) for x in test_trajectory_can_bend(model, latent_dim)])
+    check("src_cond=True zero-init == src_cond=False", lambda: test_src_cond_zero_init(cfg, latent_dim))
 
     if metrics and Path(metrics).exists():
         check("aucun gradient nul", lambda: test_no_zero_gradient(metrics))
