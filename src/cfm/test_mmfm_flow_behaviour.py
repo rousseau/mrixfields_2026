@@ -39,6 +39,13 @@ from cfm.arch_vector import build_vector_mmfm
 from cfm.mmfm_vectorized import sinusoidal_time_embedding
 from common.io import MODALITIES
 
+# `test_gan_inactive_is_noop` seul en a besoin : importe ici pour ne pas payer
+# la depense (mmfm_core importe torch.distributed, DDP, etc.) dans le chemin
+# rapide du script.
+def _mmfm_core():
+    from cfm import mmfm_core
+    return mmfm_core
+
 # Les 5 temps de champ : _field_to_time(i, 5) = i/4.
 FIELD_TIMES = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
 
@@ -374,6 +381,77 @@ def test_src_cond_zero_init(cfg: dict, latent_dim: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 5. train.lambda_gan=0.0 doit etre un NO-OP BIT A BIT (Palier 0 du plan GAN,
+#    2026-09-21/22 -- voir mmfm_core.py, LatentDiscriminator)
+# ---------------------------------------------------------------------------
+
+def test_gan_inactive_is_noop(tmp_root: Path) -> int:
+    """Fait tourner train() DEUX FOIS sur le harnais synthetique, RNG globale
+    remise au meme etat avant chacun : une fois sans aucune cle `lambda_gan*`
+    (etat d'avant ce patch), une fois avec `lambda_gan: 0.0` explicite PLUS
+    toutes les autres cles gan_*/disc_* a des valeurs actives-si-le-garde-fou-
+    etait-perce (gan_start=0, gan_every=1, disc_lr different de lr...).
+
+    La propriete testee n'est PAS « les deux runs se ressemblent » mais
+    « aucun octet de RNG globale supplementaire n'est consomme » : le
+    discriminateur n'est construit qu'a l'interieur de `if lambda_gan_active`
+    (mmfm_core.py), donc s'il l'etait par erreur (garde-fou perce), son
+    `nn.Linear`/`nn.Embedding` consommerait la RNG globale AVANT la premiere
+    iteration, decalant l'initialisation du modele et TOUT DataLoader shuffle
+    (num_workers=0, pas de generator explicite) qui suit -- les deux
+    trajectoires de loss divergeraient au 4e chiffre des la premiere iteration.
+    Une egalite bit a bit sur `loss` est donc une preuve directe, pas un proxy.
+    """
+    mmfm_core = _mmfm_core()
+    base_cfg = yaml.safe_load(open("configs/mmfm/synthetic.yaml"))
+
+    def _make_cfg(with_gan_keys: bool, out_dir: Path) -> dict:
+        cfg = json.loads(json.dumps(base_cfg))  # deep copy, YAML-safe types only
+        cfg["data"]["output_dir"] = str(out_dir)
+        cfg["train"]["total_iters"] = 24
+        cfg["train"]["print_every"] = 1
+        cfg["train"]["save_every"] = 10_000  # aucune ecriture de checkpoint
+        if with_gan_keys:
+            cfg["train"].update({
+                "lambda_gan": 0.0,          # INACTIF : c'est exactement ce qui est teste
+                "lambda_gan_final": 0.0,
+                "gan_start": 0,
+                "gan_every": 1,
+                "gan_n_steps": 2,
+                "disc_lr": 5.0e-3,          # different de train.lr : detecterait un pas D fantome
+                "disc_grad_clip": 0.5,
+            })
+        return cfg
+
+    def _run(with_gan_keys: bool, out_dir: Path) -> list[float]:
+        cfg = _make_cfg(with_gan_keys, out_dir)
+        cfg_path = out_dir.parent / f"cfg_{'gan' if with_gan_keys else 'base'}.yaml"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with open(cfg_path, "w") as f:
+            yaml.safe_dump(cfg, f)
+        torch.manual_seed(20260922)
+        random.seed(20260922)
+        mmfm_core.train(str(cfg_path), "mmfm3d_synthetic")
+        L = [json.loads(l) for l in open(out_dir / "train_metrics.jsonl")]
+        return [x["loss"] for x in L]
+
+    losses_base = _run(False, tmp_root / "base")
+    losses_gan = _run(True, tmp_root / "gan")
+
+    if losses_base != losses_gan:
+        first_diff = next(
+            i for i, (a, b) in enumerate(zip(losses_base, losses_gan)) if a != b
+        ) if len(losses_base) == len(losses_gan) else min(len(losses_base), len(losses_gan))
+        raise Failure(
+            f"lambda_gan=0.0 (+ cles gan_*/disc_* actives-en-apparence) change la "
+            f"trajectoire de loss de G : divergence au point d'impression {first_diff} "
+            f"({losses_base[first_diff:first_diff+1]} vs {losses_gan[first_diff:first_diff+1]}). "
+            "Un garde-fou `lambda_gan_active` a ete perce quelque part."
+        )
+    return len(losses_base)
+
+
+# ---------------------------------------------------------------------------
 
 def _build(cfg: dict, latent_dim: int, time_scale_override: float | None = None):
     cfg = {**cfg, "model": dict(cfg["model"])}
@@ -463,7 +541,22 @@ def main() -> None:
                     help="train_metrics.jsonl (defaut : deduit de output_subdir)")
     ap.add_argument("--demo-regression", action="store_true",
                     help="rejoue les tests a time_scale=1.0 pour prouver qu'ils echouent")
+    ap.add_argument("--gan-noop-check", action="store_true",
+                    help="Palier 0 du plan GAN : verifie que lambda_gan=0.0 est un "
+                         "no-op bit a bit sur le harnais synthetique (~10-20s CPU)")
     a = ap.parse_args()
+
+    if a.gan_noop_check:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="mmfm_gan_noop_") as td:
+            print(f"\n=== Palier 0 GAN : lambda_gan=0.0 est-il un no-op bit a bit ? ({td}) ===")
+            try:
+                n = test_gan_inactive_is_noop(Path(td))
+                print(f"  OK   {n} points de loss identiques entre les deux runs")
+                sys.exit(0)
+            except Failure as e:
+                print(f"  ECHEC {e}")
+                sys.exit(1)
 
     metrics = a.metrics
     if metrics is None:

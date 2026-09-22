@@ -1,0 +1,111 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TÉMOIN du Palier 2 (2026-09-22) : copie STRICTE de vectorized_trajectory_gan.yaml
+# avec lambda_gan=0.0 (et gan_start/gan_every/disc_* laissés tels quels — sans
+# effet, lambda_gan_active=False désactive tout le mécanisme, voir
+# test_gan_inactive_is_noop). Même reprise poids-seuls, même total_iters=2000,
+# mêmes tirages `flip_per_step`/`identity_prob`/couplage OT : seule différence
+# possible entre les deux runs, la présence du GAN — nécessaire pour juger
+# "loss de flow dégradée vs témoin" (plan §Protocole, Palier 2).
+#
+#   PYTHONPATH=src python src/cfm/train_mmfm_unified.py \
+#       --method mmfm3d_vectorized --config configs/mmfm/vectorized_trajectory_gan_control.yaml \
+#       --env local \
+#       --resume outputs/mmfm/vectorized_trajectory/weights/model_final.pth \
+#       --resume_weights_only
+# ─────────────────────────────────────────────────────────────────────────────
+
+method: mmfm3d_vectorized
+task_name: mmfm_vectorized_trajectory_gan_control
+
+vae:
+  vae_type: medvae_finetune
+  model_name: medvae_4_1_3d
+  frozen: true
+  checkpoint:
+  latent_channels: 1
+
+model:
+  hidden_dim: 1024
+  num_blocks: 4
+  time_embed_dim: 256
+  class_embed_dim: 128
+  dropout: 0.0
+  time_scale: 1000.0
+  time_cond: film
+  latent_mean: 19.913378
+  latent_scale: 18.125440
+  disc_hidden_dim: 256
+  disc_num_blocks: 3
+  disc_time_embed_dim: 128
+  disc_class_embed_dim: 64
+  disc_dropout: 0.1
+
+data:
+  modalities:
+  - T1W
+  - T2W
+  - T2FLAIR
+  fields:
+  - 0.1T
+  - 1.5T
+  - 3T
+  - 5T
+  - 7T
+  volume_size:
+  - 192
+  - 224
+  - 192
+  target_spacing:
+  - 1.0
+  - 1.0
+  - 1.0
+  encode_tile: [96, 112, 96]
+  encode_tile_margin: 16
+  split: retro_train
+  output_subdir: mmfm/vectorized_trajectory_gan_control
+  percentile_lower: 0.5
+  percentile_upper: 99.5
+  max_volumes_per_class:
+  num_workers: 4
+  use_latent_cache: true
+  latent_cache_root: outputs/mmfm/latent_cache/vectorized
+  latent_cache_dir: outputs/mmfm/latent_cache/vectorized/medvae_finetune_c4d1e200/retro_train
+  latent_preload_ram: true
+  flip_lr_prob: 0.5
+  flip_axis: 0
+  random_crop_prob: 0.0
+
+train:
+  marginal_mode: trajectory
+  loss: mse
+  flip_per_step: true
+  batch_size: 1
+  total_iters: 2000
+  num_targets_per_step: 1
+  adjacent_only: false
+  identity_prob: 0.1
+  warmup_steps: 100
+  lr: 2.0e-5
+  sigma: 0.0
+  ot_method: exact
+  accumulation_steps: 1
+  save_every: 500
+  keep_checkpoints: 2
+  print_every: 50
+  use_amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  # TÉMOIN : GAN désactivé.
+  lambda_gan: 0.0
+  lambda_gan_final: 0.0
+  gan_start: 0
+  gan_every: 1
+  gan_n_steps: 4
+  disc_lr: 2.0e-5
+  disc_grad_clip: 1.0
+
+inference:
+  n_steps: 20
+  ode_solver: euler
+  norm_mode: field_fixed

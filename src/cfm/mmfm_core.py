@@ -100,6 +100,12 @@ class ArchAdapter:
     build_cache_dataset: Callable[[Path, Path, dict], Any]
     validate_cache_shape: Callable[[Any, Tuple[int, ...]], None]
     default_cache_root: str
+    # `train.lambda_gan` (2026-09-21/22) : discriminateur en espace latent,
+    # optionnel. None (defaut) = comportement historique inchange pour
+    # arch_unet.py/arch_inr.py ; lambda_gan>0 est refuse explicitement pour
+    # ces methodes (garde-fou dans train()) plutot que de silencieusement
+    # ignorer la perte. Seul arch_vector.py/arch_synthetic.py le fournissent.
+    build_discriminator: Optional[Callable[[], Any]] = None
 
 
 def _resolve_arch_module(method: str):
@@ -575,6 +581,9 @@ def _save_checkpoint(
     arch_meta: dict,
     modalities: List[str],
     fields: List[str],
+    disc=None,
+    disc_optimizer=None,
+    disc_scheduler=None,
 ) -> None:
     torch.save(
         {
@@ -593,6 +602,12 @@ def _save_checkpoint(
             "arch_meta": arch_meta,
             "modalities": modalities,
             "fields": fields,
+            # `train.lambda_gan` (2026-09-21/22) : None pour tout run sans GAN —
+            # schéma de checkpoint inchangé, G n'a AUCUNE dépendance à ces
+            # trois clés (voir la reprise plus haut).
+            "disc": disc.state_dict() if disc is not None else None,
+            "disc_optimizer": disc_optimizer.state_dict() if disc_optimizer is not None else None,
+            "disc_scheduler": disc_scheduler.state_dict() if disc_scheduler is not None else None,
         },
         path,
     )
@@ -859,6 +874,35 @@ def train(
             "OOM sur un volume 1mm entier)."
         )
 
+    # PERTE ADVERSARIALE LATENTE (2026-09-21/22, style UNSB -- voir
+    # LatentDiscriminator dans mmfm_vectorized.py et le plan GAN dans
+    # CHANGELOG.md). Même patron que lambda_lpips ci-dessus : 0.0 par défaut,
+    # aucun coût, aucun checkpoint existant affecté. `disc_lr`/`disc_grad_clip`
+    # retombent sur `lr`/`grad_clip` de G si non précisés.
+    lambda_gan = float(train_cfg.get("lambda_gan", 0.0))
+    lambda_gan_final = float(train_cfg.get("lambda_gan_final", lambda_gan))
+    gan_start = int(train_cfg.get("gan_start", 0))
+    gan_every = int(train_cfg.get("gan_every", 1))
+    gan_n_steps = int(train_cfg.get("gan_n_steps", 4))
+    disc_lr = float(train_cfg.get("disc_lr", lr))
+    disc_grad_clip = float(train_cfg.get("disc_grad_clip", grad_clip))
+
+    lambda_gan_active = lambda_gan > 0.0 or lambda_gan_final > 0.0
+    if lambda_gan_active and marginal_mode != "trajectory":
+        raise ValueError(
+            "lambda_gan n'est implémenté qu'en marginal_mode='trajectory' "
+            "(il lit `Z`/`Level`/`t_anchor`, déjà chargés pour la spline, pour "
+            "tirer une position de champ cible discrète — même principe que "
+            "lambda_lpips)."
+        )
+    if lambda_gan_active and accumulation_steps != 1:
+        raise ValueError(
+            "lambda_gan et accumulation_steps>1 ne sont pas combinés : "
+            "l'alternance G/D par pas n'a pas été validée sous accumulation de "
+            "gradient (périmètre réduit pour cette première expérience, voir "
+            "le plan GAN)."
+        )
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_distributed = world_size > 1
@@ -891,6 +935,12 @@ def train(
 
     latent_shape = _infer_latent_shape(vae, volume_size, device)
     adapter = arch_module.make_adapter(cfg, latent_shape, n_classes)
+    if lambda_gan_active and adapter.build_discriminator is None:
+        raise ValueError(
+            f"lambda_gan>0 mais method='{method}' n'a pas de discriminateur "
+            "(seuls mmfm3d_vectorized/mmfm3d_synthetic en fournissent un — "
+            "voir arch_vector.py/arch_synthetic.py)."
+        )
 
     # ── Dataset : latents pré-encodés (cache) OU volumes à encoder à la volée
     if use_latent_cache:
@@ -1027,6 +1077,23 @@ def train(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
+    # ── Discriminateur latent (train.lambda_gan, 2026-09-21/22). None tant que
+    # lambda_gan=0.0 : aucun paramètre construit, aucun coût. DDP symétrique à
+    # G (même schéma `raw_disc = disc.module if is_distributed else disc`
+    # utilisé pour tous les forward, comme `raw_model`/`model_fn` pour G) —
+    # non vérifié en multi-GPU par ce plan, voir CHANGELOG.md.
+    disc = None
+    raw_disc = None
+    disc_optimizer = None
+    disc_scheduler = None
+    if lambda_gan_active:
+        disc = adapter.build_discriminator().to(device)
+        if is_distributed:
+            disc = DDP(disc, device_ids=[local_rank])
+        raw_disc = disc.module if is_distributed else disc
+        disc_optimizer = torch.optim.AdamW(disc.parameters(), lr=disc_lr, weight_decay=1e-4)
+        disc_scheduler = torch.optim.lr_scheduler.LambdaLR(disc_optimizer, _lr_lambda)
+
     if amp_dtype_name == "bf16":
         amp_dtype = torch.bfloat16
     elif amp_dtype_name == "fp16":
@@ -1052,6 +1119,11 @@ def train(
             # checkpoints antérieurs au correctif : pas de compteur, on prend
             # l'itération, qui en est le bon substitut.
             ema.num_updates = int(state.get("ema_num_updates", state.get("iter", 0)))
+        if raw_disc is not None and state.get("disc") is not None:
+            # D REPART DE ZÉRO si le checkpoint repris n'a pas de D (chemin
+            # recommandé : reprise poids-seuls depuis un run SANS GAN, voir le
+            # plan) — chargé seulement si un D a bien été sauvegardé.
+            raw_disc.load_state_dict(state["disc"])
         if resume_weights_only:
             if is_main_process():
                 print(f"Reprise (poids seuls) depuis : {resume_path}")
@@ -1061,6 +1133,10 @@ def train(
                 scheduler.load_state_dict(state["scheduler"])
             if "scaler" in state and use_scaler and state["scaler"] is not None:
                 scaler.load_state_dict(state["scaler"])
+            if disc_optimizer is not None and state.get("disc_optimizer") is not None:
+                disc_optimizer.load_state_dict(state["disc_optimizer"])
+            if disc_scheduler is not None and state.get("disc_scheduler") is not None:
+                disc_scheduler.load_state_dict(state["disc_scheduler"])
             start_iter = state.get("iter", 0) + 1
             if is_main_process():
                 print(f"Reprise depuis iter {start_iter} : {resume_path}")
@@ -1082,8 +1158,19 @@ def train(
     recent_edge_losses: List[float] = []
     recent_edge_fwd_losses: List[float] = []
     recent_lpips_losses: List[float] = []
+    recent_gan_g_losses: List[float] = []
+    recent_gan_d_losses: List[float] = []
+    recent_d_acc: List[float] = []
     model.train()
+    if disc is not None:
+        disc.train()
     grad_norm = 0.0  # persists across accumulation micro-steps for logging
+    # GAN (2026-09-21/22) : persistent comme `grad_norm` ci-dessus -- restent à
+    # leur dernière valeur observée entre deux activations du bloc D (voir
+    # gan_every), au lieu d'un None qui ferait disparaître la ligne de log.
+    grad_norm_d = 0.0
+    gan_contrast_log: Optional[int] = None
+    gan_tgt_field_log: Optional[int] = None
 
     msg_len = 1 + 2 * num_targets_per_step
 
@@ -1128,11 +1215,17 @@ def train(
         step_edge_losses: List[float] = []
         step_edge_fwd_losses: List[float] = []
         step_lpips_losses: List[float] = []
+        step_gan_g_losses: List[float] = []
+        # Capturé par le bloc G (dans la boucle transitions, trajectoire =
+        # 1 seule itération) puis consommé par le bloc D juste après
+        # ema.update(...) : (z_fake, z_real, t, y, contrast, tgt_field).
+        gan_step_state = None
 
         cur_lambda_cycle = _lerp_lambda(lambda_cycle, lambda_cycle_final, step, total_iters)
         cur_lambda_edge = _lerp_lambda(lambda_edge, lambda_edge_final, step, total_iters)
         cur_lambda_edge_fwd = _lerp_lambda(lambda_edge_fwd, lambda_edge_fwd_final, step, total_iters)
         cur_lambda_lpips = _lerp_lambda(lambda_lpips, lambda_lpips_final, step, total_iters)
+        cur_lambda_gan = _lerp_lambda(lambda_gan, lambda_gan_final, step, total_iters)
 
         for (fi, fj) in transitions:
             if marginal_mode == "trajectory":
@@ -1153,9 +1246,14 @@ def train(
                     torch.stack([ds[int(j)][-1] for j in row]) for row in idx
                 ]).to(device).float()  # (B, K)
 
-                if flip_per_step and flip_lr_prob > 0.0 and random.random() < flip_lr_prob:
+                did_flip = flip_per_step and flip_lr_prob > 0.0 and random.random() < flip_lr_prob
+                if did_flip:
                     # UN SEUL tirage, appliqué aux K marginales : les
                     # correspondances de la trajectoire restent cohérentes.
+                    # Nommée (2026-09-22) : train.lambda_gan doit appliquer
+                    # EXACTEMENT ce même tirage à son échantillon "réel" (tiré
+                    # de class_loaders, donc PAS couvert par ce flip de Z) —
+                    # voir le bloc plus bas, et le plan GAN §Découvertes.
                     Z = _flip_batch(Z)
 
                 meta = None
@@ -1358,6 +1456,68 @@ def train(
                 loss = loss + cur_lambda_lpips * loss_lpips
                 step_lpips_losses.append(float(loss_lpips.item()))
 
+            if (
+                lambda_gan_active and step >= gan_start
+                and (step - gan_start) % gan_every == 0
+                and Z.shape[1] > 1
+            ):
+                # PERTE ADVERSARIALE (2026-09-21/22, style UNSB — voir
+                # LatentDiscriminator, CHANGELOG.md). Position de champ cible
+                # DISCRÈTE, tirage indépendant de celui de lambda_lpips (les
+                # deux peuvent tomber sur des positions différentes le même
+                # pas, sans conséquence : chacun lit `Z`/`t_anchor` pour son
+                # propre besoin).
+                k_total = Z.shape[1]
+                gan_offset = int(step_rng.integers(1, k_total))
+                gan_tgt_pos = (anchor_pos + gan_offset) % k_total
+                gan_tgt_field = contrast_fields[contrast][gan_tgt_pos]
+
+                z_fake_tgt = euler_integrate(
+                    model_fn, z_src, y_tgt, t_anchor[anchor_pos], t_anchor[gan_tgt_pos],
+                    gan_n_steps, device, use_amp=use_amp, amp_dtype=amp_dtype, level=level_src,
+                )
+
+                # "RÉEL" tiré de class_loaders (la vraie marginale de la classe
+                # cible), PAS de Z[:, gan_tgt_pos] : D doit voir un échantillon
+                # de la distribution cible, pas le sujet chaîné par le
+                # couplage OT (déjà vu par la MSE). `did_flip` (même tirage que
+                # celui déjà appliqué à Z) : sans ça, le "réel" ne serait
+                # JAMAIS retourné alors que le "faux" (dérivé de Z) l'est une
+                # fois sur deux — D apprendrait à distinguer réel/faux par
+                # l'orientation gauche-droite plutôt que par le contenu (voir
+                # le plan GAN, §Découvertes).
+                gan_tgt_flat = _flat_class(contrast, gan_tgt_field, n_fields)
+                gan_real_item = next(class_loaders[gan_tgt_flat])[0].to(device).float()
+                if did_flip:
+                    gan_real_item = _flip_batch(gan_real_item)
+                if not (use_latent_cache and adapter.cache_prebakes_prep):
+                    gan_real_item = adapter.prep_latent(vae, gan_real_item)[0]
+
+                n_gan = min(z_fake_tgt.shape[0], gan_real_item.shape[0])
+                t_gan = torch.full((n_gan,), t_anchor[gan_tgt_pos], dtype=torch.float32, device=device)
+                y_gan = torch.full((n_gan,), contrast, dtype=torch.long, device=device)
+
+                with torch.amp.autocast(
+                    "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+                ):
+                    d_fake_for_g = raw_disc(z_fake_tgt[:n_gan], t_gan, y_gan)
+                loss_gan_g = F.mse_loss(
+                    d_fake_for_g.float(), torch.ones_like(d_fake_for_g, dtype=torch.float32)
+                )
+                loss = loss + cur_lambda_gan * loss_gan_g
+                step_gan_g_losses.append(float(loss_gan_g.item()))
+
+                # Détaché : le pas D ci-dessous ne doit pas redériver à travers
+                # G. `disc_optimizer.zero_grad()` (juste avant le backward de
+                # D) purge par ailleurs les gradients parasites que CE backward
+                # (celui de G, ligne suivante) dépose sur les paramètres de D —
+                # même schéma que finetune_medvae.py:701-727 (phase 1 génère
+                # sans geler D, phase 2 zero_grad avant son propre backward).
+                gan_step_state = (
+                    z_fake_tgt[:n_gan].detach(), gan_real_item[:n_gan].detach(),
+                    t_gan, y_gan, contrast, gan_tgt_field,
+                )
+
             if use_scaler:
                 scaler.scale(loss / accumulation_steps).backward()
             else:
@@ -1376,6 +1536,38 @@ def train(
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             ema.update(raw_model)
+
+        step_gan_d_loss = None
+        step_d_acc = None
+        if lambda_gan_active and gan_step_state is not None:
+            z_fake_d, z_real_d, t_gan, y_gan, gan_contrast_log, gan_tgt_field_log = gan_step_state
+            disc_optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(
+                "cuda", dtype=amp_dtype, enabled=(use_amp and device.type == "cuda")
+            ):
+                d_real = raw_disc(z_real_d, t_gan, y_gan)
+                d_fake = raw_disc(z_fake_d, t_gan, y_gan)
+            loss_gan_d = 0.5 * (
+                F.mse_loss(d_real.float(), torch.ones_like(d_real, dtype=torch.float32))
+                + F.mse_loss(d_fake.float(), torch.zeros_like(d_fake, dtype=torch.float32))
+            )
+            if use_scaler:
+                scaler.scale(loss_gan_d).backward()
+                scaler.unscale_(disc_optimizer)
+                grad_norm_d = float(torch.nn.utils.clip_grad_norm_(raw_disc.parameters(), disc_grad_clip))
+                scaler.step(disc_optimizer)
+                scaler.update()
+            else:
+                loss_gan_d.backward()
+                grad_norm_d = float(torch.nn.utils.clip_grad_norm_(raw_disc.parameters(), disc_grad_clip))
+                disc_optimizer.step()
+            disc_scheduler.step()
+            with torch.no_grad():
+                d_acc = 0.5 * (
+                    (d_real.float() > 0.5).float().mean() + (d_fake.float() < 0.5).float().mean()
+                )
+            step_gan_d_loss = float(loss_gan_d.item())
+            step_d_acc = float(d_acc.item())
 
         mean_step_loss = float(np.mean(step_losses)) if step_losses else 0.0
         recent_losses.append(mean_step_loss)
@@ -1397,6 +1589,17 @@ def train(
             recent_lpips_losses.append(float(np.mean(step_lpips_losses)))
             if len(recent_lpips_losses) > print_every:
                 recent_lpips_losses.pop(0)
+        if step_gan_g_losses:
+            recent_gan_g_losses.append(float(np.mean(step_gan_g_losses)))
+            if len(recent_gan_g_losses) > print_every:
+                recent_gan_g_losses.pop(0)
+        if step_gan_d_loss is not None:
+            recent_gan_d_losses.append(step_gan_d_loss)
+            if len(recent_gan_d_losses) > print_every:
+                recent_gan_d_losses.pop(0)
+            recent_d_acc.append(step_d_acc)
+            if len(recent_d_acc) > print_every:
+                recent_d_acc.pop(0)
 
         if is_main_process() and (step + 1) % print_every == 0:
             avg_recent = float(np.mean(recent_losses))
@@ -1422,6 +1625,14 @@ def train(
             if lambda_lpips_active:
                 avg_lpips = float(np.mean(recent_lpips_losses)) if recent_lpips_losses else float("nan")
                 extra_log += f" lpips={avg_lpips:.4f}(λ={cur_lambda_lpips:.2f})"
+            if lambda_gan_active:
+                avg_gan_g = float(np.mean(recent_gan_g_losses)) if recent_gan_g_losses else float("nan")
+                avg_gan_d = float(np.mean(recent_gan_d_losses)) if recent_gan_d_losses else float("nan")
+                avg_d_acc = float(np.mean(recent_d_acc)) if recent_d_acc else float("nan")
+                extra_log += (
+                    f" gan_g={avg_gan_g:.4f}(λ={cur_lambda_gan:.3f}) gan_d={avg_gan_d:.4f} "
+                    f"d_acc={avg_d_acc:.2f} grad_d={grad_norm_d:.2f}"
+                )
             print(
                 f"[{step + 1:6d}/{total_iters}] loss={avg_recent:.4f} grad={float(grad_norm):.2f} "
                 f"lr={lr_cur:.2e} contrast={contrast}→fields{transitions} speed={it_s:.2f} it/s "
@@ -1457,6 +1668,15 @@ def train(
             if lambda_edge_fwd_active:
                 record["loss_edge_fwd"] = round(avg_edge_fwd, 6)
                 record["lambda_edge_fwd"] = round(cur_lambda_edge_fwd, 6)
+            if lambda_gan_active:
+                record["loss_gan_g"] = round(avg_gan_g, 6)
+                record["loss_gan_d"] = round(avg_gan_d, 6)
+                record["d_acc"] = round(avg_d_acc, 4)
+                record["lambda_gan"] = round(cur_lambda_gan, 6)
+                record["grad_norm_d"] = round(grad_norm_d, 4)
+                if gan_contrast_log is not None:
+                    record["gan_contrast"] = gan_contrast_log
+                    record["gan_tgt_field"] = gan_tgt_field_log
             with open(metrics_path, "a") as _mf:
                 _mf.write(json.dumps(record) + "\n")
             last_log_t = time.time()
@@ -1466,6 +1686,7 @@ def train(
             _save_checkpoint(
                 ckpt_path, step, raw_model, ema, optimizer, scheduler, scaler, use_scaler,
                 cfg_path, method, adapter.arch_meta_dict(), modalities, fields,
+                disc=raw_disc, disc_optimizer=disc_optimizer, disc_scheduler=disc_scheduler,
             )
             print(f"  → Checkpoint : {ckpt_path}")
             # Rotation APRÈS écriture réussie : si `_save_checkpoint` avait
@@ -1479,6 +1700,7 @@ def train(
         _save_checkpoint(
             final_path, total_iters - 1, raw_model, ema, optimizer, scheduler, scaler, use_scaler,
             cfg_path, method, adapter.arch_meta_dict(), modalities, fields,
+            disc=raw_disc, disc_optimizer=disc_optimizer, disc_scheduler=disc_scheduler,
         )
         print(f"\nEntraînement terminé. Modèle final : {final_path}")
 

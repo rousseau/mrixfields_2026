@@ -24,7 +24,7 @@ from typing import Any, Callable, Tuple
 import torch
 from torch import Tensor, nn
 
-from cfm.arch_vector import build_vector_mmfm
+from cfm.arch_vector import build_latent_discriminator, build_vector_mmfm
 from cfm.synthetic_marginals import SyntheticLatentDataset, SyntheticSpec
 
 REQUIRES_SPATIAL_VAE = False
@@ -54,10 +54,15 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
     def build_model() -> nn.Module:
         return build_vector_mmfm(cfg, latent_dim, n_classes)
 
-    def make_model_fn(raw_model: nn.Module) -> Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]:
-        def _fn(z_t: Tensor, z_src: Tensor, t: Tensor, y: Tensor) -> Tensor:
-            return raw_model(z_t, z_src, t, y)
-        return _fn
+    def make_model_fn(raw_model: nn.Module) -> Callable[..., Tensor]:
+        # `level=None` (2026-09-21) : mmfm_core.py appelle desormais model_fn
+        # avec `level=...` inconditionnellement (depuis l'ajout de level_cond,
+        # 2026-09-18) -- oubli de ce fichier a l'epoque (il n'appelle pas
+        # euler_integrate directement, absent du grep qui avait servi a
+        # corriger arch_unet.py/arch_inr.py/diagnose_*.py). raw_model est un
+        # VectorMMFM (voir build_model), le meme que arch_vector.py : on
+        # transmet donc `level` au lieu de l'ignorer, comme arch_inr.py.
+        return lambda z_t, z_src, t, y, level=None: raw_model(z_t, z_src, t, y, level)
 
     def prep_latent(vae, z: Tensor) -> Tuple[Tensor, Any]:
         return z.reshape(z.shape[0], -1), None
@@ -101,4 +106,9 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
         build_cache_dataset=build_cache_dataset,
         validate_cache_shape=validate_cache_shape,
         default_cache_root=DEFAULT_CACHE_ROOT,
+        # `train.lambda_gan` (2026-09-21/22) : reutilise le discriminateur du
+        # vectorise (meme signature, aucune dependance a VectorMMFM) -- le
+        # harnais synthetique doit pouvoir exercer lambda_gan (Palier 1 du
+        # plan GAN) avant tout entrainement sur retro_train.
+        build_discriminator=lambda: build_latent_discriminator(cfg, latent_dim, n_classes),
     )

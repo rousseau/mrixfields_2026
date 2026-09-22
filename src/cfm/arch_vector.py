@@ -18,7 +18,7 @@ from typing import Any, Callable, Optional, Tuple
 import torch
 from torch import Tensor, nn
 
-from cfm.mmfm_vectorized import LatentVectorizer, VectorMMFM
+from cfm.mmfm_vectorized import LatentDiscriminator, LatentVectorizer, VectorMMFM
 from common.dataset import FlatLatentCacheDataset
 
 REQUIRES_SPATIAL_VAE = False
@@ -75,6 +75,30 @@ def build_vector_mmfm(cfg: dict, latent_dim: int, n_classes: int) -> VectorMMFM:
         # VectorMMFM.__init__ et CHANGELOG.md, 2026-09-21.
         src_cond=bool(m.get("src_cond", False)),
         src_embed_dim=int(m.get("src_embed_dim", 256)),
+    )
+
+
+def build_latent_discriminator(cfg: dict, latent_dim: int, n_classes: int) -> LatentDiscriminator:
+    """Discriminateur pour `train.lambda_gan` (2026-09-21/22, voir
+    LatentDiscriminator). `n_classes` SANS le +1 de `cond_dropout_prob` : D ne
+    voit jamais l'id de classe nul reserve a la guidance conditionnelle -- il
+    est entraine seulement sur `y_tgt` (le vrai label), jamais `y_flow`.
+    `time_scale`/`latent_mean`/`latent_scale` REPRIS de la meme config que G
+    (memes cles `model.*`, pas de doublon `disc_*`) : D et G doivent voir le
+    temps et le latent a la meme echelle pour que la comparaison reel/faux
+    ait un sens commun."""
+    m = cfg["model"]
+    return LatentDiscriminator(
+        latent_dim=latent_dim,
+        num_classes=n_classes,
+        hidden_dim=int(m.get("disc_hidden_dim", 256)),
+        depth=int(m.get("disc_num_blocks", 3)),
+        time_embed_dim=int(m.get("disc_time_embed_dim", 128)),
+        class_embed_dim=int(m.get("disc_class_embed_dim", 64)),
+        dropout=float(m.get("disc_dropout", 0.1)),
+        latent_mean=_load_latent_norm(m, "latent_mean", 0.0),
+        latent_scale=_load_latent_norm(m, "latent_scale", 1.0),
+        time_scale=float(m.get("time_scale", 1.0)),
     )
 
 
@@ -153,4 +177,8 @@ def make_adapter(cfg: dict, latent_shape: Tuple[int, ...], n_classes: int):
         build_cache_dataset=_build_cache_dataset,
         validate_cache_shape=_validate_cache_shape,
         default_cache_root=DEFAULT_CACHE_ROOT,
+        # `train.lambda_gan` (2026-09-21/22) : seul le vectorise a un
+        # discriminateur latent -- arch_unet.py/arch_inr.py laissent ce champ
+        # a None (defaut ArchAdapter), lambda_gan>0 y est refuse explicitement.
+        build_discriminator=lambda: build_latent_discriminator(cfg, latent_dim, n_classes),
     )

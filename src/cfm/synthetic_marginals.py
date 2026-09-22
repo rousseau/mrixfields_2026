@@ -147,7 +147,18 @@ class SyntheticMarginals:
 class SyntheticLatentDataset(torch.utils.data.Dataset):
     """Expose le probleme synthetique sous le contrat attendu par
     mmfm_core._build_class_loaders : `.samples` porte class_idx, et
-    __getitem__ rend (vecteur, mod_idx, field_idx, class_idx).
+    __getitem__ rend (vecteur, mod_idx, field_idx, class_idx, level).
+
+    `level` = 0.0 constant (tampon, voir FlatLatentCacheDataset) : le probleme
+    synthetique n'a pas d'equivalent au niveau d'intensite d'un volume IRM
+    -- ce cinquieme champ existe uniquement pour que `ds[i][-1]` (lu par
+    mmfm_core.py::train, branche `trajectory`/`pairwise_ot`, depuis l'ajout de
+    `level_cond` le 2026-09-18) retourne un Tensor plutot qu'un IndexError/
+    TypeError. `level_cond=True` n'a pas de sens ici (aucune variation a
+    apprendre) ; laisse a 0.0 constant plutot que remonte en erreur, pour ne
+    pas bloquer le harnais synthetique sur les mecanismes qui, comme
+    `lambda_gan`, ne lisent QUE `Z`/`Level`/le conditionnement partage sans
+    dependre de la valeur de `level` elle-meme.
 
     Les echantillons sont tires UNE fois et figes : un jeu d'entrainement fini,
     comme les 1939 volumes reels, et non un flux infini qui rendrait le
@@ -176,7 +187,8 @@ class SyntheticLatentDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, i: int):
         s = self.samples[i]
-        return self.vectors[i], s["mod_idx"], s["field_idx"], s["class_idx"]
+        return (self.vectors[i], s["mod_idx"], s["field_idx"], s["class_idx"],
+                torch.tensor(0.0, dtype=torch.float32))
 
 
 # ---------------------------------------------------------------------------

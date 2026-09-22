@@ -12,6 +12,147 @@ expérience non écrite ici est réputée ne pas avoir eu lieu.
 
 ---
 
+## 2026-09-22 — Perte adversariale latente (style UNSB) sur le flow : Paliers 0-3 POSITIFS, Palier 4 (Task 3 officielle) en attente
+
+**Verdict Paliers 0-1 : POSITIF, aucun signal d'alarme.** Palier 2 (retro_train
+réel, ~1-2h GPU) non lancé — en attente de confirmation, conformément au
+protocole du plan (un GAN peut diverger, contrairement aux leviers précédents
+qui ne pouvaient qu'être neutres/négatifs). Manifeste détaillé :
+`results/mmfm/gan_latent_paliers01_20260922/manifest.md`.
+
+Contexte : la revue de littérature du 2026-09-21 (voir entrée `src_cond`
+ci-dessous et [[project-plateau-huit-leviers]]) a établi l'élément
+conceptuel manquant derrière trois leviers indépendants mesurés « appris,
+sans effet favorable » (`level_cond`, recalibration d'intensité, `src_cond`) :
+sous perte L2 contre des cibles issues d'un couplage OT chaîné non informatif
+(0 sujet apparié sur 1056 dans `retro_train`), l'estimateur optimal est
+l'espérance conditionnelle, qui s'effondre vers une constante de population.
+Étudié : UNSB (Kim et al., ICLR 2024, arXiv:2305.15086) — code 2D pur, non
+portable tel quel, mais principe transposable (LSGAN, alternance G/D,
+échantillonnage à un seul pas de temps). Implémenté en espace LATENT (pas
+image) pour éviter le décodage coûteux (~35s/pas mesuré pour `lambda_lpips`) :
+`LatentDiscriminator` (mmfm_vectorized.py), jamais conditionné sur `z_src`
+(raison structurelle : sinon D apprendrait trivialement « ces deux latents
+sont-ils corrélés » plutôt que « est-ce réaliste », pareil à pourquoi
+CycleGAN/CUT/UNSB ne conditionnent jamais D sur l'image source). Câblage
+additif complet dans `mmfm_core.py::train()` via `ArchAdapter.build_discriminator`
+(nouveau champ optionnel, `None` par défaut pour `arch_unet.py`/`arch_inr.py`) ;
+`train.lambda_gan` (défaut `0.0`) sur le même patron que `lambda_lpips`.
+
+**Palier 0** (secondes, CPU) : deux bugs préexistants corrigés en cours de
+route (indépendants du GAN — `arch_synthetic.py` n'acceptait pas `level=...`,
+`SyntheticLatentDataset` ne renvoyait pas de 5e élément `level`, même classe
+d'oubli que le correctif du 2026-09-18 sur `arch_unet.py`/`arch_inr.py`, manqué
+ici car ce fichier n'appelle pas `euler_integrate` directement). Nouveau test
+`test_mmfm_flow_behaviour.py::test_gan_inactive_is_noop` : `train()` lancé
+deux fois sur le harnais synthétique, RNG globale remise au même état avant
+chaque run — une fois sans clé `lambda_gan*`, une fois avec `lambda_gan: 0.0`
+**plus** toutes les autres clés `gan_*`/`disc_*` à des valeurs actives-si-le-
+garde-fou-était-percé. **Les 24 points de `loss` sont identiques bit à bit** :
+preuve directe (pas un proxy) que le mécanisme est un no-op tant que
+`lambda_gan=0.0`.
+
+**Palier 1** (minutes, `configs/mmfm/synthetic_gan.yaml`, 4000 itérations
+inchangées, `lambda_gan=0.05`, `gan_start=500`) :
+
+| | témoin (`synthetic.yaml`) | GAN |
+|---|---|---|
+| fraction de courbure moyenne (porte ≥ 0.80) | 1.018 | 1.025 |
+| pire nRMSE intermédiaire vs vérité EXACTE (porte ≤ 0.100) | 0.0672 | **0.0668** |
+
+**Aucune dégradation de la fidélité à la vérité terrain — légère amélioration
+sur les deux mesures.** C'est le check anti-hallucination le plus fort du
+protocole (seul endroit du projet où la vérité est connue exactement,
+échantillon par échantillon) : si `lambda_gan` avait poussé G vers du
+plausible-pour-la-classe déconnecté de la source, ce couple de métriques
+l'aurait révélé directement. Santé de l'entraînement : `d_acc` fenêtre finale
+0.67→0.74 (borne du plan [0.55, 0.90]), `gan_g` croît progressivement sans
+collapse de G ni D mort, `grad_d` (norme avant clip) borné sans tendance
+monotone (0.06 à 12.50), aucun NaN/Inf, 6/6 tests `test_mmfm_flow_behaviour.py`
+passent sur le checkpoint GAN.
+
+**Ne prouve pas encore un gain sur données réelles** : le problème synthétique
+n'a pas le défaut structurel de `retro_train` (0 sujet apparié) qui motive
+l'expérience — c'est exactement ce que le Palier 2 doit tester (reprise
+poids-seuls depuis la production, `configs/mmfm/vectorized_trajectory_gan.yaml`,
+~2000 itérations = 8% du budget, `gan_start=0`).
+
+**SUITE — Palier 2 (retro_train réel), même jour : POSITIF, tous les
+critères du plan remplis.** Confirmation utilisateur obtenue avant lancement
+(coût GPU réel, risque de divergence). Deux runs 2000 itérations, reprise
+poids-seuls depuis `outputs/mmfm/vectorized_trajectory/weights/model_final.pth`,
+même `step_rng` déterministe (mêmes trajectoires/tirages entre les deux) :
+GAN (`vectorized_trajectory_gan.yaml`, `lambda_gan=0.05`, `gan_start=0` — le
+test le plus dur, un modèle déjà bon se déstabilise-t-il dès l'activation ?)
+vs témoin (`vectorized_trajectory_gan_control.yaml`, `lambda_gan=0.0`).
+
+Les deux runs se terminent sans erreur, aucun NaN/Inf. **Loss de flow (G) :
+statistiquement indiscernable du témoin** — Mann-Whitney sur les 40 points de
+loss de chaque run, p=0.554 ; médiane quasi identique (1641.64 GAN vs
+1639.77 témoin) ; moyenne même légèrement INFÉRIEURE sous GAN (1634.01 vs
+1677.55, ratio 0.974). `grad_norm` de G plus élevé sous GAN (+23% en
+moyenne, 512.9 vs 417.1) — attendu (G reçoit aussi le gradient adversarial),
+sans effet négatif sur la loss ni instabilité (`grad_clip=1.0` inchangé).
+
+**Diagnostic de mémorisation par cellule** (12 cellules = 3 contrastes × 4
+champs cibles, 16 échantillons réels + 16 générés par cellule, D+G-EMA du
+checkpoint final) : `d_acc` moyen 0.596 (min 0.344, max 0.844) — **aucune
+cellule ne dépasse 0.90** (le signal de mémorisation redouté). La seule
+anomalie va dans le sens INVERSE : T2W@5T (43 volumes, la plus petite classe
+du jeu de données) a `d_acc=0.344` — SOUS le hasard, `D(réel)≈D(faux)`
+(+0.464 vs +0.466) — D manque d'exemples pour apprendre à séparer réel/faux
+sur cette cellule, ce qui l'empêche structurellement de pousser G vers un
+raccourci class-plausible-mais-décorrélé là où le risque aurait été le plus
+élevé (la classe la plus rare). Plutôt rassurant que préoccupant pour le
+risque d'hallucination nommé dans le plan.
+
+Détail complet (logs, JSON, script de diagnostic) :
+`results/mmfm/gan_latent_paliers01_20260922/manifest.md`.
+
+**SUITE — Palier 3 (continuation à budget étendu + inspection), même jour :
+POSITIF, aucun signal d'alarme.** Confirmation utilisateur obtenue avant
+lancement. Continuation COMPLÈTE (G+EMA+optimizer+scheduler+D+disc_optimizer
++disc_scheduler, pas `--resume_weights_only`) depuis le `model_final.pth` du
+Palier 2 : `total_iters` 2000→5000 dans
+`configs/mmfm/vectorized_trajectory_gan.yaml`, soit 3000 itérations de plus
+(budget cumulé Palier 2+3 = 5000 = 20% de la production), `gan_start=0`
+inchangé. Termine sans erreur ; `d_acc` fenêtre finale 0.67-0.79 (légère
+hausse vs Palier 2, à surveiller si le budget s'étendait encore, mais sous
+la borne 0.90) ; `grad_d` borné.
+
+Inférence + évaluation ciblées sur le sujet 0006 (un des 3 seuls sujets
+réellement appariés), T1W, 3 paires (0.1T→1.5T facile, 3T→7T et 0.1T→7T
+dures), géométrie `--center_crop_only` (smoke test, PAS le protocole
+officiel réservé au Palier 4) — évaluateur officiel du challenge, comparé
+aux prédictions de production déjà calculées (même géométrie cc) :
+
+| Paire | ΔnRMSE | ΔSSIM | ΔLPIPS |
+|---|---|---|---|
+| 3T→7T | −0.0062 (mieux) | +0.0016 (mieux) | −0.0017 (mieux) |
+| 0.1T→7T | +0.0023 | −0.0002 | +0.0000 |
+| 0.1T→1.5T | +0.0007 | −0.0006 | −0.0002 |
+
+**Aucune signature d'hallucination** (SSIM/LPIPS qui s'améliorerait pendant
+que nRMSE se dégrade) : sur 3T→7T les trois métriques s'améliorent
+ENSEMBLE ; sur les deux autres paires les trois bougent de conserve dans
+des écarts de 0.0002-0.0007, sous le bruit d'une mesure à un seul sujet.
+Cross-vérifié par un second code indépendant
+(`eval_quantitative_3arch.py --mode calibration --region slab`) : `nrmse_raw`
+identique aux 5 décimales. Inspection qualitative (panel source/vérité/
+témoin/GAN/erreurs, script autonome — pas d'ajout au registre `METHODS`
+partagé) : témoin et GAN visuellement quasi indiscernables sur les 3
+paires, aucune structure anatomiquement implausible, cartes d'erreur au
+même motif spatial sur les deux colonnes.
+
+Détail complet (CSV, panel qualitatif, logs) :
+`results/mmfm/gan_latent_paliers01_20260922/manifest.md`. Prochaine étape
+(Palier 4, évaluation Task 3 OFFICIELLE — 20 paires × 3 sujets, 8win,
+plusieurs heures GPU, comparaison appariée contre la référence 0.2843
+nRMSE) : EN ATTENTE DE CONFIRMATION — engagement le plus lourd du
+protocole.
+
+---
+
 ## 2026-09-21 (soir) — Réinjection FiLM de z_src à chaque bloc résiduel (`src_cond`) : PISTE FERMÉE, NÉGATIVE
 
 **Verdict final : NÉGATIF.** Diagnostic prolongé jusqu'à 5000 itérations

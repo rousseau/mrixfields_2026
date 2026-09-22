@@ -318,6 +318,101 @@ class VectorMMFM(nn.Module):
         return self.output_head(h) * self.latent_scale
 
 
+class LatentDiscriminator(nn.Module):
+    """Discriminateur EN ESPACE LATENT pour une perte adversariale sur le flow
+    lui-meme (2026-09-21/22, voir CHANGELOG.md -- inspire d'UNSB, Kim et al.
+    ICLR 2024, arXiv:2305.15086, adapte a notre latent aplati plutot qu'aux
+    images 2D du depot original).
+
+    Pourquoi une perte adversariale : le flow est entraine par REGRESSION
+    (MSE sur la vitesse) contre des cibles issues d'un couplage OT chaine qui,
+    sur retro_train, apparie necessairement des sujets DIFFERENTS (aucun des
+    1056 sujets n'existe a 2 champs). Sous MSE, l'estimateur optimal est
+    l'esperance conditionnelle E[Y|x] -- avec un appariement non informatif,
+    elle s'effondre vers une constante de population (deja mesure : le flow
+    calculait litteralement z -> z + Dt*c avant les correctifs du 2026-09-04).
+    Une perte adversariale n'a pas ce mode d'echec : son optimum est en
+    DISTRIBUTION (Goodfellow 2014), pas point-a-point.
+
+    Reutilise `sinusoidal_time_embedding`/`ResidualMLPBlock` tels quels (meme
+    garantie FiLM zero-init que VectorMMFM) plutot que d'ecrire une nouvelle
+    brique -- D est nettement plus petit que G (hidden_dim/num_blocks par
+    defaut 256/3 contre 1024/4), pratique standard pour eviter qu'un
+    discriminateur surdimensionne n'ecrase le generateur.
+
+    D NE RECOIT JAMAIS z_src (raison structurelle, pas stylistique) : s'il le
+    recevait, chaque paire "reelle" montree serait un couple de sujets non
+    apparentes (aucun n'existe a 2 champs) alors que chaque paire "fausse" est
+    par construction correlee a z_src -- D apprendrait trivialement "ces deux
+    latents sont-ils correles" et pousserait G a CASSER la correlation avec la
+    source pour gagner. Meme raison que CycleGAN/CUT/UNSB ne conditionnent
+    jamais leur discriminateur sur l'image source.
+
+    D ne voit que des POSITIONS DE CHAMP DISCRETES (jamais un `t` continu
+    arbitraire) : sans le reseau E d'UNSB (regularisation entropique,
+    deliberement exclu -- notre spline multi-marginale regularise deja la
+    trajectoire autrement, et porter les deux mecanismes a la fois changerait
+    deux choses en meme temps), il n'existe de vraie distribution de
+    reference qu'aux 5 temps de champ reels. Meme principe que
+    `train.lambda_lpips` (2026-09-20/21), qui choisit deja `tgt_pos` parmi un
+    ensemble discret plutot qu'un temps continu.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        num_classes: int,
+        hidden_dim: int = 256,
+        depth: int = 3,
+        time_embed_dim: int = 128,
+        class_embed_dim: int = 64,
+        dropout: float = 0.1,
+        latent_mean=0.0,
+        latent_scale=1.0,
+        time_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.time_embed_dim = time_embed_dim
+        # `time_scale` : MEME valeur que G (passee par build_latent_discriminator
+        # depuis la meme cle de config `model.time_scale`), pas une copie
+        # independante -- D et G doivent voir le temps a la meme echelle.
+        self.time_scale = float(time_scale)
+        self.class_embed = nn.Embedding(num_classes, class_embed_dim)
+        cond_dim = time_embed_dim + class_embed_dim
+
+        self.input_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.blocks = nn.ModuleList([
+            ResidualMLPBlock(hidden_dim, dropout=dropout, cond_dim=cond_dim)
+            for _ in range(depth)
+        ])
+        self.output_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+        # MEMES tampons que VectorMMFM (non persistants, valeurs de la config)
+        # -- D et G doivent normaliser le latent identiquement pour que la
+        # comparaison reel/faux ait un sens commun.
+        self.register_buffer("latent_mean", torch.as_tensor(latent_mean, dtype=torch.float32), persistent=False)
+        self.register_buffer("latent_scale", torch.as_tensor(latent_scale, dtype=torch.float32), persistent=False)
+
+    def forward(self, z_vec: torch.Tensor, timesteps: torch.Tensor, class_labels: torch.Tensor) -> torch.Tensor:
+        z_n = (z_vec - self.latent_mean) / self.latent_scale
+        time_feat = sinusoidal_time_embedding(timesteps * self.time_scale, self.time_embed_dim)
+        class_feat = self.class_embed(class_labels)
+        cond = torch.cat([time_feat, class_feat], dim=1)
+        h = self.input_proj(z_n)
+        for block in self.blocks:
+            h = block(h, cond)
+        # Pas de sigmoid : LSGAN (MSELoss contre 0/1 directement sur le
+        # logit), pas de perte vanilla-GAN (BCE) ni hinge -- choix par
+        # defaut d'UNSB, plus stable pour une premiere experience.
+        return self.output_head(h).squeeze(-1)
+
+
 def cycle_rollout_vector(
     raw_mmfm: VectorMMFM,
     z_src_vec: torch.Tensor,
