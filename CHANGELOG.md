@@ -12,6 +12,54 @@ expérience non écrite ici est réputée ne pas avoir eu lieu.
 
 ---
 
+## 2026-09-25 — DÉCOUVERTE : les « fine-tunings » LOO n'ont jamais repris la production — ils sont entraînés DEPUIS ZÉRO
+
+**Verdict : la référence 0.2843 reste un chiffre VALIDE, mais son
+interprétation change.** Ce n'est pas « production + fine-tuning supervisé sur
+pro_train ». C'est un modèle **initialisé aléatoirement et entraîné seulement
+sur les 2 sujets appariés du repli** (30 volumes), pendant 250 à 5000 itérations.
+Le pré-entraînement sur les 1056 sujets de retro_train n'y contribue en rien.
+
+**Cause (code).** `mmfm_core.py::train()` lit `cfg.get("resume")` à la RACINE
+du YAML (ligne ~1112), clé que seul l'argument CLI `--resume` renseigne
+(ligne ~674). Toutes les configs `vectorized_finetune_loo_*` déclarent
+`resume:` / `resume_weights_only:` sous `train:` : **clés lues par personne**,
+sans avertissement. Vérifié : `load_yaml_with_include(...)` donne
+`cfg.get("resume") = None`. Seul `diagnose_finetune_checkpoints.py` lit
+`cfg["train"]["resume"]`, pour sa ligne repère « production ». Les comparaisons
+latentes contre la production étaient donc correctes. En revanche, l'hypothèse
+« le fine-tuning part de la production » était fausse.
+
+**Preuve (poids).** Cosinus des poids bruts, calculé en float64 :
+
+| | cos vs production |
+|---|---|
+| témoin GAN, vraie reprise CLI + 3000 itérations | **0.9994** |
+| `finetune_loo_excl0006` @150 | 0.1073 |
+| `finetune_loo_excl0006_5k` @250 | 0.1070 |
+| `finetune_loo_excl0006_long_lpips` final | 0.1064 |
+| init aléatoire neuve (seed 0) | 0.1088 (même plancher) |
+
+Deux runs LOO différents ont aussi un cosinus de 0.108 entre eux. C'est le
+plancher entre modèles sans lien, et il vaut aussi entre un modèle entraîné et
+une init neuve. Une vraie reprise reste à 0.999 même après 3000 itérations.
+Les checkpoints LOO n'ont donc aucun lien avec la production, ni entre eux.
+
+**Conséquences :**
+- Une interprétation à revoir : 30 volumes appariés, entraînés depuis zéro,
+  battent 1056 sujets non appariés (0.2843 contre 0.3394). C'est cohérent avec
+  le diagnostic « le plafond vient des données non appariées »
+  ([[project-dataset-unpaired-n3]]), et nettement plus fort que ce qui était écrit.
+- Le checkpoint est choisi sur le sujet TENU À L'ÉCART (minimum du nRMSE latent
+  contre sa vraie cible, parmi 15 à 21 checkpoints). C'est une sélection sur
+  l'ensemble de test, déjà présente dans le protocole, et elle rend le 0.2843 optimiste.
+- Le Palier 5 GAN prévu (« recette LOO sur le checkpoint GAN ») n'avait pas de
+  sens tel quel : via le YAML, il aurait reproduit la référence à la graine près.
+  Il a été arrêté après 50 itérations et aucun checkpoint n'a été écrit.
+  Les 6 configs `*_ganbase.yaml` ne sont pas commitées.
+- Les runs GAN des Paliers 2-4 et le témoin passaient `--resume` en CLI : ils
+  ne sont PAS touchés (ligne « Reprise ... » présente dans leurs logs).
+
 ## 2026-09-25 — Perte adversariale latente, Palier 4 (Task 3 officielle, 8win) : POSITIF MAIS MINUSCULE
 
 **Verdict : gain significatif et cohérent sur les 3 métriques contre un témoin
