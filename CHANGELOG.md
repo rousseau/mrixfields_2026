@@ -12,7 +12,35 @@ expérience non écrite ici est réputée ne pas avoir eu lieu.
 
 ---
 
-## 2026-09-22 — Perte adversariale latente (style UNSB) sur le flow : Paliers 0-3 POSITIFS, Palier 4 (Task 3 officielle) en attente
+## 2026-09-25 — Perte adversariale latente, Palier 4 (Task 3 officielle, 8win) : POSITIF MAIS MINUSCULE
+
+**Verdict : gain significatif et cohérent sur les 3 métriques contre un témoin
+au même budget, mais de l'ordre du plancher de bruit.** Manifeste :
+`results/mmfm/gan_palier4_task3_20260924/manifest.md`.
+
+Le témoin `lambda_gan=0` a été prolongé de 2000 à 5000 itérations (reprise
+complète, même geste que le Palier 3 côté GAN) pour que la comparaison soit
+à budget égal. Les 180 prédictions 8win ont été faites pour chacun des deux
+modèles. L'inférence GAN interrompue le 2026-09-23 à 156/180 a été complétée
+avec `--skip_existing`.
+
+| 8win, slab, 60 cellules | nRMSE | SSIM | LPIPS |
+|---|---|---|---|
+| GAN (5000 it.) | **0.3380** | 0.8313 | 0.2055 |
+| témoin (5000 it.) | 0.3409 | 0.8304 | 0.2063 |
+| production (25k) | 0.3394 | 0.8313 | 0.2060 |
+| référence LOO | 0.2843 | 0.8418 | 0.1991 |
+| **GAN − témoin** | **−0.0029** (38/60, Wilcoxon p=0.005) | **+0.0009** (p=0.0006) | **−0.0008** (p=0.002) |
+
+- Les trois métriques bougent ENSEMBLE : pas de signature d'hallucination.
+- Gain porté par T1W (−0.0060 nRMSE, 15/20, p_W=0.004) ; T2W et T2FLAIR NS en nRMSE.
+- La moitié de l'écart vient de ce que le témoin se DÉGRADE en prolongeant
+  (0.3409 contre 0.3394 pour la production). GAN − production : −0.0015,
+  Wilcoxon p=0.048, signes NS.
+- 19 fois plus petit que le gain du fine-tuning LOO. Pas testé en combinaison avec lui.
+- Une seule graine par run : la variance entre graines n'est pas mesurée.
+
+## 2026-09-22 — Perte adversariale latente (style UNSB) sur le flow : Paliers 0-3 POSITIFS (Palier 4 : voir 2026-09-25)
 
 **Verdict Paliers 0-1 : POSITIF, aucun signal d'alarme.** Palier 2 (retro_train
 réel, ~1-2h GPU) non lancé — en attente de confirmation, conformément au

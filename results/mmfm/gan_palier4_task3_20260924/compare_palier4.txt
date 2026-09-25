@@ -1,0 +1,47 @@
+runs disponibles : ['gan', 'temoin', 'prod', 'ref2843']
+gan      (60 cellules)  nrmse 0.3380  ssim 0.8313  lpips 0.2055   | nRMSE T1W:0.4250  T2W:0.2715  T2FLAIR:0.3174
+temoin   (60 cellules)  nrmse 0.3409  ssim 0.8304  lpips 0.2063   | nRMSE T1W:0.4311  T2W:0.2725  T2FLAIR:0.3190
+prod     (60 cellules)  nrmse 0.3394  ssim 0.8313  lpips 0.2060   | nRMSE T1W:0.4285  T2W:0.2714  T2FLAIR:0.3184
+ref2843  (60 cellules)  nrmse 0.2843  ssim 0.8418  lpips 0.1991   | nRMSE T1W:0.3152  T2W:0.2714  T2FLAIR:0.2663
+
+=== GAN - temoin ===
+  T1W      nrmse  delta -0.0060  GAN<base 15/20  signes p=0.0414  Wilcoxon p=0.00365
+  T1W      ssim   delta +0.0017  GAN<base 4/20  signes p=0.0118  Wilcoxon p=0.00169
+  T1W      lpips  delta -0.0017  GAN<base 14/20  signes p=0.115  Wilcoxon p=0.0826
+  T2W      nrmse  delta -0.0011  GAN<base 12/20  signes p=0.503  Wilcoxon p=0.245
+  T2W      ssim   delta +0.0002  GAN<base 7/20  signes p=0.263  Wilcoxon p=0.202
+  T2W      lpips  delta -0.0005  GAN<base 15/20  signes p=0.0414  Wilcoxon p=0.0296
+  T2FLAIR  nrmse  delta -0.0016  GAN<base 11/20  signes p=0.824  Wilcoxon p=0.498
+  T2FLAIR  ssim   delta +0.0008  GAN<base 6/20  signes p=0.115  Wilcoxon p=0.189
+  T2FLAIR  lpips  delta -0.0004  GAN<base 12/20  signes p=0.503  Wilcoxon p=0.261
+  TOUS     nrmse  delta -0.0029  GAN<base 38/60  signes p=0.0519  Wilcoxon p=0.00527
+  TOUS     ssim   delta +0.0009  GAN<base 17/60  signes p=0.00107  Wilcoxon p=0.000602
+  TOUS     lpips  delta -0.0008  GAN<base 41/60  signes p=0.00622  Wilcoxon p=0.00248
+
+=== GAN - prod ===
+  T1W      nrmse  delta -0.0034  GAN<base 15/20  signes p=0.0414  Wilcoxon p=0.0073
+  T1W      ssim   delta +0.0013  GAN<base 4/20  signes p=0.0118  Wilcoxon p=0.00315
+  T1W      lpips  delta -0.0014  GAN<base 15/20  signes p=0.0414  Wilcoxon p=0.00486
+  T2W      nrmse  delta +0.0000  GAN<base 10/20  signes p=1  Wilcoxon p=0.956
+  T2W      ssim   delta -0.0016  GAN<base 13/20  signes p=0.263  Wilcoxon p=0.368
+  T2W      lpips  delta -0.0002  GAN<base 7/20  signes p=0.263  Wilcoxon p=0.596
+  T2FLAIR  nrmse  delta -0.0010  GAN<base 10/20  signes p=1  Wilcoxon p=0.498
+  T2FLAIR  ssim   delta +0.0004  GAN<base 8/20  signes p=0.503  Wilcoxon p=0.368
+  T2FLAIR  lpips  delta -0.0000  GAN<base 12/20  signes p=0.503  Wilcoxon p=0.622
+  TOUS     nrmse  delta -0.0015  GAN<base 35/60  signes p=0.245  Wilcoxon p=0.0477
+  TOUS     ssim   delta +0.0000  GAN<base 25/60  signes p=0.245  Wilcoxon p=0.0773
+  TOUS     lpips  delta -0.0005  GAN<base 34/60  signes p=0.366  Wilcoxon p=0.117
+
+=== GAN - ref2843 ===
+  T1W      nrmse  delta +0.1099  GAN<base 4/20  signes p=0.0118  Wilcoxon p=0.000322
+  T1W      ssim   delta -0.0227  GAN<base 17/20  signes p=0.00258  Wilcoxon p=0.000483
+  T1W      lpips  delta +0.0143  GAN<base 6/20  signes p=0.115  Wilcoxon p=0.0328
+  T2W      nrmse  delta +0.0000  GAN<base 10/20  signes p=1  Wilcoxon p=0.956
+  T2W      ssim   delta -0.0016  GAN<base 13/20  signes p=0.263  Wilcoxon p=0.368
+  T2W      lpips  delta -0.0002  GAN<base 7/20  signes p=0.263  Wilcoxon p=0.596
+  T2FLAIR  nrmse  delta +0.0511  GAN<base 7/20  signes p=0.263  Wilcoxon p=0.0484
+  T2FLAIR  ssim   delta -0.0071  GAN<base 13/20  signes p=0.263  Wilcoxon p=0.0897
+  T2FLAIR  lpips  delta +0.0052  GAN<base 7/20  signes p=0.263  Wilcoxon p=0.114
+  TOUS     nrmse  delta +0.0537  GAN<base 21/60  signes p=0.0273  Wilcoxon p=0.000728
+  TOUS     ssim   delta -0.0105  GAN<base 43/60  signes p=0.00107  Wilcoxon p=0.000137
+  TOUS     lpips  delta +0.0064  GAN<base 20/60  signes p=0.0135  Wilcoxon p=0.0116

@@ -80,7 +80,11 @@ train:
   loss: mse
   flip_per_step: true
   batch_size: 1
-  total_iters: 2000
+  # PALIER 4 (2026-09-24) : 2000 -> 5000, continuation COMPLETE (--resume sans
+  # --resume_weights_only) depuis le model_final.pth du Palier 2 — meme geste
+  # que le Palier 3 cote GAN, pour que le temoin ait le MEME budget cumule
+  # (sinon un ecart GAN/temoin confondrait GAN et 3000 iterations de plus).
+  total_iters: 5000
   num_targets_per_step: 1
   adjacent_only: false
   identity_prob: 0.1
