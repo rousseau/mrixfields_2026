@@ -1,0 +1,38 @@
+/home/rousseau/miniforge3/lib/python3.13/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.3)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+Output dir : /home/rousseau/Exp/mrixfields_2026/outputs/mmfm/finetune_loo_excl0006_long_lpips_ganbase
+World size : 1 | Device : cuda:0 | Méthode : mmfm3d_vectorized
+Modalités  : ['T1W', 'T2W', 'T2FLAIR']  |  Champs : ['0.1T', '1.5T', '3T', '5T', '7T']  |  Classes (contrastes) : 3
+  [load_vae] type=medvae_finetune source=local
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+making attention of type 'vanilla' with 512 in_channels
+Working with z of shape (1, 1, 128, 128) = 16384 dimensions.
+making attention of type 'vanilla' with 512 in_channels
+Restored from /home/rousseau/.cache/huggingface/hub/models--stanfordmimi--MedVAE/snapshots/8040c5ccb7a51eff6b4cef513c7f20bd1bda983d/model_weights/vae_4x_1c_3D.ckpt with 0 missing and 0 unexpected keys
+/home/rousseau/miniforge3/lib/python3.13/site-packages/monai/inferers/utils.py:231: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:347.)
+  win_data = inputs[unravel_slice[0]].to(sw_device)
+/home/rousseau/miniforge3/lib/python3.13/site-packages/monai/inferers/utils.py:370: UserWarning: Using a non-tuple sequence for multidimensional indexing is deprecated and will be changed in pytorch 2.9; use x[tuple(seq)] instead of x[seq]. In pytorch 2.9 this will be interpreted as tensor index, x[torch.tensor(seq)], which will result either in an error or a different result (Triggered internally at /pytorch/torch/csrc/autograd/python_variable_indexing.cpp:347.)
+  out[idx_zm] += p
+  MedVAEFineTune (medvae_4_1_3d): frozen (inference only)
+/home/rousseau/miniforge3/lib/python3.13/site-packages/torch/cuda/__init__.py:435: UserWarning: 
+    Found GPU0 NVIDIA GB10 which is of cuda capability 12.1.
+    Minimum and Maximum cuda capability supported by this version of PyTorch is
+    (8.0) - (12.0)
+    
+  queued_call()
+  [load_vae] latent_format=spatial latent_channels=1 latent_shape=(1, 16, 16, 16)
+  Cache latents : outputs/mmfm/latent_cache/vectorized/medvae_finetune_c4d1e200/pro_train_loo_excl0006
+  Classes disponibles : 15/15
+  Contrastes utilisables : [0, 1, 2] | champs/contraste={0: [0, 1, 2, 3, 4], 1: [0, 1, 2, 3, 4], 2: [0, 1, 2, 3, 4]}
+  identity_prob=0.1 | adjacent_only=False | num_targets_per_step=1
+  marginal_mode=trajectory | loss=mse | flip_per_step=True (flip_lr_prob=0.5)
+  cond_dropout_prob=0.0
+  Construction des trajectoires par couplage OT chaîné (Genentech/MMFM, data.py:123) …
+  couplage OT chaîné, contraste 0 : 2 trajectoires sur champs [0, 1, 2, 3, 4] | sujets distincts par champ = [2, 2, 2, 2, 2]
+  couplage OT chaîné, contraste 1 : 2 trajectoires sur champs [0, 1, 2, 3, 4] | sujets distincts par champ = [2, 2, 2, 2, 2]
+  couplage OT chaîné, contraste 2 : 2 trajectoires sur champs [0, 1, 2, 3, 4] | sujets distincts par champ = [2, 2, 2, 2, 2]
+  Couplage terminé en 0.0s | temps d'ancrage par contraste = {0: (0.0, 0.25, 0.5, 0.75, 1.0), 1: (0.0, 0.25, 0.5, 0.75, 1.0), 2: (0.0, 0.25, 0.5, 0.75, 1.0)}
+loaded pretrained LPIPS loss from .cache/vgg.pth
+mmfm3d_vectorized : 433.2M params | latent_shape=(1, 48, 56, 48)
+Entraînement : 3750 iters | batch=1 | targets/step=1 | lr=2e-05 | AMP=True (bf16)
+[    50/3750] loss=1043.3513 grad=222.75 lr=2.00e-05 contrast=0→fields[(0, 0)] speed=0.18 it/s eta=5.85h t=4.7min mem=69.4GB lpips=0.3849(λ=1.00)
